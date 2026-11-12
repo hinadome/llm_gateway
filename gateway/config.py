@@ -30,10 +30,17 @@ class Settings(BaseSettings):
     )
 
     admin_key: str | None = None
+    # SQLite by default; PostgreSQL works too (the postgres extra —
+    # asyncpg — plus a postgresql+asyncpg:// URL). JSON columns map to
+    # JSONB there; pooled connections are pre-pinged so server-side
+    # drops recycle instead of surfacing as 500s.
     database_url: str = "sqlite+aiosqlite:///./gateway.db"
     config_path: str = "./config.yaml"
     # Where POST /admin/backup writes SQLite snapshots (VACUUM INTO).
     # Must be writable by the gateway process; created on first backup.
+    # SQLite-only: on PostgreSQL the endpoint refuses with a 400
+    # pointing at pg_dump (a half-copy would be a false sense of
+    # safety).
     backup_dir: str = "./backups"
     log_level: str = "INFO"
     # "text" (default) or "json" — single-line JSON records on stdout

@@ -6,11 +6,21 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     """Declarative base for all gateway ORM models."""
+
+
+# Portable JSON column type: JSONB on PostgreSQL, plain JSON (text)
+# everywhere else (SQLite). JSONB gives semantic equality — the
+# budget-alert fired-levels write is a compare-and-swap that matches
+# the stored value with `==` — and the better-behaved storage
+# (normalized, indexable). On SQLite the JSON type serializes
+# deterministically, so the same comparison matches byte-for-byte.
+JSONColumn = JSON().with_variant(JSONB(), "postgresql")
 
 
 def _utcnow() -> datetime:
@@ -39,7 +49,7 @@ class VirtualKey(Base):
     # pre-tenancy behavior, unchanged). A member key must pass both its
     # own limits and the tenant's; the tenant can only narrow.
     tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    allowed_models: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    allowed_models: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -58,17 +68,17 @@ class VirtualKey(Base):
     # Budget-alert levels (percent values) already fired for this key —
     # each threshold fires once; raising the budget re-arms below-current
     # levels. Null = never evaluated.
-    budget_alerts_fired: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    budget_alerts_fired: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     # Guardrail names that are skipped for requests authenticated with this
     # key — a runtime override of config scoping (see GuardrailScope).
-    disabled_guardrails: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    disabled_guardrails: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     # Per-key model routing (LiteLLM-style per-team config): requested
     # name -> public model name, applied before global aliases — an
     # explicit admin decision for this key wins, even over real public
     # model names (that is what per-team steering means). default_model
     # is this key's catch-all for unknown names; it beats the global one.
     # Both are runtime-settable via the admin API (no restart needed).
-    model_mappings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    model_mappings: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     default_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Gateway-managed prompt policy (admin API, no restart needed):
     # system_prompt is prepended to this key's requests that carry no
@@ -81,16 +91,16 @@ class VirtualKey(Base):
     # managed prompt (merged over prompts.variables, key wins).
     system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     system_prompt_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    prompt_variables: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    prompt_variables: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     # Token scoping (defense in depth beyond model allowlists):
     # allowed_endpoints — data-plane scopes this key may call
     #   ("chat" | "embeddings" | "models"; NULL = all of them), and
     # allowed_ips — plain IPs or CIDR blocks calls must come from
     #   (NULL = any source). The admin key is never scoped.
-    allowed_endpoints: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    allowed_ips: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    allowed_endpoints: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    allowed_ips: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    metadata_json: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -158,7 +168,7 @@ class Tenant(Base):
     # Free-form label for dashboards; the slug is what APIs speak.
     display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    allowed_models: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    allowed_models: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -173,7 +183,7 @@ class Tenant(Base):
     monthly_bucket: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Budget-alert levels (percent) already fired for this tenant —
     # same once-per-level semantics as keys.
-    budget_alerts_fired: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    budget_alerts_fired: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -216,9 +226,9 @@ class RequestLog(Base):
     deployment: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="success", index=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    guardrail_actions: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    request_body: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    response_body: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    guardrail_actions: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    request_body: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
+    response_body: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     stream: Mapped[bool] = mapped_column(Boolean, default=False)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

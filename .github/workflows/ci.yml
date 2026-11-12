@@ -2,6 +2,9 @@
 #
 # The suite is self-contained (httpx MockTransport, fakeredis, tmp-path
 # SQLite databases) — no network access or external services needed.
+# The postgres job opts the same suite into a real PostgreSQL server
+# (per-test databases) to keep the second supported backend honest.
+#
 # The workflow stays dormant until the repository is pushed to GitHub.
 
 name: CI
@@ -17,12 +20,12 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (Python ${{ matrix.python-version }})
+    name: pytest (Python ${{ matrix.python-version }}, SQLite)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -40,3 +43,39 @@ jobs:
 
       - name: Smoke-check the shipped config
         run: uv run python -c "from gateway.config import GatewayConfig; GatewayConfig.load('config.yaml')"
+
+  postgres:
+    name: pytest (Python 3.12, PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gateway"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Each test gets its own database on this server (see
+      # tests/conftest.py).
+      GATEWAY_TEST_DATABASE_URL: postgresql+asyncpg://gateway:gateway@localhost:5432/gateway
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests against PostgreSQL
+        run: uv run pytest -q

@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 60 Python files, ~16,020 lines, 732 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 60 Python files, ~16,100 lines, 736 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -652,7 +652,7 @@ Two structural choices make adapters independently testable:
 
 - **Translation is pure** — `anthropic_adapter.translate_request(request, native_model) → dict` and `translate_response(native, public_model) → dict` are side-effect-free functions (unit-tested without HTTP).
 - **Stream translation is a stateful converter** — `AnthropicStreamTranslator` / `GeminiStreamTranslator` consume native SSE events and emit OpenAI chunks; the adapter's I/O shell is thin.
-- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 732 tests run with no network).
+- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 736 tests run with no network).
 
 Note also: because the OpenAI adapter is a passthrough over a configurable `api_base`, **any OpenAI-compatible service (vLLM, Ollama, Groq, Together, …) is already supported** without new code — for chat, embeddings, images and audio.
 
@@ -925,7 +925,7 @@ erDiagram
 
 **Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them.
 
-Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` with no code changes (only async SQLAlchemy is used; JSON columns are provider-neutral).
+Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` (the `postgres` extra, asyncpg) with no code changes — only async SQLAlchemy is used. JSON columns compile to JSONB on PostgreSQL via a shared variant type (`JSONColumn` in `models.py`), which keeps the budget-alert compare-and-swap meaningful there (semantic JSONB equality; plain `json` has no `=` operator); PostgreSQL engines also pre-ping pooled connections so server-side drops recycle instead of surfacing as 500s. The whole test suite runs against either backend — `GATEWAY_TEST_DATABASE_URL` points `conftest` at a live PostgreSQL server, where each test gets its own database (created and dropped around the run; the `VACUUM INTO` backup tests skip, and a test pins the `pg_dump`-pointing 400 refusal). Online backups stay SQLite-only by construction.
 
 There is no Alembic; `init_engine` runs `create_all` preceded by a small in-place upgrade pass (`_add_missing_columns_sync` in `db.py`) that `ALTER TABLE ... ADD COLUMN`s every *nullable* model column an existing table lacks (plus single-column indexes). Databases created before a column existed (e.g. `trace_id`, `model_mappings`) are upgraded transparently on the next start; non-nullable additions are reported instead of applied.
 
@@ -1100,7 +1100,10 @@ Keys are namespaced by the prefix and expire shortly after their window/TTL, so 
 ```
 tests/
 ├── conftest.py          Full app wired to MockTransport upstream (no network, ever);
-│                        fresh temp SQLite DB per test; ASGITransport client
+│                        fresh temp SQLite DB per test (or, with
+│                        GATEWAY_TEST_DATABASE_URL, a per-test database on a real
+│                        PostgreSQL server — same suite, same isolation);
+│                        ASGITransport client
 ├── test_guardrails.py   Unit tests per builtin + manager chaining/blocking + observe mode
 ├── test_guardrail_scoping.py  Scope matching matrix (keys/models include+exclude globs,
 │                        admin-as-key-name, AND across fields) + per-key overrides
@@ -1301,7 +1304,8 @@ tests/
 │                        invalid config keeps the old one running, breaker state
 │                        survives, restart_required honesty, /admin/reload + SIGHUP
 │                        share one path), SQLite backups (VACUUM INTO snapshot is
-│                        a valid DB with the rows, list/delete, bad-name 400) and
+│                        a valid DB with the rows, list/delete, bad-name 400;
+│                        non-SQLite backend refused with 400 + pg_dump pointer) and
 │                        the deployment artifacts' contracts (compose healthcheck
 │                        on /readyz, graceful-shutdown window, volumes)
 ├── test_images.py        Image generation + edits + variations: unit-price

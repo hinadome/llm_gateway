@@ -59,10 +59,24 @@ def _add_missing_columns_sync(conn) -> None:
 
 
 async def init_engine(database_url: str) -> AsyncEngine:
-    """Create the engine (if needed) and create/upgrade tables."""
+    """Create the engine (if needed) and create/upgrade tables.
+
+    SQLite (default) and PostgreSQL both work; the URL picks the
+    dialect (``sqlite+aiosqlite://`` / ``postgresql+asyncpg://`` —
+    the latter needs the ``postgres`` extra). PostgreSQL engines
+    pre-ping pooled connections: the server may drop idle ones
+    (timeouts, restarts, failovers), and a recycled connection beats
+    a 500 from a dead socket. SQLite is in-process, where a ping per
+    checkout is pure overhead.
+    """
     global _engine, _sessionmaker
     if _engine is None:
-        _engine = create_async_engine(database_url, echo=False)
+        kwargs = (
+            {"pool_pre_ping": True}
+            if database_url.startswith("postgresql")
+            else {}
+        )
+        _engine = create_async_engine(database_url, echo=False, **kwargs)
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     async with _engine.begin() as conn:
         from .models import Base  # local import to avoid circular dependency

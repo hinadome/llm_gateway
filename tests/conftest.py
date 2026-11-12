@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import uuid
 from types import SimpleNamespace
 
 import httpx
@@ -561,9 +563,17 @@ async def _make_env(
     jwks_client=None,
     audit_client=None,
 ):
-    """Build a full app (fresh DB + mock upstream) as an async generator."""
+    """Build a full app (fresh DB + mock upstream) as an async generator.
+
+    The database is a SQLite file per test by default. Setting
+    GATEWAY_TEST_DATABASE_URL (a ``postgresql+asyncpg://`` URL to a
+    maintenance database such as ``postgres``) runs the very same
+    suite against a real PostgreSQL server instead: every test gets its
+    own database, created before and dropped after the run — the same
+    isolation story as the per-test SQLite files.
+    """
     reset_engine_for_tests()
-    db_url = f"sqlite+aiosqlite:///{tmp_path}/test.db"
+    db_url, drop_test_database = await _test_database(tmp_path)
     await init_engine(db_url)
 
     mock = MockUpstream()
@@ -586,18 +596,70 @@ async def _make_env(
     )
     app.state.admin_key = ADMIN_KEY  # ASGITransport does not run the lifespan
 
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
-    ) as client:
-        yield SimpleNamespace(app=app, client=client, mock=mock)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+        ) as client:
+            yield SimpleNamespace(app=app, client=client, mock=mock)
+    finally:
+        # Background log writes (logging.background_write): drain the
+        # queue before the engine goes away (mirrors the lifespan
+        # teardown).
+        logging_stop = getattr(app.state.pipeline.logging_service, "stop", None)
+        if logging_stop is not None:
+            await logging_stop()
+        await http_client.aclose()
+        await dispose_engine()
+        if drop_test_database is not None:
+            await drop_test_database()
 
-    # Background log writes (logging.background_write): drain the queue
-    # before the engine goes away (mirrors the lifespan teardown).
-    logging_stop = getattr(app.state.pipeline.logging_service, "stop", None)
-    if logging_stop is not None:
-        await logging_stop()
-    await http_client.aclose()
-    await dispose_engine()
+
+async def _test_database(tmp_path):
+    """(db_url, teardown) for one isolated test database.
+
+    SQLite (default): a fresh file under the test's tmp_path, no
+    teardown needed. PostgreSQL (GATEWAY_TEST_DATABASE_URL set): a
+    database created for this test alone and dropped afterwards —
+    WITH (FORCE) so a connection the pool neglected to close cannot
+    wedge the drop (the engine is disposed by then, so this is
+    belt-and-braces).
+    """
+    base_url = os.environ.get("GATEWAY_TEST_DATABASE_URL")
+    if not base_url:
+        return f"sqlite+aiosqlite:///{tmp_path}/test.db", None
+
+    import asyncpg
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(base_url)
+    dbname = "gwtest_" + uuid.uuid4().hex[:12]
+    connect = dict(
+        host=parsed.host or "localhost",
+        port=parsed.port or 5432,
+        user=parsed.username,
+        password=parsed.password,
+    )
+
+    async def admin_connect():
+        return await asyncpg.connect(database="postgres", **connect)
+
+    conn = await admin_connect()
+    try:
+        await conn.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await conn.close()
+
+    async def drop() -> None:
+        conn = await admin_connect()
+        try:
+            await conn.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await conn.close()
+
+    # The returned URL keeps the caller's driver (postgresql+asyncpg).
+    # render_as_string: str(url) masks the password as *** — the engine
+    # would literally authenticate with "***".
+    return parsed.set(database=dbname).render_as_string(hide_password=False), drop
 
 
 @pytest.fixture

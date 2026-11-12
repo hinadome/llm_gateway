@@ -20,6 +20,20 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- PostgreSQL support: the `postgres` extra (`asyncpg`) plus
+  `GATEWAY_DATABASE_URL=postgresql+asyncpg://...` runs the same
+  gateway on PostgreSQL. JSON columns compile to JSONB there via a
+  shared variant type — which also keeps the budget-alert
+  compare-and-swap working (plain `json` has no equality operator) —
+  and pooled connections are pre-pinged so server-side drops recycle
+  instead of surfacing as 500s. The entire test suite runs against
+  either backend: `GATEWAY_TEST_DATABASE_URL` opts the suite into a
+  real PostgreSQL server, giving every test its own database (created
+  and dropped around the run). Online backups (`POST /admin/backup`)
+  stay SQLite-only: any other backend is refused with a 400
+  (`backup_not_supported`) pointing at the platform's own tooling
+  (`pg_dump`) — a half-copy through a different mechanism would be a
+  false sense of safety.
 - Tenants in the admin dashboard: a Tenants tab (platform admins
   only — a tenant admin lands on a note pointing at their scoped tabs)
   with the tenant table (state incl. kill-switch badge, key count,
@@ -32,9 +46,10 @@ All notable changes to the LLM Gateway are documented here. Format follows
   breakdown when tenants have traffic. The dashboard learns which kind
   of administrator signed in by probing `/admin/tenants` once.
 - CI workflow (`.github/workflows/ci.yml`): the full test suite on
-  Python 3.12 and 3.13 via uv (cached), plus a smoke-check of the
-  shipped `config.yaml`. Dormant until the repository is pushed to
-  GitHub.
+  Python 3.12–3.14 via uv (cached) against SQLite, plus a Python 3.12
+  job running the same suite against a PostgreSQL 17 service
+  container, and a smoke-check of the shipped `config.yaml`. Dormant
+  until the repository is pushed to GitHub.
 
 ## [1.0.0] — 2026-11-12
 

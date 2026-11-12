@@ -20,11 +20,18 @@ backup/restore tooling, and the deployment artifacts.
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 
+import pytest
 import yaml
 
 from .conftest import ADMIN_KEY, _make_env, auth, chat_body, create_key, make_config
+
+# The whole suite can run against a live PostgreSQL server instead of
+# per-test SQLite files (GATEWAY_TEST_DATABASE_URL — see conftest).
+# The VACUUM INTO backup tests are SQLite by construction.
+PG_SUITE = bool(os.environ.get("GATEWAY_TEST_DATABASE_URL"))
 
 
 # ----------------------------------------------------------------------
@@ -467,6 +474,7 @@ async def test_reload_requires_admin(tmp_path):
 # ----------------------------------------------------------------------
 
 
+@pytest.mark.skipif(PG_SUITE, reason="VACUUM INTO snapshot is SQLite-only")
 async def test_backup_creates_valid_sqlite_snapshot(tmp_path):
     async for env in _make_env(tmp_path, config=make_config()):
         backup_dir = tmp_path / "backups"
@@ -498,6 +506,7 @@ async def test_backup_creates_valid_sqlite_snapshot(tmp_path):
         break
 
 
+@pytest.mark.skipif(PG_SUITE, reason="VACUUM INTO snapshot is SQLite-only")
 async def test_backup_list_and_delete(tmp_path):
     import os
 
@@ -559,6 +568,31 @@ async def test_backup_requires_admin(tmp_path):
         assert denied.status_code == 403
         listed = await env.client.get("/admin/backups", headers=auth(key))
         assert listed.status_code == 403
+        break
+
+
+async def test_backup_refused_on_non_sqlite(monkeypatch, tmp_path):
+    """Online backups are SQLite-only: any other backend is refused
+    with an honest 400 pointing at the platform's own tooling, never
+    a half-copy through a different mechanism."""
+    import gateway.db as db_module
+
+    class _FakeDialect:
+        name = "postgresql"
+
+    class _FakeEngine:
+        dialect = _FakeDialect()
+
+    async for env in _make_env(tmp_path, config=make_config()):
+        env.app.state.settings.backup_dir = str(tmp_path / "backups")
+        monkeypatch.setattr(db_module, "get_engine", lambda: _FakeEngine())
+        resp = await env.client.post("/admin/backup", headers=auth(ADMIN_KEY))
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "backup_not_supported"
+        assert "pg_dump" in body["error"]["message"]
+        # Nothing was written — the refusal happens before any I/O.
+        assert not (tmp_path / "backups").exists()
         break
 
 

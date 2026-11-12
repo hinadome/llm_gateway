@@ -30,6 +30,9 @@ guardrails = [
 auth = [
     "pyjwt[crypto]>=2.9",
 ]
+postgres = [
+    "asyncpg>=0.30",
+]
 
 [dependency-groups]
 dev = [
@@ -39,6 +42,7 @@ dev = [
     "presidio-analyzer>=2.2",
     "openai>=3.49.0",
     "pyjwt[crypto]>=2.9",
+    "asyncpg>=0.30",
 ]
 
 [build-system]

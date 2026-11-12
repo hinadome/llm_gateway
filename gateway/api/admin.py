@@ -1156,13 +1156,28 @@ async def create_backup(
     the live database without blocking traffic (safe while requests are
     being served and logged). Restore is deliberately offline — stop the
     gateway, replace the database file, start it again; restoring under
-    a live engine is a footgun the API refuses to be."""
+    a live engine is a footgun the API refuses to be.
+
+    SQLite-only by construction: any other backend (PostgreSQL) is
+    refused with a 400 pointing at the platform's own tooling
+    (pg_dump) — a half-copy through a different mechanism would be a
+    false sense of safety.
+    """
     from ..db import get_engine
 
+    engine = get_engine()
+    if engine.dialect.name != "sqlite":
+        raise GatewayError(
+            400,
+            "Online backups are SQLite-only (VACUUM INTO). For a "
+            f"{engine.dialect.name} database, use its own tooling "
+            "(pg_dump for PostgreSQL).",
+            "invalid_request_error",
+            code="backup_not_supported",
+        )
     backup_dir = Path(raw_request.app.state.settings.backup_dir)
     backup_dir.mkdir(parents=True, exist_ok=True)
     path = backup_dir / f"gateway-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.db"
-    engine = get_engine()
     async with engine.connect() as conn:
         await conn.exec_driver_sql("VACUUM INTO ?", (str(path),))
     size = path.stat().st_size
