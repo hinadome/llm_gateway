@@ -48,7 +48,14 @@ from ..guardrails.manager import GuardrailManager
 from ..observability import metrics
 from ..observability.metrics import KeyLabeler
 from .prompts import apply_prompt_policy, substitute
-from ..schemas import ChatCompletionRequest, EmbeddingRequest, Message
+from ..schemas import (
+    ChatCompletionRequest,
+    EmbeddingRequest,
+    ImageGenerationRequest,
+    Message,
+    SpeechRequest,
+    TranscriptionRequest,
+)
 from ..utils import content_to_text, daily_bucket, estimate_tokens, monthly_bucket
 from .cache import ResponseCache, cache_key_for
 from .semantic_cache import SemanticCache
@@ -403,6 +410,61 @@ class GatewayPipeline:
     # Embeddings
     # ------------------------------------------------------------------
 
+    async def _serve_simple(
+        self,
+        model: str,
+        request_body: dict,
+        auth: AuthContext,
+        request_id: str | None,
+        span_name: str,
+        event: str,
+        inner: Callable[[RequestContext], Awaitable[Response]],
+    ) -> Response:
+        """Shared wrapper for the non-chat surfaces (embeddings, images,
+        audio): context, in-flight metric, span, error-path logging —
+        ``inner(ctx)`` runs the modality's own pipeline phase."""
+        ctx = RequestContext(
+            request_id=request_id or f"req_{uuid.uuid4().hex}",
+            auth=auth,
+            model=model,
+            stream=False,
+            request_body=request_body,
+        )
+        metrics.INFLIGHT.inc()
+        span = self._tracer.start_span(span_name, kind=SpanKind.INTERNAL)
+        ctx.otel_span = span
+        span_context = span.get_span_context()
+        if span_context.is_valid:
+            ctx.trace_id = format(span_context.trace_id, "032x")
+            ctx.span_id = format(span_context.span_id, "016x")
+        span.set_attribute("gateway.request_id", ctx.request_id)
+        span.set_attribute("gateway.model", model)
+        span.set_attribute("gateway.key_name", ctx.auth.key_name or "admin")
+        with use_span(
+            span,
+            end_on_exit=False,
+            record_exception=False,
+            set_status_on_exception=False,
+        ):
+            try:
+                response = await inner(ctx)
+            except GatewayError as exc:
+                ctx.status = "error"
+                ctx.error_message = exc.message
+                self._request_metric(ctx)
+                await self._log(ctx, event=event)
+                self._finish_span(ctx, exc)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                ctx.status = "error"
+                ctx.error_message = f"internal error: {exc}"
+                self._request_metric(ctx)
+                await self._log(ctx, event=event)
+                self._finish_span(ctx, exc)
+                raise
+            self._finish_span(ctx)
+            return response
+
     async def handle_embedding(
         self, request: EmbeddingRequest, auth: AuthContext, request_id: str | None = None
     ) -> Response:
@@ -414,47 +476,15 @@ class GatewayPipeline:
         Rate limits, budgets, model allowlists, caching, retries, fallbacks,
         circuit breakers, cost tracking and logging all apply unchanged.
         """
-        ctx = RequestContext(
-            request_id=request_id or f"req_{uuid.uuid4().hex}",
-            auth=auth,
-            model=request.model,
-            stream=False,
-            request_body=request.model_dump(exclude_none=True),
+        return await self._serve_simple(
+            request.model,
+            request.model_dump(exclude_none=True),
+            auth,
+            request_id,
+            "gateway.embedding",
+            "embedding request completed",
+            lambda ctx: self._handle_embedding(request, ctx),
         )
-        metrics.INFLIGHT.inc()
-        span = self._tracer.start_span("gateway.embedding", kind=SpanKind.INTERNAL)
-        ctx.otel_span = span
-        span_context = span.get_span_context()
-        if span_context.is_valid:
-            ctx.trace_id = format(span_context.trace_id, "032x")
-            ctx.span_id = format(span_context.span_id, "016x")
-        span.set_attribute("gateway.request_id", ctx.request_id)
-        span.set_attribute("gateway.model", request.model)
-        span.set_attribute("gateway.key_name", ctx.auth.key_name or "admin")
-        with use_span(
-            span,
-            end_on_exit=False,
-            record_exception=False,
-            set_status_on_exception=False,
-        ):
-            try:
-                response = await self._handle_embedding(request, ctx)
-            except GatewayError as exc:
-                ctx.status = "error"
-                ctx.error_message = exc.message
-                self._request_metric(ctx)
-                await self._log(ctx, event="embedding request completed")
-                self._finish_span(ctx, exc)
-                raise
-            except Exception as exc:  # noqa: BLE001
-                ctx.status = "error"
-                ctx.error_message = f"internal error: {exc}"
-                self._request_metric(ctx)
-                await self._log(ctx, event="embedding request completed")
-                self._finish_span(ctx, exc)
-                raise
-            self._finish_span(ctx)
-            return response
 
     async def _handle_embedding(
         self, request: EmbeddingRequest, ctx: RequestContext
@@ -528,6 +558,232 @@ class GatewayPipeline:
         if request.encoding_format == "base64":
             return _encode_embeddings_base64(response)
         return response
+
+    # ------------------------------------------------------------------
+    # Image generation / audio (same pre-flight checks as embeddings:
+    # guardrails are chat-typed and do not run; no caching — image and
+    # speech generation are non-deterministic, transcription is cheap
+    # relative to its upload; retries/fallbacks/breakers/cost/logging
+    # all apply unchanged)
+    # ------------------------------------------------------------------
+
+    async def handle_image_generation(
+        self,
+        request: ImageGenerationRequest,
+        auth: AuthContext,
+        request_id: str | None = None,
+    ) -> Response:
+        """POST /v1/images/generations — OpenAI Images API."""
+        return await self._serve_simple(
+            request.model,
+            request.model_dump(exclude_none=True),
+            auth,
+            request_id,
+            "gateway.image_generation",
+            "image generation completed",
+            lambda ctx: self._handle_image_generation(request, ctx),
+        )
+
+    async def _handle_image_generation(
+        self, request: ImageGenerationRequest, ctx: RequestContext
+    ) -> Response:
+        resolved = self._resolve_model(request.model, ctx.auth)
+        if resolved != request.model:
+            request = request.model_copy(update={"model": resolved})
+            ctx.model = resolved
+            if ctx.otel_span is not None:
+                ctx.otel_span.set_attribute("gateway.model", resolved)
+
+        if not ctx.auth.is_admin:
+            self._check_model_permission(ctx.auth, request.model)
+
+        await self._check_rate_limit(ctx, estimate_tokens(request.prompt))
+        self._check_budget(ctx)
+
+        deployment, response = await self.router.generate_image(request)
+        ctx.provider = deployment.provider
+        ctx.deployment = deployment.name
+        ctx.native_model = deployment.model
+
+        images = len(response.get("data") or []) or max(1, request.n)
+        cost = self.cost_calculator.calculate_images(
+            deployment.model, images
+        ) or self.cost_calculator.calculate_images(ctx.model, images)
+        await self._account_cost(ctx, cost, prompt_tokens=estimate_tokens(request.prompt))
+        ctx.response_body = response
+        ctx.status = "success"
+
+        self._request_metric(ctx)
+        metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
+            ctx.latency_ms() / 1000
+        )
+        await self._log(ctx, event="image generation completed")
+        return JSONResponse(content=response, headers=self._headers(ctx, "NONE"))
+
+    async def handle_transcription(
+        self,
+        request: TranscriptionRequest,
+        auth: AuthContext,
+        request_id: str | None = None,
+    ) -> Response:
+        """POST /v1/audio/transcriptions + /v1/audio/translations (multipart).
+
+        The log's request_body carries metadata only (file name + size,
+        never the audio bytes). Cost is duration-based when the provider
+        reports a duration (``verbose_json``); audio bytes deliberately do
+        not count as text tokens for TPM — RPM still applies.
+        """
+        body = {
+            "model": request.model,
+            "endpoint": request.endpoint,
+            "language": request.language,
+            "prompt": request.prompt,
+            "response_format": request.response_format,
+            "file_name": request.file_name,
+            "file_size_bytes": len(request.file),
+        }
+        return await self._serve_simple(
+            request.model,
+            {k: v for k, v in body.items() if v is not None},
+            auth,
+            request_id,
+            "gateway.transcription",
+            "audio transcription completed",
+            lambda ctx: self._handle_transcription(request, ctx),
+        )
+
+    async def _handle_transcription(
+        self, request: TranscriptionRequest, ctx: RequestContext
+    ) -> Response:
+        resolved = self._resolve_model(request.model, ctx.auth)
+        if resolved != request.model:
+            request = request.model_copy(update={"model": resolved})
+            ctx.model = resolved
+            if ctx.otel_span is not None:
+                ctx.otel_span.set_attribute("gateway.model", resolved)
+
+        if not ctx.auth.is_admin:
+            self._check_model_permission(ctx.auth, request.model)
+
+        await self._check_rate_limit(ctx, estimate_tokens(request.prompt or ""))
+        self._check_budget(ctx)
+
+        deployment, (content, media_type) = await self.router.transcribe(request)
+        ctx.provider = deployment.provider
+        ctx.deployment = deployment.name
+        ctx.native_model = deployment.model
+
+        duration = content.get("duration") if isinstance(content, dict) else None
+        minutes = float(duration) / 60.0 if duration else 0.0
+        cost = self.cost_calculator.calculate_audio(
+            deployment.model, minutes
+        ) or self.cost_calculator.calculate_audio(ctx.model, minutes)
+        text = (
+            content.get("text") if isinstance(content, dict) else content
+        ) or ""
+        await self._account_cost(ctx, cost, completion_tokens=estimate_tokens(text))
+        ctx.response_body = content if isinstance(content, dict) else {"text": text}
+        ctx.status = "success"
+
+        self._request_metric(ctx)
+        metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
+            ctx.latency_ms() / 1000
+        )
+        await self._log(ctx, event="audio transcription completed")
+        if isinstance(content, dict):
+            return JSONResponse(content=content, headers=self._headers(ctx, "NONE"))
+        return Response(content=content, media_type=media_type, headers=self._headers(ctx, "NONE"))
+
+    async def handle_speech(
+        self,
+        request: SpeechRequest,
+        auth: AuthContext,
+        request_id: str | None = None,
+    ) -> Response:
+        """POST /v1/audio/speech — OpenAI Speech API (binary audio out)."""
+        return await self._serve_simple(
+            request.model,
+            request.model_dump(exclude_none=True),
+            auth,
+            request_id,
+            "gateway.speech",
+            "speech synthesis completed",
+            lambda ctx: self._handle_speech(request, ctx),
+        )
+
+    async def _handle_speech(
+        self, request: SpeechRequest, ctx: RequestContext
+    ) -> Response:
+        resolved = self._resolve_model(request.model, ctx.auth)
+        if resolved != request.model:
+            request = request.model_copy(update={"model": resolved})
+            ctx.model = resolved
+            if ctx.otel_span is not None:
+                ctx.otel_span.set_attribute("gateway.model", resolved)
+
+        if not ctx.auth.is_admin:
+            self._check_model_permission(ctx.auth, request.model)
+
+        await self._check_rate_limit(ctx, estimate_tokens(request.input))
+        self._check_budget(ctx)
+
+        deployment, (audio, media_type) = await self.router.speak(request)
+        ctx.provider = deployment.provider
+        ctx.deployment = deployment.name
+        ctx.native_model = deployment.model
+
+        cost = self.cost_calculator.calculate_speech(
+            deployment.model, len(request.input)
+        ) or self.cost_calculator.calculate_speech(ctx.model, len(request.input))
+        await self._account_cost(ctx, cost, prompt_tokens=estimate_tokens(request.input))
+        # Binary audio: the log records a note about it, never the bytes.
+        ctx.response_body = {
+            "note": "binary audio response",
+            "media_type": media_type,
+            "bytes": len(audio),
+        }
+        ctx.status = "success"
+
+        self._request_metric(ctx)
+        metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
+            ctx.latency_ms() / 1000
+        )
+        await self._log(ctx, event="speech synthesis completed")
+        return Response(content=audio, media_type=media_type, headers=self._headers(ctx, "NONE"))
+
+    async def _account_cost(
+        self,
+        ctx: RequestContext,
+        cost: float,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        """Accounting for the non-token modalities (images, audio): the cost
+        comes from unit prices (per image / per minute / per 1M chars), the
+        token counters are estimates feeding the log row and TPM. Mirrors
+        ``_account_usage`` minus the usage-dict path."""
+        ctx.prompt_tokens = prompt_tokens or ctx.prompt_tokens
+        ctx.completion_tokens = completion_tokens or ctx.completion_tokens
+        if prompt_tokens or completion_tokens:
+            metrics.TOKENS.labels("prompt").inc(prompt_tokens)
+            metrics.TOKENS.labels("completion").inc(completion_tokens)
+            if self.config.metrics.per_key:
+                key = self._key_labeler.label(ctx.auth.key_name)
+                metrics.KEY_TOKENS.labels(key=key, type="prompt").inc(prompt_tokens)
+                metrics.KEY_TOKENS.labels(key=key, type="completion").inc(
+                    completion_tokens
+                )
+            if ctx.auth.key_id is not None and not ctx.cache_hit:
+                await self.rate_limiter.record_usage(
+                    ctx.auth.key_id, prompt_tokens + completion_tokens
+                )
+        ctx.cost_usd = cost
+        metrics.COST.labels(model=ctx.model).inc(cost)
+        if self.config.metrics.per_key:
+            metrics.KEY_COST.labels(
+                key=self._key_labeler.label(ctx.auth.key_name)
+            ).inc(cost)
+        self._queue_spend(ctx, cost)
 
     # ------------------------------------------------------------------
     # Streaming machinery

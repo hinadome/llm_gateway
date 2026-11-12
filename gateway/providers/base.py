@@ -6,10 +6,18 @@ on the upstream side. Three methods:
 * ``complete`` — non-streaming; returns an OpenAI ``chat.completion`` dict.
 * ``stream``  — yields OpenAI ``chat.completion.chunk`` dicts; usage (when
   available) is attached to the final chunk's ``usage`` field.
-* ``embed``   — embeddings; returns an OpenAI ``list[embedding]`` dict. The
-  base implementation raises a clear error, so chat-only providers (e.g.
-  Anthropic) need no special handling — the router falls through to the
-  next deployment.
+* ``embed``   — embeddings; returns an OpenAI ``list[embedding]`` dict.
+* ``generate_image`` — image generation; returns an OpenAI ``images.response``
+  dict (``{created, data: [...]}``).
+* ``transcribe`` — audio transcription/translation; returns
+  ``(content, media_type)`` — content is a dict for JSON response formats,
+  plain text otherwise (srt/vtt/text).
+* ``speak``    — text-to-speech; returns ``(audio_bytes, media_type)``.
+
+The base implementations of the non-chat methods raise a clear error that
+is not retryable on the same deployment but does fall through to the next
+one, so chat-only providers (e.g. Anthropic) need no special handling —
+the router falls through to a deployment that supports the modality.
 """
 
 from __future__ import annotations
@@ -22,7 +30,13 @@ import httpx
 
 from ..config import DeploymentConfig, ProviderConfig
 from ..errors import ProviderError
-from ..schemas import ChatCompletionRequest, EmbeddingRequest
+from ..schemas import (
+    ChatCompletionRequest,
+    EmbeddingRequest,
+    ImageGenerationRequest,
+    SpeechRequest,
+    TranscriptionRequest,
+)
 from .sse import sse_data_lines
 
 
@@ -139,6 +153,62 @@ class ProviderAdapter(ABC):
             f"(deployment '{deployment.name}').",
             "api_error",
             code="embeddings_not_supported",
+            fallback=True,
+        )
+
+    async def generate_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageGenerationRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        """Generate images; return an OpenAI images-format dict."""
+        raise ProviderError(
+            501,
+            f"Provider '{self.name}' does not support image generation "
+            f"(deployment '{deployment.name}').",
+            "api_error",
+            code="images_not_supported",
+            fallback=True,
+        )
+
+    async def transcribe(
+        self,
+        deployment: DeploymentConfig,
+        request: TranscriptionRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> tuple[dict | str, str]:
+        """Transcribe/translate audio; return ``(content, media_type)``.
+
+        ``content`` is a dict for the JSON response formats (``json``,
+        ``verbose_json``) and a string for the text ones (``text``, ``srt``,
+        ``vtt``); ``media_type`` is the provider's response content type.
+        """
+        raise ProviderError(
+            501,
+            f"Provider '{self.name}' does not support audio transcription "
+            f"(deployment '{deployment.name}').",
+            "api_error",
+            code="audio_not_supported",
+            fallback=True,
+        )
+
+    async def speak(
+        self,
+        deployment: DeploymentConfig,
+        request: SpeechRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> tuple[bytes, str]:
+        """Synthesize speech; return ``(audio_bytes, media_type)``."""
+        raise ProviderError(
+            501,
+            f"Provider '{self.name}' does not support text-to-speech "
+            f"(deployment '{deployment.name}').",
+            "api_error",
+            code="audio_not_supported",
             fallback=True,
         )
 

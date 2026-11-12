@@ -23,7 +23,13 @@ from typing import AsyncIterator
 import httpx
 
 from ..config import DeploymentConfig, ProviderConfig
-from ..schemas import ChatCompletionRequest, EmbeddingRequest
+from ..schemas import (
+    ChatCompletionRequest,
+    EmbeddingRequest,
+    ImageGenerationRequest,
+    SpeechRequest,
+    TranscriptionRequest,
+)
 from .base import ProviderAdapter, network_error, raise_for_provider_status
 from .responses_native import completion_to_chat, native_body, stream_events_to_chunks
 from .sse import sse_data_lines
@@ -45,11 +51,28 @@ class OpenAIProviderAdapter(ProviderAdapter):
     def _embed_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
         return f"{provider_cfg.api_base.rstrip('/')}/embeddings"
 
+    def _images_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return f"{provider_cfg.api_base.rstrip('/')}/images/generations"
+
+    def _audio_url(
+        self, deployment: DeploymentConfig, provider_cfg: ProviderConfig, kind: str
+    ) -> str:
+        # kind: "transcriptions" | "translations"
+        return f"{provider_cfg.api_base.rstrip('/')}/audio/{kind}"
+
+    def _speech_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return f"{provider_cfg.api_base.rstrip('/')}/audio/speech"
+
     def _headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {provider_cfg.resolve_key() or ''}",
             "Content-Type": "application/json",
         }
+
+    def _auth_headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
+        """Auth only — for requests where httpx owns the Content-Type
+        (multipart uploads, which need their boundary in it)."""
+        return {"Authorization": f"Bearer {provider_cfg.resolve_key() or ''}"}
 
     @staticmethod
     def _build_body(request: ChatCompletionRequest, native_model: str) -> dict:
@@ -116,6 +139,98 @@ class OpenAIProviderAdapter(ProviderAdapter):
         )
         data["model"] = request.model
         return data
+
+    async def generate_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageGenerationRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        body = request.model_dump(exclude_none=True)
+        body["model"] = deployment.model
+        return await self._read_json(
+            "POST",
+            self._images_url(deployment, provider_cfg),
+            self._headers(provider_cfg),
+            body,
+            timeout,
+            self.name,
+        )
+
+    async def transcribe(
+        self,
+        deployment: DeploymentConfig,
+        request: TranscriptionRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> tuple[dict | str, str]:
+        """Multipart forward to OpenAI's /audio/{transcriptions,translations}.
+
+        Unknown form fields ride along (``extra``), so provider-specific
+        parameters (e.g. ``timestamp_granularities[]``) keep working without
+        gateway changes. The response is returned with the provider's
+        content type — JSON formats parse to a dict, text formats (srt/vtt)
+        pass through as strings.
+        """
+        data: dict[str, str | list[str]] = {"model": deployment.model}
+        for field in ("language", "prompt", "response_format", "temperature"):
+            value = getattr(request, field)
+            if value is not None:
+                data[field] = str(value)
+        data.update(request.extra)
+        files = {
+            "file": (
+                request.file_name,
+                request.file,
+                request.file_content_type or "application/octet-stream",
+            )
+        }
+        try:
+            response = await self.client.post(
+                self._audio_url(deployment, provider_cfg, request.endpoint),
+                headers=self._auth_headers(provider_cfg),
+                data=data,
+                files=files,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise network_error(self.name, exc) from exc
+        raise_for_provider_status(response, self.name)
+        media_type = response.headers.get("content-type", "application/json")
+        if "json" in media_type:
+            try:
+                return response.json(), media_type
+            except Exception as exc:  # invalid JSON from provider
+                raise ProviderError(
+                    502, f"Invalid JSON from provider '{self.name}'", "api_error",
+                    retryable=True, fallback=True, provider=self.name,
+                ) from exc
+        return response.text, media_type
+
+    async def speak(
+        self,
+        deployment: DeploymentConfig,
+        request: SpeechRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> tuple[bytes, str]:
+        body = request.model_dump(exclude_none=True)
+        body["model"] = deployment.model
+        try:
+            response = await self.client.post(
+                self._speech_url(deployment, provider_cfg),
+                headers=self._headers(provider_cfg),
+                json=body,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise network_error(self.name, exc) from exc
+        raise_for_provider_status(response, self.name)
+        return (
+            response.content,
+            response.headers.get("content-type", "audio/mpeg"),
+        )
 
     async def stream(
         self,

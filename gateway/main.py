@@ -31,9 +31,11 @@ from sqlalchemy import text
 from . import __version__
 from .api import admin as admin_api
 from .api import anthropic_native
+from .api import audio as audio_api
 from .api import chat as chat_api
 from .api import embeddings as embeddings_api
 from .api import gemini_native
+from .api import images as images_api
 from .api import models as models_api
 from .api import openai_responses as responses_api
 from .bootstrap import ensure_admin_key, ensure_default_key
@@ -493,6 +495,8 @@ def create_app(
     app.include_router(anthropic_native.router)
     app.include_router(gemini_native.router)
     app.include_router(responses_api.router)
+    app.include_router(images_api.router)
+    app.include_router(audio_api.router)
     app.include_router(admin_api.router)
 
     @app.get("/health")

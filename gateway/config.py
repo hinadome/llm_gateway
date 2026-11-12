@@ -322,6 +322,17 @@ class PromptsConfig(BaseModel):
     library_cache_seconds: float = 30.0
 
 
+class AudioConfig(BaseModel):
+    """Multipart upload policy for /v1/audio/transcriptions|translations.
+
+    ``max_upload_mb`` caps the uploaded file size (413 beyond it) — the
+    gateway buffers uploads to route/retry them, so a bound protects
+    memory. 25 MB matches OpenAI's own limit.
+    """
+
+    max_upload_mb: int = 25
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -407,6 +418,7 @@ class GatewayConfig(BaseModel):
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @classmethod

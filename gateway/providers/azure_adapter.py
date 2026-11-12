@@ -15,6 +15,11 @@ all handled by overriding the URL/header hooks of the OpenAI adapter:
   a recent stable version; override per provider with
   ``providers.azure.api_version``.
 
+Azure supports the same non-chat surfaces with deployment-addressed URLs —
+images/generations, audio/transcriptions, audio/translations and
+audio/speech (Whisper / gpt-4o-transcribe deployments for the audio ones) —
+so they pass through this subclass unchanged too.
+
 Streaming, tools, and embeddings pass through unchanged — Azure's
 responses are OpenAI-shaped, so the parent adapter's translation,
 usage accounting and error mapping apply as-is.
@@ -60,8 +65,24 @@ class AzureProviderAdapter(OpenAIProviderAdapter):
     def _embed_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
         return self._deployment_path(deployment, provider_cfg, "embeddings")
 
+    def _images_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return self._deployment_path(deployment, provider_cfg, "images/generations")
+
+    def _audio_url(
+        self, deployment: DeploymentConfig, provider_cfg: ProviderConfig, kind: str
+    ) -> str:
+        # kind: "transcriptions" | "translations"
+        return self._deployment_path(deployment, provider_cfg, f"audio/{kind}")
+
+    def _speech_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return self._deployment_path(deployment, provider_cfg, "audio/speech")
+
     def _headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
         return {
             "api-key": provider_cfg.resolve_key() or "",
             "Content-Type": "application/json",
         }
+
+    def _auth_headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
+        # Multipart uploads: httpx owns the Content-Type (boundary).
+        return {"api-key": provider_cfg.resolve_key() or ""}

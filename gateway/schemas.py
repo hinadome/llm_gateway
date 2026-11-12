@@ -118,6 +118,65 @@ class EmbeddingRequest(BaseModel):
     user: str | None = None
 
 
+class ImageGenerationRequest(BaseModel):
+    """POST /v1/images/generations body (OpenAI Images schema, extras allowed).
+
+    ``n`` defaults to 1. ``size``/``quality``/``style`` pass through to the
+    provider; ``response_format`` (``url`` | ``b64_json``) applies to the
+    DALL·E API — gpt-image-1 always returns base64. Streaming partial
+    images (gpt-image-1 ``stream: true``) are not supported.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    prompt: str
+    n: int = 1
+    size: str | None = None
+    quality: str | None = None
+    style: str | None = None
+    response_format: str | None = None
+    user: str | None = None
+
+
+class TranscriptionRequest(BaseModel):
+    """Internal shape for /v1/audio/transcriptions + /v1/audio/translations.
+
+    Built by the API layer from the parsed multipart form (never directly
+    deserialized from JSON): ``file`` carries the audio bytes,
+    ``endpoint`` selects which OpenAI audio endpoint to call, and ``extra``
+    holds unknown form fields for provider passthrough.
+    """
+
+    model: str
+    endpoint: str = "transcriptions"  # "transcriptions" | "translations"
+    file: bytes
+    file_name: str = "audio"
+    file_content_type: str | None = None
+    language: str | None = None
+    prompt: str | None = None
+    response_format: str | None = None  # json | text | srt | verbose_json | vtt
+    temperature: float | None = None
+    extra: dict[str, list[str]] = {}
+
+
+class SpeechRequest(BaseModel):
+    """POST /v1/audio/speech body (OpenAI Speech schema, extras allowed).
+
+    The response is binary audio (``response_format`` selects the codec —
+    mp3 by default), not JSON.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    input: str
+    voice: str
+    response_format: str | None = None
+    speed: float | None = None
+    user: str | None = None
+
+
 # --------------------------------------------------------------------------
 # Response models
 # --------------------------------------------------------------------------

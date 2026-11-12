@@ -4,6 +4,42 @@ All notable changes to the LLM Gateway are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+Image generation and audio — the non-chat modalities, on the same policy
+spine (keys, routing, retries, failover, breakers, budgets, rate limits,
+logging).
+
+### Added
+
+- `POST /v1/images/generations` — OpenAI Images API. OpenAI/Azure pass
+  through; Gemini translates to `generateContent` with image output
+  (`n` images = `n` sequential calls; `size`/`quality` have no Gemini
+  equivalent and are ignored). `stream: true` is rejected with a 400.
+- `POST /v1/audio/transcriptions` + `POST /v1/audio/translations` —
+  multipart, parsed once at the edge, re-serialized upstream with unknown
+  form fields passed through. JSON (`json`/`verbose_json`) or text
+  (`text`/`srt`/`vtt`) responses per `response_format`. Uploads capped by
+  `audio.max_upload_mb` (default 25 MB, hot-reloadable; 413 beyond).
+- `POST /v1/audio/speech` — OpenAI Speech API (binary audio out, buffered).
+- `ProviderAdapter` contract extended: `generate_image` / `transcribe` /
+  `speak`, each defaulting to a 501-with-fallback so chat-only providers
+  (Anthropic) need no special handling — the routing group falls through.
+  The router's non-streaming executor is now one shared `_dispatch`
+  behind `complete`/`embed`/`generate_image`/`transcribe`/`speak`.
+- Non-token cost tracking: unit prices in the `pricing:` block
+  (`image_usd` per image, `audio_usd_per_minute` — billed from the
+  duration `verbose_json` reports, `speech_usd_per_1m_chars`), same
+  longest-prefix match as token prices.
+- Endpoint scopes `images` and `audio` for per-key `allowed_endpoints`.
+- Audio uploads are never persisted: the request log stores file name +
+  size; speech responses are logged as a note (media type + byte count).
+
+### Changed
+
+- `handle_embedding` and the new modality handlers share one pipeline
+  wrapper (`_serve_simple`); embeddings behavior is unchanged.
+
 ## [0.1.0] — 2026-11-12
 
 First tagged milestone: a production-shaped LLM gateway with flexible

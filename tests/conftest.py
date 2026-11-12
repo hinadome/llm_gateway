@@ -260,8 +260,35 @@ class MockUpstream:
             },
         )
 
+    @staticmethod
+    def _multipart_fields(content: bytes, content_type: str) -> dict[str, str]:
+        """Minimal multipart/form-data parse (field name -> value/filename).
+
+        Good enough for assertions about what the provider received —
+        not a general MIME parser.
+        """
+        fields: dict[str, str] = {}
+        if "boundary=" not in content_type:
+            return fields
+        boundary = content_type.split("boundary=")[-1].strip().encode()
+        for part in content.split(b"--" + boundary):
+            if b'name="' not in part:
+                continue
+            header, _, value = part.partition(b"\r\n\r\n")
+            if not _:
+                continue
+            name = header.split(b'name="')[1].split(b'"')[0].decode()
+            if b'filename="' in header:
+                fields[name] = header.split(b'filename="')[1].split(b'"')[0].decode()
+            else:
+                fields[name] = value.rstrip(b"\r\n").decode(errors="replace")
+        return fields
+
     def handler(self, request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content) if request.content else {}
+        try:
+            body = json.loads(request.content) if request.content else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {"_raw": True, "size_bytes": len(request.content)}
         self.requests.append(
             {"url": str(request.url), "headers": dict(request.headers), "body": body}
         )
@@ -272,6 +299,47 @@ class MockUpstream:
         path = request.url.path
         if path.endswith("/responses"):
             return self._responses_route(body)
+        if path.endswith("/images/generations"):
+            n = int(body.get("n") or 1)
+            return httpx.Response(
+                200,
+                json={
+                    "created": 1700000000,
+                    "data": [{"b64_json": f"aW1hZ2VkYXRh{i}"} for i in range(n)],
+                },
+            )
+        if path.endswith("/audio/transcriptions") or path.endswith(
+            "/audio/translations"
+        ):
+            fields = self._multipart_fields(
+                request.content, request.headers.get("content-type", "")
+            )
+            # Surface the parsed form (not the raw bytes) for assertions.
+            self.requests[-1]["body"] = {
+                "_multipart": fields,
+                "endpoint": path.rsplit("/", 1)[-1],
+            }
+            if self.fail_counts.get(fields.get("model"), 0) > 0:
+                self.fail_counts[fields["model"]] -= 1
+                return httpx.Response(500, json={"error": {"message": "boom"}})
+            fmt = fields.get("response_format")
+            if fmt in ("text", "srt", "vtt"):
+                text = (
+                    "1\n00:00:00,000 --> 00:00:01,000\ntranscribed words\n"
+                    if fmt == "srt"
+                    else "transcribed words"
+                )
+                return httpx.Response(200, text=text)
+            out = {"text": "transcribed words", "model": fields.get("model")}
+            if fmt == "verbose_json":
+                out["duration"] = 42.0  # seconds — drives per-minute cost
+            return httpx.Response(200, json=out)
+        if path.endswith("/audio/speech"):
+            return httpx.Response(
+                200,
+                content=b"FAKEAUDIODATA",
+                headers={"content-type": "audio/mpeg"},
+            )
         if path.endswith("/embeddings"):
             return httpx.Response(200, json=self._embedding_response(body))
         if ":batchEmbedContents" in path:
@@ -282,6 +350,30 @@ class MockUpstream:
                 json={
                     "embeddings": [
                         {"values": [0.25, 0.5, 0.75, 1.0]} for _ in requests_
+                    ]
+                },
+            )
+        if ":generateContent" in path and "IMAGE" in (
+            (body.get("generationConfig") or {}).get("responseModalities") or []
+        ):
+            # Gemini image generation: one inline image + some text.
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"text": "here is your image"},
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/png",
+                                            "data": "Z2VtaW5pLWltZw==",
+                                        }
+                                    },
+                                ]
+                            }
+                        }
                     ]
                 },
             )

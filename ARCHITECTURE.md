@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 58 Python files, ~13,170 lines, 604 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 60 Python files, ~13,970 lines, 637 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -87,9 +87,10 @@ gateway/
 │                           models — incl. shadow deployments/canary weights — model_aliases/default_model,
 │                           guardrails + their scopes, cache, routing incl. breaker backend, auth chain
 │                           (admin_key/virtual_key/jwt/custom + JWT verification), audit + alerts webhooks,
-│                           pricing, logging incl. store_bodies/retention_days/
+│                           pricing (per-1M-token + modality unit prices), logging incl.
+│                           store_bodies/retention_days/
 │                           background_write, metrics incl. per_key,
-│                           prompts incl. system_prompt/variables)
+│                           prompts incl. system_prompt/variables, audio upload cap)
 ├── schemas.py              OpenAI-compatible pydantic models (request, response, chunks, admin);
 │                           ChatCompletionRequest carries private attrs (never serialized,
 │                           excluded from cache identity/logs) for the native Responses
@@ -107,7 +108,8 @@ gateway/
 │   │                       x-api-key, x-goog-api-key, api-key, ?key= — one
 │   │                       namespace for all inbound wire formats) → hand it
 │   │                       to the auth chain (app.state), then enforce token
-│   │                       scoping (allowed_endpoints / allowed_ips, never
+│   │                       scoping (allowed_endpoints — chat / embeddings /
+│   │                       images / audio / models — + allowed_ips, never
 │   │                       on admins); require_admin
 │   ├── chat.py             POST /v1/chat/completions → pipeline.handle_chat
 │   ├── embeddings.py       POST /v1/embeddings → pipeline.handle_embedding
@@ -138,6 +140,15 @@ gateway/
 │   │                       Also attaches the original body + a pristine
 │   │                       messages snapshot as private attrs, feeding
 │   │                       the native Responses southbound
+│   ├── images.py           POST /v1/images/generations → pipeline
+│   │                       .handle_image_generation (stream: true rejected
+│   │                       with a 400 — it would bypass accounting)
+│   ├── audio.py            POST /v1/audio/transcriptions + /translations
+│   │                       (multipart parsed once at the edge, validated
+│   │                       against audio.max_upload_mb — 413 beyond —
+│   │                       unknown form fields ride along for provider
+│   │                       passthrough) + /v1/audio/speech (JSON in,
+│   │                       binary audio out)
 │   └── admin.py            Keys CRUD (incl. per-key model_mappings / default_model,
 │                           prompt policy fields and scoping fields), the prompt
 │                           library CRUD (create/version, summaries, per-name
@@ -158,6 +169,16 @@ gateway/
 ├── core/                   ── Policy & orchestration (framework-agnostic; no FastAPI types) ──
 │   ├── pipeline.py         GatewayPipeline: the chat request lifecycle (see §5) + the
 │   │                       embeddings path (same pre-flight checks, no guardrails);
+│   │                       _serve_simple is the shared wrapper for every non-chat
+│   │                       surface (embeddings, images, audio: context, in-flight
+│   │                       metric, span, error-path logging) and handle_image_
+│   │                       generation / handle_transcription / handle_speech run
+│   │                       the modality pipelines on it — no guardrails, no
+│   │                       response cache (X-Gateway-Cache: NONE), unit-priced
+│   │                       cost via _account_cost (per image / per minute /
+│   │                       per 1M chars), audio bytes never persisted (the log
+│   │                       row carries file metadata; speech responses a note
+│   │                       with media type + byte count);
 │   │                       _resolve_model normalizes requested names to public names
 │   │                       (per-key model_mappings → real names → global aliases →
 │   │                       key default_model → global default) before any check,
@@ -204,8 +225,11 @@ gateway/
 │   │                       messages / gemini) that guardrail route
 │   │                       scopes match against
 │   ├── router.py           Deployment selection, weighted LB, retries w/ backoff, fallback tiers
-│   │                       (complete / complete_stream / embed — one contract, three entry
-│   │                       points). Shadow deployments are excluded from serving (resolve
+│   │                       — one shared non-streaming executor (_dispatch: resolve →
+│   │                       breaker filter → retries → fallback) behind complete /
+│   │                       embed / generate_image / transcribe / speak, so every
+│   │                       modality gets the identical contract. Shadow deployments
+│   │                       are excluded from serving (resolve
 │   │                       filters them; shadow_deployments() lists the mirroring
 │   │                       targets); apply_config hot-swaps models/deployments
 │   │                       and routing policy in place — breakers and provider
@@ -227,7 +251,10 @@ gateway/
 │   │                       call — see embed_fn_for in router.py) and serves the best
 │   │                       same-model response above a cosine threshold; TTL + LRU
 │   │                       bounded, embedder failures degrade to a miss
-│   ├── cost.py             CostCalculator: per-1M-token pricing, longest-prefix lookup
+│   ├── cost.py             CostCalculator: per-1M-token pricing, longest-prefix lookup;
+│   │                       unit prices for non-token modalities (image_usd,
+│   │                       audio_usd_per_minute, speech_usd_per_1m_chars —
+│   │                       same config block, same prefix match)
 │   ├── auth.py             Pluggable auth chain (Authenticator ABC → AuthChain.
 │   │                       from_config): built-in admin_key (constant-time vs
 │   │                       app.state), virtual_key (SHA-256 row lookup) and jwt
@@ -301,10 +328,17 @@ gateway/
 │                           presidio_pii (Microsoft Presidio; optional 'guardrails' extra)
 │
 ├── providers/              ── Upstream translation layer ──
-│   ├── base.py             ProviderAdapter ABC (complete / stream) + provider error mapping
+│   ├── base.py             ProviderAdapter ABC (complete / stream / embed /
+│   │                       generate_image / transcribe / speak) + provider
+│   │                       error mapping; the non-chat methods default to
+│   │                       501-with-fallback, so chat-only providers fall
+│   │                       through to a modality-capable deployment
 │   ├── openai_adapter.py   Near-passthrough (works for any OpenAI-compatible base URL);
 │   │                       URL/header construction lives in overridable hooks
-│   │                       (_chat_url / _responses_url / _embed_url / _headers);
+│   │                       (_chat_url / _responses_url / _embed_url /
+│   │                       _images_url / _audio_url / _speech_url /
+│   │                       _headers + _auth_headers for multipart, where
+│   │                       httpx owns the Content-Type);
 │   │                       native_responses deployments forward the original
 │   │                       Responses body southbound (see responses_native.py)
 │   ├── azure_adapter.py    Azure OpenAI: subclasses the OpenAI adapter, overrides only
@@ -313,7 +347,10 @@ gateway/
 │   │                       header, optional providers.azure.api_version
 │   ├── anthropic_adapter.py / gemini_adapter.py
 │   │                       Full request/response/stream translation incl. tools & images
-│   │                       (pure translation functions + stateful stream translators)
+│   │                       (pure translation functions + stateful stream translators);
+│   │                       the Gemini adapter also translates image generation
+│   │                       (OpenAI Images → generateContent with
+│   │                       responseModalities, one image per call, n = n calls)
 │   ├── responses_native.py Native Responses southbound: native_body (decision — flag on,
 │   │                       bridge body attached, messages still the pristine parse —
 │   │                       plus the build with the provider-native model id) and the
@@ -507,9 +544,9 @@ Two structural choices make adapters independently testable:
 
 - **Translation is pure** — `anthropic_adapter.translate_request(request, native_model) → dict` and `translate_response(native, public_model) → dict` are side-effect-free functions (unit-tested without HTTP).
 - **Stream translation is a stateful converter** — `AnthropicStreamTranslator` / `GeminiStreamTranslator` consume native SSE events and emit OpenAI chunks; the adapter's I/O shell is thin.
-- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 604 tests run with no network).
+- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 637 tests run with no network).
 
-Note also: because the OpenAI adapter is a passthrough over a configurable `api_base`, **any OpenAI-compatible service (vLLM, Ollama, Groq, Together, …) is already supported** without new code — for both chat and embeddings.
+Note also: because the OpenAI adapter is a passthrough over a configurable `api_base`, **any OpenAI-compatible service (vLLM, Ollama, Groq, Together, …) is already supported** without new code — for chat, embeddings, images and audio.
 
 ### 4.3 Embeddings
 
@@ -520,11 +557,21 @@ Note also: because the OpenAI adapter is a passthrough over a configurable `api_
 - **Gemini translation** — one `batchEmbedContents` call per ≤100 inputs (the API's batch limit), `dimensions` → `outputDimensionality`; token usage is estimated (~chars/4) because the API returns no counts. Anthropic has no embeddings API: the base adapter's default raises a clear 501 that the router treats as a non-retryable, fall-through error — so a mixed routing group (Anthropic primary, OpenAI fallback) still serves embeddings.
 - **No `/v1/embeddings` for pre-tokenized input** (arrays of token ids) — tokenize client-side.
 
+### 4.4 Images & audio
+
+The modality endpoints (`/v1/images/generations`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/audio/speech`) are a fourth *kind* of surface, built on the same two pieces the embeddings path uses — the shared non-streaming executor (`router._dispatch`: resolve → breaker filter → retries → fallback, so a failing image deployment fails over exactly like a chat one) and the shared pipeline wrapper (`pipeline._serve_simple`: context, in-flight metric, span, error-path logging). The modality handlers add:
+
+- **Adapter contract with graceful gaps** — `generate_image` / `transcribe` / `speak` on `ProviderAdapter`, defaulting to a 501 that is non-retryable on the deployment but falls through the routing group. OpenAI and Azure implement all three (Azure, as ever, by overriding only the URL hooks); Gemini translates image generation to `generateContent` with `responseModalities` (one image per call, `n` = `n` sequential calls; `size`/`quality` have no Gemini equivalent); Anthropic has no image/audio APIs and relies on the fall-through.
+- **Unit-priced accounting** — `_account_cost` mirrors `_account_usage` minus the usage dict: cost comes from `CostCalculator`'s unit prices (`image_usd` per generated image, `audio_usd_per_minute` from the duration a `verbose_json` transcription reports — plain `json` reports none and costs nothing, a documented trade-off — and `speech_usd_per_1m_chars`), while token counters stay estimates for the log row and TPM.
+- **Multipart at the edge** — the audio endpoints parse `multipart/form-data` once in `api/audio.py`, validate the upload against `audio.max_upload_mb` (413 beyond), and the OpenAI adapter re-serializes it upstream with *unknown form fields passed through* (provider-specific parameters keep working without gateway changes).
+- **Never-persisted audio bytes** — the log row's request body carries file metadata (name, size) only, and a speech response is logged as a note (media type + byte count). No response cache for any of these surfaces (`X-Gateway-Cache: NONE`): generation is non-deterministic and transcription is cheap relative to its upload.
+
+
 ---
 
 ## 5. Request lifecycle
 
-*(The embeddings path is the same pipeline minus guardrails and streaming — see §4.3.)*
+*(The embeddings path is the same pipeline minus guardrails and streaming — see §4.3; images and audio likewise — see §4.4.)*
 
 ### 5.1 Non-streaming sequence
 
@@ -685,7 +732,7 @@ erDiagram
         json disabled_guardrails "guardrail names skipped for this key (runtime override)"
         json model_mappings "per-key requested name to public model routing table"
         str default_model "this key's catch-all for unknown names"
-        json allowed_endpoints "data-plane scopes (chat/embeddings/models), NULL = all"
+        json allowed_endpoints "data-plane scopes (chat/embeddings/images/audio/models), NULL = all"
         json allowed_ips "source IPs/CIDRs calls must come from, NULL = any"
         datetime expires_at
         json metadata_json
@@ -822,7 +869,7 @@ Shutdown is the mirror image of composition, in reverse dependency order: `/read
 
 Being honest about the seams — these are the current trade-offs (all are localizable; none require redesigning the pipeline concept):
 
-1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Still missing: native Responses for Anthropic/Gemini (no such endpoint), images and audio (no adapter contract at all), and inbound *embeddings* in native formats (only chat is translated). Adding those means generalizing `ProviderAdapter` and the schema layer, not just registering something.
+1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Images and audio now exist as first-class non-chat surfaces (`generate_image`/`transcribe`/`speak` on `ProviderAdapter`, 501-with-fallback defaults so chat-only providers need no special handling — the router falls through), with OpenAI/Azure passing all three through and Gemini translating image generation to `generateContent`. The modality matrix is deliberately shallow: no Gemini or Anthropic *audio* (no such upstream APIs), Gemini images have no size/quality mapping and `n` means `n` sequential calls, transcription is billed only from the duration `verbose_json` reports, TTS is buffered (not streamed), and audio inbound is OpenAI-multipart-shaped only. Still missing: native Responses for Anthropic/Gemini (no such endpoint) and inbound *embeddings* in native formats (only chat is translated). Adding those means generalizing `ProviderAdapter` and the schema layer, not just registering something.
 2. **Pipeline phase order is fixed in code.** auth → rate-limit → budget → guardrails → cache → routing → respond. You cannot reorder or disable phases via config (e.g., "check cache before rate limits"). Guardrails *within* the request phase are ordered; *phases* are not.
 3. ~~Request-phase guardrails can only modify `messages`~~ **Solved:** `GuardrailResult` now carries `modified_model` (reject-and-redirect — "serve this on the small model" instead of blocking, with the pipeline re-checking the key's allowlist after the guardrail phase, fail closed) and `modified_request_fields` (arbitrary `ChatCompletionRequest` fields: `temperature`, `tools`, ...). All three compose and chain across guardrails (one `model_copy` per guardrail, each seeing the previous one's output).
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
@@ -1080,7 +1127,25 @@ tests/
 │                        a valid DB with the rows, list/delete, bad-name 400) and
 │                        the deployment artifacts' contracts (compose healthcheck
 │                        on /readyz, graceful-shutdown window, volumes)
-└── test_core.py         CostCalculator (prefix pricing) + RateLimiter windows
+├── test_images.py        Image generation: unit-price lookups (overrides,
+│                        longest-prefix, token fields untouched), e2e (native
+│                        model + prompt upstream, per-image cost), n billing,
+│                        unpriced = no cost header, fallback from a chat-only
+│                        provider (Anthropic 501 → OpenAI serves), breaker trip
+│                        + failover, RPM, allowlist 404, endpoint scope 403,
+│                        stream:true rejected 400, auth 401, log rows (bodies),
+│                        Gemini translation (n = n generateContent calls with
+│                        responseModalities)
+├── test_audio.py         Audio: multipart forwarding (native model, file name,
+│                        params), unknown-field passthrough, verbose_json
+│                        duration-based billing (json = no duration = no cost),
+│                        text/srt passthrough, translations endpoint, 413 size
+│                        cap, missing file/model 400s, allowlist, fallback from
+│                        unsupported providers, retry-then-failover, TTS e2e
+│                        (char-based cost, binary response), TTS logged as a
+│                        note (never bytes), audio bytes never in log rows,
+│                        endpoint scope, auth
+└── test_core.py         CostCalculator (prefix pricing + modality unit prices) + RateLimiter windows
 ```
 
 Design choices that make this cheap: the mock upstream is an `httpx.MockTransport` handler (captures every request body for asserting *what the provider received* — e.g., that PII was redacted before it left); `db.reset_engine_for_tests()` isolates state per test; `create_app`'s injectable constructor means the production code path *is* the test path.

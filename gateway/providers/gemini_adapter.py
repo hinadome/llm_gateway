@@ -11,7 +11,7 @@ import httpx
 
 from ..config import DeploymentConfig, ProviderConfig
 from ..errors import ProviderError
-from ..schemas import ChatCompletionRequest, EmbeddingRequest, Message
+from ..schemas import ChatCompletionRequest, EmbeddingRequest, ImageGenerationRequest, Message
 from ..utils import content_to_text, estimate_tokens
 from .base import ProviderAdapter, network_error, raise_for_provider_status
 from .sse import sse_data_lines
@@ -347,6 +347,48 @@ class GeminiProviderAdapter(ProviderAdapter):
             self.name,
         )
         return translate_response(data, request.model)
+
+    async def generate_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageGenerationRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        """OpenAI Images -> Gemini generateContent with responseModalities.
+
+        Gemini image models (gemini-2.0-flash-preview-image-generation,
+        gemini-2.5-flash-image) take the prompt as text and return the
+        image as an inlineData part (base64). One image per call, so
+        ``n > 1`` issues ``n`` sequential calls. Image-size/quality
+        parameters have no Gemini equivalent and are ignored.
+        """
+        url = self._url(provider_cfg.api_base, deployment.model, stream=False)
+        headers = self._headers(provider_cfg.resolve_key())
+        images: list[dict] = []
+        for _ in range(max(1, request.n)):
+            body = {
+                "contents": [{"parts": [{"text": request.prompt}]}],
+                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+            }
+            data = await self._read_json(
+                "POST", url, headers, body, timeout, self.name
+            )
+            for candidate in data.get("candidates") or []:
+                for part in (candidate.get("content") or {}).get("parts") or []:
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline and inline.get("data"):
+                        images.append({"b64_json": inline["data"]})
+        if not images:
+            raise ProviderError(
+                502,
+                f"Gemini returned no image data (deployment '{deployment.name}').",
+                "api_error",
+                retryable=True,
+                fallback=True,
+                provider=self.name,
+            )
+        return {"created": int(time.time()), "data": images}
 
     async def embed(
         self,

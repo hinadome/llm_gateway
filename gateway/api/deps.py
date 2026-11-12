@@ -19,7 +19,7 @@ logger = logging.getLogger("gateway.auth")
 # "chat" covers every chat-shaped surface — OpenAI chat, the Responses
 # bridge, and the native Anthropic/Gemini inbound formats — because they
 # all exercise the same underlying completions machinery.
-ENDPOINT_SCOPES = frozenset({"chat", "embeddings", "models"})
+ENDPOINT_SCOPES = frozenset({"chat", "embeddings", "images", "audio", "models"})
 
 
 def required_scope(path: str) -> str | None:
@@ -29,6 +29,10 @@ def required_scope(path: str) -> str | None:
     """
     if path == "/v1/embeddings":
         return "embeddings"
+    if path == "/v1/images/generations":
+        return "images"
+    if path.startswith("/v1/audio/"):
+        return "audio"
     last = path.rsplit("/", 1)[-1]
     if path == "/v1/models" or (path.startswith("/v1/models/") and ":" not in last):
         return "models"  # OpenAI model objects (not Gemini's /v1/models/x:generate)

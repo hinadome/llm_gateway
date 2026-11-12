@@ -17,14 +17,20 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from typing import AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from opentelemetry import trace
 
 from ..config import DeploymentConfig, GatewayConfig, ProviderConfig
 from ..errors import ModelNotFoundError, ProviderError
-from ..schemas import ChatCompletionRequest, EmbeddingRequest
+from ..schemas import (
+    ChatCompletionRequest,
+    EmbeddingRequest,
+    ImageGenerationRequest,
+    SpeechRequest,
+    TranscriptionRequest,
+)
 from ..observability import metrics
 from .breaker import CircuitBreakerRegistry
 
@@ -221,8 +227,14 @@ class Router:
 
     # -- non-streaming -----------------------------------------------------------
 
-    async def complete(self, request: ChatCompletionRequest) -> tuple[DeploymentConfig, dict]:
-        deployments = self.resolve(request.model)
+    async def _dispatch(
+        self, model: str, call: Callable[..., Awaitable]
+    ) -> tuple[DeploymentConfig, Any]:
+        """Shared non-streaming executor for every modality: resolve →
+        breaker filter → retry/backoff per deployment → fallback across
+        deployments. ``call(adapter, deployment, provider_cfg, timeout)``
+        performs the provider call and returns its response."""
+        deployments = self.resolve(model)
         remaining = await self._available(deployments)
         last_error: ProviderError | None = None
         tried: set[str] = set()
@@ -243,15 +255,15 @@ class Router:
 
             for attempt in range(max_retries + 1):
                 try:
-                    response = await adapter.complete(
-                        deployment, request, provider_cfg, self._timeout(deployment)
+                    response = await call(
+                        adapter, deployment, provider_cfg, self._timeout(deployment)
                     )
                     await self.breakers.record_success(deployment.name)
                     return deployment, response
                 except ProviderError as exc:
                     last_error = exc
                     metrics.REQUESTS.labels(
-                        provider=deployment.provider, model=request.model, status="retry"
+                        provider=deployment.provider, model=model, status="retry"
                     ).inc()
                     if not exc.retryable or attempt >= max_retries:
                         break
@@ -269,55 +281,40 @@ class Router:
 
         raise last_error or ProviderError(502, "All deployments failed", "api_error")
 
-    # -- embeddings ---------------------------------------------------------------
+    async def complete(self, request: ChatCompletionRequest) -> tuple[DeploymentConfig, dict]:
+        return await self._dispatch(
+            request.model, lambda a, d, pc, t: a.complete(d, request, pc, t)
+        )
 
     async def embed(self, request: EmbeddingRequest) -> tuple[DeploymentConfig, dict]:
         """Route an embeddings request — same retry/fallback/breaker
         contract as ``complete`` (embeddings are never streamed)."""
-        deployments = self.resolve(request.model)
-        remaining = await self._available(deployments)
-        last_error: ProviderError | None = None
-        tried: set[str] = set()
+        return await self._dispatch(
+            request.model, lambda a, d, pc, t: a.embed(d, request, pc, t)
+        )
 
-        while remaining:
-            deployment = self._pick(remaining)
-            if deployment.name in tried:
-                remaining.remove(deployment)
-                continue
-            tried.add(deployment.name)
-            adapter = self.providers[deployment.provider]
-            provider_cfg = self._provider_cfg(deployment)
-            max_retries = (
-                deployment.max_retries
-                if deployment.max_retries is not None
-                else self.config.routing.max_retries
-            )
+    async def generate_image(
+        self, request: ImageGenerationRequest
+    ) -> tuple[DeploymentConfig, dict]:
+        """Route an image-generation request (same contract as embed)."""
+        return await self._dispatch(
+            request.model, lambda a, d, pc, t: a.generate_image(d, request, pc, t)
+        )
 
-            for attempt in range(max_retries + 1):
-                try:
-                    response = await adapter.embed(
-                        deployment, request, provider_cfg, self._timeout(deployment)
-                    )
-                    await self.breakers.record_success(deployment.name)
-                    return deployment, response
-                except ProviderError as exc:
-                    last_error = exc
-                    metrics.REQUESTS.labels(
-                        provider=deployment.provider, model=request.model, status="retry"
-                    ).inc()
-                    if not exc.retryable or attempt >= max_retries:
-                        break
-                    _trace_retry(deployment, attempt + 1, exc.message)
-                    await asyncio.sleep(self._backoff(attempt, self.config.routing.retry_backoff_base))
+    async def transcribe(
+        self, request: TranscriptionRequest
+    ) -> tuple[DeploymentConfig, tuple[dict | str, str]]:
+        """Route an audio transcription/translation request."""
+        return await self._dispatch(
+            request.model, lambda a, d, pc, t: a.transcribe(d, request, pc, t)
+        )
 
-            if last_error is not None and not last_error.fallback:
-                raise last_error
-            await self.breakers.record_failure(deployment.name)
-            if len(remaining) > 1:  # only when there is something to fall back to
-                _trace_fallback(deployment, last_error.message if last_error else "")
-            remaining.remove(deployment)
-
-        raise last_error or ProviderError(502, "All deployments failed", "api_error")
+    async def speak(self, request: SpeechRequest) -> tuple[DeploymentConfig, tuple[bytes, str]]:
+        """Route a text-to-speech request (buffered; audio is not streamed
+        through the gateway in this version)."""
+        return await self._dispatch(
+            request.model, lambda a, d, pc, t: a.speak(d, request, pc, t)
+        )
 
     # -- streaming ---------------------------------------------------------------
 

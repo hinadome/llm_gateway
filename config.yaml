@@ -91,6 +91,30 @@ models:
         provider: openai
         model: text-embedding-3-small
 
+  # Image + audio models (declared exactly like chat models; same routing,
+  # retries, failover, circuit breakers, budgets, rate limits and logging).
+  #   POST /v1/images/generations — OpenAI/Azure pass through; Gemini is
+  #     translated to generateContent with responseModalities (n images =
+  #     n calls; size/quality have no Gemini equivalent).
+  #   POST /v1/audio/transcriptions + /v1/audio/translations (multipart) and
+  #     POST /v1/audio/speech (binary out) — OpenAI/Azure only in this
+  #     version; other providers 501 and routing falls through.
+  - name: gpt-image-1
+    deployments:
+      - name: openai/gpt-image-1
+        provider: openai
+        model: gpt-image-1
+  - name: whisper-1
+    deployments:
+      - name: openai/whisper-1
+        provider: openai
+        model: whisper-1
+  - name: tts-1
+    deployments:
+      - name: openai/tts-1
+        provider: openai
+        model: tts-1
+
 # ------------------------------------------------------------
 # Gateway-managed prompt policy (applied after model resolution,
 # before guardrails and cache lookup — checks and cache identity see
@@ -311,8 +335,25 @@ auth:
   #   audience: llm-gateway
   #   leeway_seconds: 30                   # clock-skew tolerance
 
+# Audio upload policy (POST /v1/audio/transcriptions|translations). The
+# gateway buffers multipart uploads to route and retry them, so a size
+# bound protects memory. 25 MB matches OpenAI's own limit. Rejected
+# uploads fail with 413 (audio_file_too_large). Hot-reloadable.
+audio:
+  max_upload_mb: 25
+
 # Per-1M-token pricing overrides (USD). Merged over built-in defaults;
 # longest model-prefix match wins. Embeddings are input-only.
+#
+# Non-token modalities use unit-price keys in the same block:
+#   image_usd               — per generated image (/v1/images/generations)
+#   audio_usd_per_minute    — per minute of audio, billed from the duration
+#                             the provider reports (verbose_json responses;
+#                             use that response_format when billing matters)
+#   speech_usd_per_1m_chars — per 1M input characters (/v1/audio/speech)
 pricing: {}
   # gpt-4o: {input: 2.5, output: 10.0}
   # text-embedding-3-small: {input: 0.02}
+  # gpt-image-1: {image_usd: 0.04}
+  # whisper-1: {audio_usd_per_minute: 0.006}
+  # tts-1: {speech_usd_per_1m_chars: 15.0}
