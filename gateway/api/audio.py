@@ -5,9 +5,10 @@
 * ``POST /v1/audio/speech``          (JSON in, binary audio out)
 
 Multipart is parsed once at the edge (python-multipart), validated against
-``audio.max_upload_mb``, and re-serialized upstream — so the same
+``uploads.max_upload_mb``, and re-serialized upstream — so the same
 routing/retry/breaker/accounting machinery as the rest of the gateway
 applies, and providers that need extra form fields get them passed through.
+``POST /v1/audio/speech`` streams the provider's audio as it arrives.
 """
 
 from __future__ import annotations
@@ -58,12 +59,12 @@ async def _transcription_from_form(
         )
 
     content = await file.read()
-    max_bytes = raw_request.app.state.config.audio.max_upload_mb * 1024 * 1024
+    max_bytes = raw_request.app.state.config.uploads.max_upload_mb * 1024 * 1024
     if len(content) > max_bytes:
         raise GatewayError(
             413,
             f"Audio file too large: {len(content)} bytes "
-            f"(limit {max_bytes} bytes = audio.max_upload_mb).",
+            f"(limit {max_bytes} bytes = uploads.max_upload_mb).",
             "request_too_large",
             code="audio_file_too_large",
         )

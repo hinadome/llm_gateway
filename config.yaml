@@ -91,14 +91,15 @@ models:
         provider: openai
         model: text-embedding-3-small
 
-  # Image + audio models (declared exactly like chat models; same routing,
-  # retries, failover, circuit breakers, budgets, rate limits and logging).
-  #   POST /v1/images/generations — OpenAI/Azure pass through; Gemini is
-  #     translated to generateContent with responseModalities (n images =
-  #     n calls; size/quality have no Gemini equivalent).
-  #   POST /v1/audio/transcriptions + /v1/audio/translations (multipart) and
-  #     POST /v1/audio/speech (binary out) — OpenAI/Azure only in this
-  #     version; other providers 501 and routing falls through.
+  # Image and audio models are declared exactly like chat models and get the
+  # same routing/retries/failover/breakers/budgets/rate limits/logs — that
+  # covers POST /v1/images/generations, /v1/images/edits (uploaded image(s)
+  # + prompt; a mask forwards on OpenAI/Azure, no Gemini equivalent) and
+  # /v1/images/variations (DALL·E 2 on OpenAI/Azure) as well as the audio
+  # endpoints. Images: OpenAI/Azure pass through, Gemini is translated to
+  # generateContent (n images = n calls; size/quality have no equivalent).
+  # Audio (transcription/translation/TTS): OpenAI/Azure pass through; other
+  # providers 501 and routing falls through.
   - name: gpt-image-1
     deployments:
       - name: openai/gpt-image-1
@@ -109,6 +110,16 @@ models:
       - name: openai/whisper-1
         provider: openai
         model: whisper-1
+  # Gemini TTS: gemini-2.5-*-preview-tts via generateContent (AUDIO
+  # modality). OpenAI voice names map to Gemini prebuilt voices (alloy ->
+  # Kore, ash -> Puck, ...; unknown names pass through, so Gemini voice
+  # names like Puck work directly); output is raw PCM, served as WAV
+  # (response_format: pcm serves it raw); speed has no equivalent.
+  # - name: gemini-tts
+  #   deployments:
+  #     - name: gemini/gemini-2.5-flash-preview-tts
+  #       provider: gemini
+  #       model: gemini-2.5-flash-preview-tts
   - name: tts-1
     deployments:
       - name: openai/tts-1
@@ -335,11 +346,11 @@ auth:
   #   audience: llm-gateway
   #   leeway_seconds: 30                   # clock-skew tolerance
 
-# Audio upload policy (POST /v1/audio/transcriptions|translations). The
-# gateway buffers multipart uploads to route and retry them, so a size
-# bound protects memory. 25 MB matches OpenAI's own limit. Rejected
-# uploads fail with 413 (audio_file_too_large). Hot-reloadable.
-audio:
+# Multipart upload policy (/v1/audio/transcriptions|translations file,
+# /v1/images/edits|variations images + mask). The gateway buffers uploads
+# to route and retry them, so a size bound protects memory. 25 MB matches
+# OpenAI's own limits. Rejected uploads fail with 413. Hot-reloadable.
+uploads:
   max_upload_mb: 25
 
 # Per-1M-token pricing overrides (USD). Merged over built-in defaults;

@@ -28,7 +28,7 @@ import time
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from opentelemetry import trace
@@ -51,7 +51,9 @@ from .prompts import apply_prompt_policy, substitute
 from ..schemas import (
     ChatCompletionRequest,
     EmbeddingRequest,
+    ImageEditRequest,
     ImageGenerationRequest,
+    ImageVariationRequest,
     Message,
     SpeechRequest,
     TranscriptionRequest,
@@ -113,6 +115,28 @@ def _encode_embeddings_base64(response: dict) -> dict:
         for item in response.get("data", [])
     ]
     return out
+
+
+def _image_edit_log_body(
+    request: ImageEditRequest | ImageVariationRequest,
+) -> dict:
+    """Log body for the multipart image surfaces: metadata about the
+    uploaded images, never the bytes themselves."""
+    body: dict = {
+        "model": request.model,
+        "images": [
+            {"file_name": name, "size_bytes": len(content)}
+            for content, name, _ in request.images
+        ],
+        "n": request.n,
+    }
+    if request.size is not None:
+        body["size"] = request.size
+    if getattr(request, "prompt", None):
+        body["prompt"] = request.prompt
+    if getattr(request, "mask", None):
+        body["mask"] = {"file_name": request.mask[1], "size_bytes": len(request.mask[0])}
+    return body
 
 
 class GatewayPipeline:
@@ -462,6 +486,11 @@ class GatewayPipeline:
                 await self._log(ctx, event=event)
                 self._finish_span(ctx, exc)
                 raise
+            if isinstance(response, StreamingResponse):
+                # The span and the in-flight gauge are finished by the
+                # stream wrapper once the response body completes (streamed
+                # speech does this — see _handle_speech).
+                return response
             self._finish_span(ctx)
             return response
 
@@ -581,12 +610,75 @@ class GatewayPipeline:
             request_id,
             "gateway.image_generation",
             "image generation completed",
-            lambda ctx: self._handle_image_generation(request, ctx),
+            lambda ctx: self._serve_image(
+                ctx,
+                request,
+                lambda r: self.router.generate_image(r),
+                request.prompt,
+                "image generation completed",
+            ),
         )
 
-    async def _handle_image_generation(
-        self, request: ImageGenerationRequest, ctx: RequestContext
+    async def handle_image_edit(
+        self,
+        request: ImageEditRequest,
+        auth: AuthContext,
+        request_id: str | None = None,
     ) -> Response:
+        """POST /v1/images/edits — OpenAI image edits (multipart). The log's
+        request_body carries metadata only (image names + sizes, mask name,
+        never the bytes)."""
+        return await self._serve_simple(
+            request.model,
+            _image_edit_log_body(request),
+            auth,
+            request_id,
+            "gateway.image_edit",
+            "image edit completed",
+            lambda ctx: self._serve_image(
+                ctx,
+                request,
+                lambda r: self.router.edit_image(r),
+                request.prompt,
+                "image edit completed",
+            ),
+        )
+
+    async def handle_image_variation(
+        self,
+        request: ImageVariationRequest,
+        auth: AuthContext,
+        request_id: str | None = None,
+    ) -> Response:
+        """POST /v1/images/variations — OpenAI image variations (multipart,
+        no prompt; DALL·E 2 on OpenAI/Azure)."""
+        return await self._serve_simple(
+            request.model,
+            _image_edit_log_body(request),
+            auth,
+            request_id,
+            "gateway.image_variation",
+            "image variation completed",
+            lambda ctx: self._serve_image(
+                ctx,
+                request,
+                lambda r: self.router.vary_image(r),
+                None,
+                "image variation completed",
+            ),
+        )
+
+    async def _serve_image(
+        self,
+        ctx: RequestContext,
+        request: ImageGenerationRequest | ImageEditRequest | ImageVariationRequest,
+        dispatch: Callable[[Any], Awaitable[tuple[Any, dict]]],
+        prompt: str | None,
+        event: str,
+    ) -> Response:
+        """Shared image-pipeline tail: resolve → permission → rate limit →
+        budget → dispatch (per-surface router call) → per-image cost →
+        log → JSON response."""
         resolved = self._resolve_model(request.model, ctx.auth)
         if resolved != request.model:
             request = request.model_copy(update={"model": resolved})
@@ -597,10 +689,10 @@ class GatewayPipeline:
         if not ctx.auth.is_admin:
             self._check_model_permission(ctx.auth, request.model)
 
-        await self._check_rate_limit(ctx, estimate_tokens(request.prompt))
+        await self._check_rate_limit(ctx, estimate_tokens(prompt or ""))
         self._check_budget(ctx)
 
-        deployment, response = await self.router.generate_image(request)
+        deployment, response = await dispatch(request)
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
@@ -609,7 +701,7 @@ class GatewayPipeline:
         cost = self.cost_calculator.calculate_images(
             deployment.model, images
         ) or self.cost_calculator.calculate_images(ctx.model, images)
-        await self._account_cost(ctx, cost, prompt_tokens=estimate_tokens(request.prompt))
+        await self._account_cost(ctx, cost, prompt_tokens=estimate_tokens(prompt or ""))
         ctx.response_body = response
         ctx.status = "success"
 
@@ -617,7 +709,7 @@ class GatewayPipeline:
         metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
             ctx.latency_ms() / 1000
         )
-        await self._log(ctx, event="image generation completed")
+        await self._log(ctx, event=event)
         return JSONResponse(content=response, headers=self._headers(ctx, "NONE"))
 
     async def handle_transcription(
@@ -735,21 +827,77 @@ class GatewayPipeline:
         cost = self.cost_calculator.calculate_speech(
             deployment.model, len(request.input)
         ) or self.cost_calculator.calculate_speech(ctx.model, len(request.input))
-        await self._account_cost(ctx, cost, prompt_tokens=estimate_tokens(request.input))
-        # Binary audio: the log records a note about it, never the bytes.
-        ctx.response_body = {
-            "note": "binary audio response",
-            "media_type": media_type,
-            "bytes": len(audio),
-        }
-        ctx.status = "success"
+        # Known before the stream starts (char-based): the response header
+        # can carry it even though the actual accounting waits for the
+        # body to complete.
+        ctx.cost_usd = cost
+        prompt_tokens = estimate_tokens(request.input)
+        headers = self._headers(ctx, "NONE")
 
-        self._request_metric(ctx)
-        metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
-            ctx.latency_ms() / 1000
+        async def _stream_audio() -> AsyncIterator[bytes]:
+            """Stream the provider's audio as it arrives; account, log and
+            end the span once the body completes (the same shape as the
+            chat stream wrapper — the finally-path also runs on client
+            disconnects, so spend is never lost)."""
+            span = ctx.otel_span
+            total = 0
+            first = True
+            with (
+                use_span(
+                    span,
+                    end_on_exit=True,
+                    record_exception=False,
+                    set_status_on_exception=False,
+                )
+                if span is not None
+                else nullcontext()
+            ):
+                try:
+                    async for chunk in audio:
+                        if first:
+                            first = False
+                            metrics.TTFT.labels(model=ctx.model).observe(
+                                time.monotonic() - ctx.started_monotonic
+                            )
+                        total += len(chunk)
+                        yield chunk
+                except GatewayError as exc:
+                    # The response is already committed (200 + audio);
+                    # HTTP cannot change status mid-body — mark, log, abort.
+                    ctx.status = "error"
+                    ctx.error_message = exc.message
+                    raise
+                finally:
+                    metrics.INFLIGHT.dec()
+                    await self._account_cost(ctx, cost, prompt_tokens=prompt_tokens)
+                    # Binary audio: the log records a note about it, never
+                    # the bytes.
+                    ctx.response_body = {
+                        "note": "binary audio response",
+                        "media_type": media_type,
+                        "bytes": total,
+                    }
+                    if ctx.status not in ("error", "blocked"):
+                        ctx.status = "success"
+                    self._request_metric(ctx)
+                    metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
+                        ctx.latency_ms() / 1000
+                    )
+                    await self._log(ctx, event="speech synthesis completed")
+                    if span is not None:
+                        self._annotate_span(span, ctx)
+                        if ctx.status in ("error", "blocked"):
+                            span.set_status(
+                                Status(StatusCode.ERROR, ctx.error_message or ctx.status)
+                            )
+                        else:
+                            span.set_status(Status(StatusCode.OK))
+
+        return StreamingResponse(
+            _stream_audio(),
+            media_type=media_type,
+            headers=headers,
         )
-        await self._log(ctx, event="speech synthesis completed")
-        return Response(content=audio, media_type=media_type, headers=self._headers(ctx, "NONE"))
 
     async def _account_cost(
         self,

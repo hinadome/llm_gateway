@@ -16,9 +16,10 @@ all handled by overriding the URL/header hooks of the OpenAI adapter:
   ``providers.azure.api_version``.
 
 Azure supports the same non-chat surfaces with deployment-addressed URLs —
-images/generations, audio/transcriptions, audio/translations and
-audio/speech (Whisper / gpt-4o-transcribe deployments for the audio ones) —
-so they pass through this subclass unchanged too.
+images/generations, images/edits, images/variations, audio/transcriptions,
+audio/translations and audio/speech (Whisper / gpt-4o-transcribe
+deployments for the audio ones) — so they pass through this subclass
+unchanged too.
 
 Streaming, tools, and embeddings pass through unchanged — Azure's
 responses are OpenAI-shaped, so the parent adapter's translation,
@@ -67,6 +68,12 @@ class AzureProviderAdapter(OpenAIProviderAdapter):
 
     def _images_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
         return self._deployment_path(deployment, provider_cfg, "images/generations")
+
+    def _images_edits_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return self._deployment_path(deployment, provider_cfg, "images/edits")
+
+    def _images_variations_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return self._deployment_path(deployment, provider_cfg, "images/variations")
 
     def _audio_url(
         self, deployment: DeploymentConfig, provider_cfg: ProviderConfig, kind: str

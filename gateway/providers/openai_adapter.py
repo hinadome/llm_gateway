@@ -26,7 +26,9 @@ from ..config import DeploymentConfig, ProviderConfig
 from ..schemas import (
     ChatCompletionRequest,
     EmbeddingRequest,
+    ImageEditRequest,
     ImageGenerationRequest,
+    ImageVariationRequest,
     SpeechRequest,
     TranscriptionRequest,
 )
@@ -53,6 +55,12 @@ class OpenAIProviderAdapter(ProviderAdapter):
 
     def _images_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
         return f"{provider_cfg.api_base.rstrip('/')}/images/generations"
+
+    def _images_edits_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return f"{provider_cfg.api_base.rstrip('/')}/images/edits"
+
+    def _images_variations_url(self, deployment: DeploymentConfig, provider_cfg: ProviderConfig) -> str:
+        return f"{provider_cfg.api_base.rstrip('/')}/images/variations"
 
     def _audio_url(
         self, deployment: DeploymentConfig, provider_cfg: ProviderConfig, kind: str
@@ -158,6 +166,98 @@ class OpenAIProviderAdapter(ProviderAdapter):
             self.name,
         )
 
+    def _image_files(
+        self, images: list[tuple[bytes, str, str | None]]
+    ) -> list[tuple[str, tuple[str, bytes, str]]]:
+        """Upload list for multipart image endpoints. A single image goes
+        under ``image`` (the DALL·E form); several use OpenAI's repeated
+        ``image[]`` fields (the gpt-image-1 multi-reference form)."""
+        if len(images) <= 1:
+            name = "image"
+        else:
+            name = "image[]"
+        return [
+            (name, (filename or "image", content, content_type or "image/png"))
+            for content, filename, content_type in images or []
+        ]
+
+    async def _post_images_multipart(
+        self,
+        url: str,
+        data: dict[str, str | list[str]],
+        images: list[tuple[bytes, str, str | None]],
+        mask: tuple[bytes, str, str | None] | None,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        files = self._image_files(images)
+        if mask is not None:
+            files.append(
+                ("mask", (mask[1] or "mask", mask[0], mask[2] or "image/png"))
+            )
+        try:
+            response = await self.client.post(
+                url,
+                headers=self._auth_headers(provider_cfg),
+                data=data,
+                files=files,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise network_error(self.name, exc) from exc
+        raise_for_provider_status(response, self.name)
+        return response.json()
+
+    async def edit_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageEditRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        """Multipart forward to OpenAI's /images/edits (image(s) + prompt,
+        optional mask; unknown form fields ride along in ``extra``)."""
+        data: dict[str, str | list[str]] = {
+            "model": deployment.model,
+            "prompt": request.prompt,
+        }
+        for field in ("n", "size", "quality", "response_format", "user"):
+            value = getattr(request, field)
+            if value is not None:
+                data[field] = str(value)
+        data.update(request.extra)
+        return await self._post_images_multipart(
+            self._images_edits_url(deployment, provider_cfg),
+            data,
+            request.images,
+            request.mask,
+            provider_cfg,
+            timeout,
+        )
+
+    async def vary_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageVariationRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        """Multipart forward to OpenAI's /images/variations (DALL·E 2)."""
+        data: dict[str, str | list[str]] = {"model": deployment.model}
+        for field in ("n", "size", "response_format", "user"):
+            value = getattr(request, field)
+            if value is not None:
+                data[field] = str(value)
+        data.update(request.extra)
+        return await self._post_images_multipart(
+            self._images_variations_url(deployment, provider_cfg),
+            data,
+            request.images,
+            None,
+            provider_cfg,
+            timeout,
+        )
+
     async def transcribe(
         self,
         deployment: DeploymentConfig,
@@ -214,23 +314,38 @@ class OpenAIProviderAdapter(ProviderAdapter):
         request: SpeechRequest,
         provider_cfg: ProviderConfig,
         timeout: httpx.Timeout,
-    ) -> tuple[bytes, str]:
+    ) -> tuple[AsyncIterator[bytes], str]:
+        """Stream the provider's audio as it arrives: the upstream response
+        body is forwarded chunk-by-chunk (never buffered whole)."""
         body = request.model_dump(exclude_none=True)
         body["model"] = deployment.model
+        upstream = self.client.build_request(
+            "POST",
+            self._speech_url(deployment, provider_cfg),
+            headers=self._headers(provider_cfg),
+            json=body,
+            timeout=timeout,
+        )
         try:
-            response = await self.client.post(
-                self._speech_url(deployment, provider_cfg),
-                headers=self._headers(provider_cfg),
-                json=body,
-                timeout=timeout,
-            )
+            response = await self.client.send(upstream, stream=True)
         except httpx.HTTPError as exc:
             raise network_error(self.name, exc) from exc
-        raise_for_provider_status(response, self.name)
-        return (
-            response.content,
-            response.headers.get("content-type", "audio/mpeg"),
-        )
+        if response.status_code >= 400:
+            await response.aread()  # so error mapping can see the body
+            await response.aclose()
+            raise_for_provider_status(response, self.name)
+        media_type = response.headers.get("content-type", "audio/mpeg")
+
+        async def _audio() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            except httpx.HTTPError as exc:
+                raise network_error(self.name, exc) from exc
+            finally:
+                await response.aclose()
+
+        return _audio(), media_type
 
     async def stream(
         self,

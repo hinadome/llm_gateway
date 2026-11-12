@@ -29,7 +29,7 @@ def required_scope(path: str) -> str | None:
     """
     if path == "/v1/embeddings":
         return "embeddings"
-    if path == "/v1/images/generations":
+    if path.startswith("/v1/images/"):
         return "images"
     if path.startswith("/v1/audio/"):
         return "audio"

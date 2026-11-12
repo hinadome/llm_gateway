@@ -9,10 +9,15 @@ on the upstream side. Three methods:
 * ``embed``   — embeddings; returns an OpenAI ``list[embedding]`` dict.
 * ``generate_image`` — image generation; returns an OpenAI ``images.response``
   dict (``{created, data: [...]}``).
+* ``edit_image`` — image editing (uploaded image(s) + prompt); returns an
+  OpenAI ``images.response`` dict.
+* ``vary_image`` — image variations (uploaded image, no prompt); returns an
+  OpenAI ``images.response`` dict.
 * ``transcribe`` — audio transcription/translation; returns
   ``(content, media_type)`` — content is a dict for JSON response formats,
   plain text otherwise (srt/vtt/text).
-* ``speak``    — text-to-speech; returns ``(audio_bytes, media_type)``.
+* ``speak``    — text-to-speech; returns ``(byte_iterator, media_type)``
+  streaming as the provider sends it.
 
 The base implementations of the non-chat methods raise a clear error that
 is not retryable on the same deployment but does fall through to the next
@@ -33,7 +38,9 @@ from ..errors import ProviderError
 from ..schemas import (
     ChatCompletionRequest,
     EmbeddingRequest,
+    ImageEditRequest,
     ImageGenerationRequest,
+    ImageVariationRequest,
     SpeechRequest,
     TranscriptionRequest,
 )
@@ -173,6 +180,42 @@ class ProviderAdapter(ABC):
             fallback=True,
         )
 
+    async def edit_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageEditRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        """Edit uploaded image(s) per a prompt; return an OpenAI
+        images-format dict."""
+        raise ProviderError(
+            501,
+            f"Provider '{self.name}' does not support image editing "
+            f"(deployment '{deployment.name}').",
+            "api_error",
+            code="images_not_supported",
+            fallback=True,
+        )
+
+    async def vary_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageVariationRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        """Generate variations of an uploaded image; return an OpenAI
+        images-format dict."""
+        raise ProviderError(
+            501,
+            f"Provider '{self.name}' does not support image variations "
+            f"(deployment '{deployment.name}').",
+            "api_error",
+            code="images_not_supported",
+            fallback=True,
+        )
+
     async def transcribe(
         self,
         deployment: DeploymentConfig,
@@ -201,8 +244,9 @@ class ProviderAdapter(ABC):
         request: SpeechRequest,
         provider_cfg: ProviderConfig,
         timeout: httpx.Timeout,
-    ) -> tuple[bytes, str]:
-        """Synthesize speech; return ``(audio_bytes, media_type)``."""
+    ) -> tuple[AsyncIterator[bytes], str]:
+        """Synthesize speech; return ``(byte_iterator, media_type)`` — the
+        audio streams to the client as the provider sends it."""
         raise ProviderError(
             501,
             f"Provider '{self.name}' does not support text-to-speech "

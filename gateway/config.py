@@ -322,12 +322,13 @@ class PromptsConfig(BaseModel):
     library_cache_seconds: float = 30.0
 
 
-class AudioConfig(BaseModel):
-    """Multipart upload policy for /v1/audio/transcriptions|translations.
+class UploadsConfig(BaseModel):
+    """Multipart upload policy for the file-upload surfaces
+    (/v1/audio/transcriptions|translations, /v1/images/edits|variations).
 
-    ``max_upload_mb`` caps the uploaded file size (413 beyond it) — the
+    ``max_upload_mb`` caps the uploaded payload (413 beyond it) — the
     gateway buffers uploads to route/retry them, so a bound protects
-    memory. 25 MB matches OpenAI's own limit.
+    memory. 25 MB matches OpenAI's own limits.
     """
 
     max_upload_mb: int = 25
@@ -418,7 +419,7 @@ class GatewayConfig(BaseModel):
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
-    audio: AudioConfig = Field(default_factory=AudioConfig)
+    uploads: UploadsConfig = Field(default_factory=UploadsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @classmethod

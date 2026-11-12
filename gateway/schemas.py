@@ -139,6 +139,42 @@ class ImageGenerationRequest(BaseModel):
     user: str | None = None
 
 
+class ImageEditRequest(BaseModel):
+    """Internal shape for /v1/images/edits (built from the parsed multipart
+    form, never directly deserialized from JSON).
+
+    ``images`` carries the uploaded image bytes (one or more — gpt-image-1
+    accepts several; a plain-string form value is accepted as base64 image
+    data, with an optional ``data:`` URL prefix). ``mask`` is the optional
+    transparent-area mask (PNG). ``extra`` holds unknown form fields for
+    provider passthrough.
+    """
+
+    model: str
+    prompt: str
+    images: list[tuple[bytes, str, str | None]] = []  # (bytes, filename, content_type)
+    mask: tuple[bytes, str, str | None] | None = None
+    n: int = 1
+    size: str | None = None
+    quality: str | None = None
+    response_format: str | None = None
+    user: str | None = None
+    extra: dict[str, list[str]] = {}
+
+
+class ImageVariationRequest(BaseModel):
+    """Internal shape for /v1/images/variations (multipart, no prompt —
+    OpenAI's DALL·E 2 variations surface)."""
+
+    model: str
+    images: list[tuple[bytes, str, str | None]] = []
+    n: int = 1
+    size: str | None = None
+    response_format: str | None = None
+    user: str | None = None
+    extra: dict[str, list[str]] = {}
+
+
 class TranscriptionRequest(BaseModel):
     """Internal shape for /v1/audio/transcriptions + /v1/audio/translations.
 

@@ -2,22 +2,57 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import time
 import uuid
+import wave
 from typing import Any, AsyncIterator
 
 import httpx
 
 from ..config import DeploymentConfig, ProviderConfig
 from ..errors import ProviderError
-from ..schemas import ChatCompletionRequest, EmbeddingRequest, ImageGenerationRequest, Message
+from ..schemas import (
+    ChatCompletionRequest,
+    EmbeddingRequest,
+    ImageEditRequest,
+    ImageGenerationRequest,
+    Message,
+    SpeechRequest,
+)
 from ..utils import content_to_text, estimate_tokens
 from .base import ProviderAdapter, network_error, raise_for_provider_status
 from .sse import sse_data_lines
 
 # batchEmbedContents accepts at most 100 texts per call.
 _GEMINI_EMBED_BATCH = 100
+
+
+def _pcm_rate(mime_type: str | None) -> int | None:
+    """Sample rate from a Gemini audio mimeType (``audio/L16;rate=24000``)."""
+    if not mime_type:
+        return None
+    for param in mime_type.split(";")[1:]:
+        param = param.strip()
+        if param.startswith("rate="):
+            try:
+                return int(param[5:])
+            except ValueError:
+                return None
+    return None
+
+
+def _pcm_to_wav(pcm: bytes, rate: int, channels: int = 1, width: int = 2) -> bytes:
+    """Wrap raw PCM in a canonical WAV header (stdlib ``wave``)."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(rate)
+        wav.writeframes(pcm)
+    return buffer.getvalue()
 
 _FINISH_MAP = {
     "STOP": "stop",
@@ -363,17 +398,69 @@ class GeminiProviderAdapter(ProviderAdapter):
         ``n > 1`` issues ``n`` sequential calls. Image-size/quality
         parameters have no Gemini equivalent and are ignored.
         """
+        images = await self._image_edits_roundtrips(
+            deployment,
+            provider_cfg,
+            timeout,
+            prompt=request.prompt,
+            inputs=[],
+            n=request.n,
+        )
+        return {"created": int(time.time()), "data": images}
+
+    async def edit_image(
+        self,
+        deployment: DeploymentConfig,
+        request: ImageEditRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> dict:
+        """OpenAI image edits -> Gemini generateContent with the uploaded
+        images as inline input parts (the gemini-2.5-flash-image editing
+        flow: reference images + instruction). ``mask`` has no Gemini
+        equivalent and is ignored (documented); ``n`` edits = ``n`` calls."""
+        images = await self._image_edits_roundtrips(
+            deployment,
+            provider_cfg,
+            timeout,
+            prompt=request.prompt,
+            inputs=request.images,
+            n=request.n,
+        )
+        return {"created": int(time.time()), "data": images}
+
+    async def _image_edits_roundtrips(
+        self,
+        deployment: DeploymentConfig,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+        prompt: str,
+        inputs: list[tuple[bytes, str, str | None]],
+        n: int,
+    ) -> list[dict]:
+        """Shared generateContent-with-image-output loop: text prompt +
+        optional inline input images, one image per call."""
         url = self._url(provider_cfg.api_base, deployment.model, stream=False)
         headers = self._headers(provider_cfg.resolve_key())
+        input_parts: list[dict] = []
+        for content, _filename, content_type in inputs:
+            input_parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": content_type or "image/png",
+                        "data": base64.b64encode(content).decode(),
+                    }
+                }
+            )
+        input_parts.append({"text": prompt})
+
         images: list[dict] = []
-        for _ in range(max(1, request.n)):
+        for _ in range(max(1, n)):
             body = {
-                "contents": [{"parts": [{"text": request.prompt}]}],
+                "contents": [{"parts": input_parts}],
                 "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
             }
-            data = await self._read_json(
-                "POST", url, headers, body, timeout, self.name
-            )
+            data = await self._read_json("POST", url, headers, body, timeout, self.name)
             for candidate in data.get("candidates") or []:
                 for part in (candidate.get("content") or {}).get("parts") or []:
                     inline = part.get("inlineData") or part.get("inline_data")
@@ -388,7 +475,92 @@ class GeminiProviderAdapter(ProviderAdapter):
                 fallback=True,
                 provider=self.name,
             )
-        return {"created": int(time.time()), "data": images}
+        return images
+
+    # OpenAI voice names -> Gemini prebuilt voices. Approximate, deterministic
+    # pairing (there is no official mapping); unknown names pass through, so
+    # Gemini-native voice names (Kore, Puck, ...) work directly.
+    _VOICE_MAP = {
+        "alloy": "Kore",
+        "ash": "Puck",
+        "ballad": "Charon",
+        "coral": "Aoede",
+        "echo": "Fenrir",
+        "fable": "Leda",
+        "nova": "Zephyr",
+        "onyx": "Orus",
+        "sage": "Algieba",
+        "shimmer": "Enceladus",
+        "verse": "Iapetus",
+    }
+
+    async def speak(
+        self,
+        deployment: DeploymentConfig,
+        request: SpeechRequest,
+        provider_cfg: ProviderConfig,
+        timeout: httpx.Timeout,
+    ) -> tuple[AsyncIterator[bytes], str]:
+        """OpenAI Speech -> Gemini TTS (generateContent, AUDIO modality).
+
+        Gemini TTS models (gemini-2.5-flash-preview-tts, -pro-preview-tts)
+        return raw PCM (24 kHz 16-bit mono) as an inlineData part. The
+        gateway serves it as-is for ``response_format: pcm`` and wrapped in
+        a WAV header otherwise — mp3 & friends are not transcoded (the
+        content type says what you got). ``speed`` has no Gemini
+        equivalent and is ignored.
+        """
+        url = self._url(provider_cfg.api_base, deployment.model, stream=False)
+        headers = self._headers(provider_cfg.resolve_key())
+        voice = self._VOICE_MAP.get(request.voice, request.voice)
+        body = {
+            "contents": [{"parts": [{"text": request.input}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                },
+            },
+        }
+        data = await self._read_json("POST", url, headers, body, timeout, self.name)
+        pcm = bytearray()
+        rate = 24000
+        for candidate in data.get("candidates") or []:
+            for part in (candidate.get("content") or {}).get("parts") or []:
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    try:
+                        pcm.extend(base64.b64decode(inline["data"]))
+                    except Exception as exc:  # invalid base64 from provider
+                        raise ProviderError(
+                            502,
+                            f"Invalid audio data from provider '{self.name}'",
+                            "api_error",
+                            retryable=True,
+                            fallback=True,
+                            provider=self.name,
+                        ) from exc
+                    rate = _pcm_rate(inline.get("mimeType")) or rate
+        if not pcm:
+            raise ProviderError(
+                502,
+                f"Gemini returned no audio data (deployment '{deployment.name}').",
+                "api_error",
+                retryable=True,
+                fallback=True,
+                provider=self.name,
+            )
+        if request.response_format == "pcm":
+            media_type = f"audio/pcm;rate={rate}"
+            payload = bytes(pcm)
+        else:
+            media_type = "audio/wav"
+            payload = _pcm_to_wav(bytes(pcm), rate)
+
+        async def _audio() -> AsyncIterator[bytes]:
+            yield payload
+
+        return _audio(), media_type
 
     async def embed(
         self,

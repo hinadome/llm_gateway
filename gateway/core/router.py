@@ -27,7 +27,9 @@ from ..errors import ModelNotFoundError, ProviderError
 from ..schemas import (
     ChatCompletionRequest,
     EmbeddingRequest,
+    ImageEditRequest,
     ImageGenerationRequest,
+    ImageVariationRequest,
     SpeechRequest,
     TranscriptionRequest,
 )
@@ -299,6 +301,22 @@ class Router:
         """Route an image-generation request (same contract as embed)."""
         return await self._dispatch(
             request.model, lambda a, d, pc, t: a.generate_image(d, request, pc, t)
+        )
+
+    async def edit_image(
+        self, request: ImageEditRequest
+    ) -> tuple[DeploymentConfig, dict]:
+        """Route an image-edit request (uploaded image(s) + prompt)."""
+        return await self._dispatch(
+            request.model, lambda a, d, pc, t: a.edit_image(d, request, pc, t)
+        )
+
+    async def vary_image(
+        self, request: ImageVariationRequest
+    ) -> tuple[DeploymentConfig, dict]:
+        """Route an image-variation request (uploaded image, no prompt)."""
+        return await self._dispatch(
+            request.model, lambda a, d, pc, t: a.vary_image(d, request, pc, t)
         )
 
     async def transcribe(

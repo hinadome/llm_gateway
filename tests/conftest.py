@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from types import SimpleNamespace
 
@@ -284,6 +285,23 @@ class MockUpstream:
                 fields[name] = value.rstrip(b"\r\n").decode(errors="replace")
         return fields
 
+    @staticmethod
+    def _multipart_files(content: bytes, content_type: str) -> dict[str, list[bytes]]:
+        """Raw file bytes per field name, in order (repeated names kept)."""
+        files: dict[str, list[bytes]] = {}
+        if "boundary=" not in content_type:
+            return files
+        boundary = content_type.split("boundary=")[-1].strip().encode()
+        for part in content.split(b"--" + boundary):
+            if b'name="' not in part or b'filename="' not in part:
+                continue
+            header, _, value = part.partition(b"\r\n\r\n")
+            if not _:
+                continue
+            name = header.split(b'name="')[1].split(b'"')[0].decode()
+            files.setdefault(name, []).append(value.rstrip(b"\r\n"))
+        return files
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         try:
             body = json.loads(request.content) if request.content else {}
@@ -306,6 +324,23 @@ class MockUpstream:
                 json={
                     "created": 1700000000,
                     "data": [{"b64_json": f"aW1hZ2VkYXRh{i}"} for i in range(n)],
+                },
+            )
+        if path.endswith("/images/edits") or path.endswith("/images/variations"):
+            ct = request.headers.get("content-type", "")
+            fields = self._multipart_fields(request.content, ct)
+            files = self._multipart_files(request.content, ct)
+            # Surface the parsed form (not the raw bytes) for assertions.
+            self.requests[-1]["body"] = {"_multipart": fields, "_files": files}
+            if self.fail_counts.get(fields.get("model"), 0) > 0:
+                self.fail_counts[fields["model"]] -= 1
+                return httpx.Response(500, json={"error": {"message": "boom"}})
+            n = int(fields.get("n") or 1)
+            return httpx.Response(
+                200,
+                json={
+                    "created": 1700000000,
+                    "data": [{"b64_json": f"ZWRpdGVkLWltYWdl{i}"} for i in range(n)],
                 },
             )
         if path.endswith("/audio/transcriptions") or path.endswith(
@@ -335,9 +370,15 @@ class MockUpstream:
                 out["duration"] = 42.0  # seconds — drives per-minute cost
             return httpx.Response(200, json=out)
         if path.endswith("/audio/speech"):
+            # Streamed in two chunks, proving the adapter forwards bytes as
+            # they arrive rather than buffering the whole body.
+            async def _audio_chunks():
+                yield b"FAKEAUDIO"
+                yield b"DATA"
+
             return httpx.Response(
                 200,
-                content=b"FAKEAUDIODATA",
+                content=_audio_chunks(),
                 headers={"content-type": "audio/mpeg"},
             )
         if path.endswith("/embeddings"):
@@ -350,6 +391,30 @@ class MockUpstream:
                 json={
                     "embeddings": [
                         {"values": [0.25, 0.5, 0.75, 1.0]} for _ in requests_
+                    ]
+                },
+            )
+        if ":generateContent" in path and "AUDIO" in (
+            (body.get("generationConfig") or {}).get("responseModalities") or []
+        ):
+            # Gemini TTS: inline PCM audio (16-bit samples).
+            pcm = b"\x01\x00" * 100
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "audio/L16;rate=24000",
+                                            "data": base64.b64encode(pcm).decode(),
+                                        }
+                                    }
+                                ]
+                            }
+                        }
                     ]
                 },
             )

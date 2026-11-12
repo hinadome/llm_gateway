@@ -3,6 +3,8 @@ logging and the Gemini translation."""
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 from gateway.core.cost import CostCalculator
@@ -321,4 +323,349 @@ async def test_image_generation_gemini_translation(tmp_path):
         for call in gen_calls:
             assert "IMAGE" in call["body"]["generationConfig"]["responseModalities"]
             assert call["body"]["contents"][0]["parts"][0]["text"] == "a cat"
+        break
+
+
+# ----------------------------------------------------------------------
+# Image edits (/v1/images/edits)
+# ----------------------------------------------------------------------
+
+
+def _image_file(b: bytes = b"pngbytes-here", name: str = "cat.png") -> dict:
+    return {"image": (name, b, "image/png")}
+
+
+async def test_image_edit_e2e(tmp_path):
+    async for env in _make_env(
+        tmp_path, config=make_config(pricing={"model-a": {"image_usd": 0.02}})
+    ):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "make it a watercolor"},
+            files=_image_file(),
+            headers=auth(key),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["data"][0]["b64_json"]
+        assert resp.headers["x-gateway-cost-usd"] == f"{0.02:.8f}"
+
+        sent = env.mock.requests[-1]
+        assert sent["url"].endswith("/images/edits")
+        fields = sent["body"]["_multipart"]
+        assert fields["model"] == "model-a"  # native model
+        assert fields["prompt"] == "make it a watercolor"
+        assert fields["image"] == "cat.png"  # single image -> `image` field
+        assert sent["body"]["_files"]["image"] == [b"pngbytes-here"]
+        break
+
+
+async def test_image_edit_b64_string_input(tmp_path):
+    """A plain-string `image` form value is accepted as base64 data (with or
+    without a data: URL prefix) and forwarded as a file."""
+    import base64
+
+    async for env in _make_env(tmp_path, config=make_config()):
+        key = (await create_key(env.client, "editor"))["key"]
+        raw = b"secret-image-bytes"
+        for value in (base64.b64encode(raw).decode(), f"data:image/png;base64,{base64.b64encode(raw).decode()}"):
+            resp = await env.client.post(
+                "/v1/images/edits",
+                data={"model": "test-model", "prompt": "edit", "image": value},
+                headers=auth(key),
+            )
+            assert resp.status_code == 200, resp.text
+            sent = env.mock.requests[-1]
+            assert sent["body"]["_files"]["image"] == [raw]
+        break
+
+
+async def test_image_edit_invalid_b64_rejected(tmp_path):
+    async for env in _make_env(tmp_path, config=make_config()):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "edit", "image": "not base64!!"},
+            headers=auth(key),
+        )
+        assert resp.status_code == 400
+        assert "image" in resp.json()["error"]["message"]
+        break
+
+
+async def test_image_edit_multiple_images(tmp_path):
+    """Several images ride along as repeated image[] fields (gpt-image-1
+    multi-reference form)."""
+    async for env in _make_env(tmp_path, config=make_config()):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "combine"},
+            files=[("image", ("a.png", b"aaaa", "image/png")), ("image", ("b.png", b"bbbb", "image/png"))],
+            headers=auth(key),
+        )
+        assert resp.status_code == 200, resp.text
+        sent = env.mock.requests[-1]
+        assert sent["body"]["_multipart"]["image[]"] == "b.png"
+        assert sent["body"]["_files"]["image[]"] == [b"aaaa", b"bbbb"]
+        break
+
+
+async def test_image_edit_mask_forwarded(tmp_path):
+    async for env in _make_env(tmp_path, config=make_config()):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "edit"},
+            files={"image": ("cat.png", b"img", "image/png"), "mask": ("mask.png", b"msk", "image/png")},
+            headers=auth(key),
+        )
+        assert resp.status_code == 200, resp.text
+        sent = env.mock.requests[-1]
+        assert sent["body"]["_multipart"]["mask"] == "mask.png"
+        assert sent["body"]["_files"]["mask"] == [b"msk"]
+        break
+
+
+async def test_image_edit_gemini_translation(tmp_path):
+    """Edits via Gemini: uploaded image goes as an inlineData input part
+    next to the text prompt (the gemini-2.5-flash-image editing flow)."""
+    from gateway.config import DeploymentConfig, ModelConfig, ProviderConfig
+
+    async for env in _make_env(
+        tmp_path,
+        config=make_config(
+            providers={
+                "gemini": ProviderConfig(
+                    api_base="http://mockupstream.test", api_key="gk"
+                )
+            },
+            models=[
+                ModelConfig(
+                    name="image-model",
+                    deployments=[
+                        DeploymentConfig(
+                            name="gemini/images",
+                            provider="gemini",
+                            model="gemini-2.5-flash-image",
+                        )
+                    ],
+                )
+            ],
+        ),
+    ):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "image-model", "prompt": "make it a watercolor"},
+            files=_image_file(b"gemini-input-image"),
+            headers=auth(key),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"][0]["b64_json"] == "Z2VtaW5pLWltZw=="
+        call = env.mock.requests[-1]
+        assert "IMAGE" in call["body"]["generationConfig"]["responseModalities"]
+        parts = call["body"]["contents"][0]["parts"]
+        assert parts[0]["inlineData"]["data"] == base64.b64encode(
+            b"gemini-input-image"
+        ).decode()
+        assert parts[1]["text"] == "make it a watercolor"
+        break
+
+
+async def test_image_edit_size_cap_413(tmp_path):
+    async for env in _make_env(tmp_path, config=make_config()):
+        env.app.state.config.uploads.max_upload_mb = 0
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "edit"},
+            files=_image_file(b"x"),
+            headers=auth(key),
+        )
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "upload_too_large"
+        break
+
+
+async def test_image_edit_missing_fields_400(tmp_path):
+    async for env in _make_env(tmp_path, config=make_config()):
+        key = (await create_key(env.client, "editor"))["key"]
+        no_image = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "edit"},
+            headers=auth(key),
+        )
+        assert no_image.status_code == 400
+        assert "image" in no_image.json()["error"]["message"]
+        no_prompt = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model"},
+            files=_image_file(),
+            headers=auth(key),
+        )
+        assert no_prompt.status_code == 400
+        assert "prompt" in no_prompt.json()["error"]["message"]
+        no_model = await env.client.post(
+            "/v1/images/edits",
+            data={"prompt": "edit"},
+            files=_image_file(),
+            headers=auth(key),
+        )
+        assert no_model.status_code == 400
+        assert "model" in no_model.json()["error"]["message"]
+        break
+
+
+async def test_image_edit_falls_back_from_unsupported_provider(tmp_path):
+    from gateway.config import DeploymentConfig, ModelConfig, ProviderConfig
+
+    async for env in _make_env(
+        tmp_path,
+        config=make_config(
+            providers={
+                "openai": ProviderConfig(
+                    api_base="http://mockupstream.test/v1", api_key="k"
+                ),
+                "anthropic": ProviderConfig(
+                    api_base="http://mockupstream.test", api_key="k"
+                ),
+            },
+            models=[
+                ModelConfig(
+                    name="image-model",
+                    deployments=[
+                        DeploymentConfig(
+                            name="anthropic/images", provider="anthropic",
+                            model="claude-sonnet-4-5", priority=10,
+                        ),
+                        DeploymentConfig(
+                            name="openai/images", provider="openai",
+                            model="model-a", priority=20,
+                        ),
+                    ],
+                )
+            ],
+        ),
+    ):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "image-model", "prompt": "edit"},
+            files=_image_file(),
+            headers=auth(key),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["x-gateway-deployment"] == "openai/images"
+        break
+
+
+async def test_image_edit_scope_covers_edits(tmp_path):
+    async for env in _make_env(tmp_path, config=make_config()):
+        key = (
+            await create_key(env.client, "chat-only", allowed_endpoints=["chat"])
+        )["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "edit"},
+            files=_image_file(),
+            headers=auth(key),
+        )
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "endpoint_not_allowed"
+        break
+
+
+async def test_image_edit_logged_without_bytes(tmp_path):
+    async for env in _make_env(tmp_path, config=make_config()):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/edits",
+            data={"model": "test-model", "prompt": "edit"},
+            files={"image": ("cat.png", b"image-bytes", "image/png"), "mask": ("m.png", b"mask-bytes", "image/png")},
+            headers=auth(key),
+        )
+        assert resp.status_code == 200
+        logs = await env.client.get("/admin/logs", headers=auth(ADMIN_KEY))
+        row = logs.json()["data"][0]
+        assert row["status"] == "success"
+        detail = await env.client.get(
+            f"/admin/logs/{row['id']}", headers=auth(ADMIN_KEY)
+        )
+        full = detail.json()
+        # Metadata about the uploads, never the bytes.
+        assert full["request_body"]["images"] == [
+            {"file_name": "cat.png", "size_bytes": 11}
+        ]
+        assert full["request_body"]["mask"] == {"file_name": "m.png", "size_bytes": 10}
+        assert full["request_body"]["prompt"] == "edit"
+        assert full["response_body"]["data"]
+        break
+
+
+# ----------------------------------------------------------------------
+# Image variations (/v1/images/variations)
+# ----------------------------------------------------------------------
+
+
+async def test_image_variation_e2e(tmp_path):
+    async for env in _make_env(
+        tmp_path, config=make_config(pricing={"model-a": {"image_usd": 0.02}})
+    ):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/variations",
+            data={"model": "test-model", "n": "2"},
+            files=_image_file(),
+            headers=auth(key),
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(resp.json()["data"]) == 2
+        assert float(resp.headers["x-gateway-cost-usd"]) == pytest.approx(0.04)
+
+        sent = env.mock.requests[-1]
+        assert sent["url"].endswith("/images/variations")
+        fields = sent["body"]["_multipart"]
+        assert fields["model"] == "model-a"
+        assert "prompt" not in fields  # variations carry no prompt
+        assert sent["body"]["_files"]["image"] == [b"pngbytes-here"]
+        break
+
+
+async def test_image_variation_gemini_unsupported_501(tmp_path):
+    """Gemini has no variations API: a gemini-only model surfaces the
+    modality gap as a clear 501 (nothing to fall through to)."""
+    from gateway.config import DeploymentConfig, ModelConfig, ProviderConfig
+
+    async for env in _make_env(
+        tmp_path,
+        config=make_config(
+            providers={
+                "gemini": ProviderConfig(
+                    api_base="http://mockupstream.test", api_key="gk"
+                )
+            },
+            models=[
+                ModelConfig(
+                    name="image-model",
+                    deployments=[
+                        DeploymentConfig(
+                            name="gemini/images", provider="gemini",
+                            model="gemini-2.5-flash-image",
+                        )
+                    ],
+                )
+            ],
+        ),
+    ):
+        key = (await create_key(env.client, "editor"))["key"]
+        resp = await env.client.post(
+            "/v1/images/variations",
+            data={"model": "image-model"},
+            files=_image_file(),
+            headers=auth(key),
+        )
+        assert resp.status_code == 501
+        assert "does not support image variations" in resp.json()["error"]["message"]
         break
