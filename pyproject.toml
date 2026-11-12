@@ -1,6 +1,6 @@
 [project]
 name = "llm-gateway"
-version = "0.1.0"
+version = "1.0.0"
 description = "OpenAI-compatible LLM gateway with guardrails, virtual keys, routing, caching and observability"
 readme = "README.md"
 requires-python = ">=3.12"

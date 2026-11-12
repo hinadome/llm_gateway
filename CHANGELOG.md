@@ -6,13 +6,16 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ## [Unreleased]
 
-Images, audio and multimodal chat — the non-chat modalities on the same
-policy spine (keys, routing, retries, failover, breakers, budgets, rate
-limits, logging), plus audio input and image output inside chat, audio
-output in chat, and native Gemini embeddings inbound. Multi-tenancy —
-tenants (organizations) with a pooled, narrowing policy ceiling over
-groups of virtual keys, tenant admins scoped to their own tenant, and
-tenant-isolated caches.
+## [1.0.0] — 2026-11-12
+
+First stable release. Since 0.1.0: images, audio and multimodal chat —
+the non-chat modalities on the same policy spine (keys, routing,
+retries, failover, breakers, budgets, rate limits, logging), plus audio
+input and image output inside chat, audio output in chat, and native
+Gemini embeddings inbound; and multi-tenancy — tenants (organizations)
+with a pooled, narrowing policy ceiling over groups of virtual keys,
+tenant admins scoped to their own tenant, and tenant-isolated caches.
+732 tests, no network required.
 
 ### Added
 
@@ -235,4 +238,5 @@ operations story. 604 tests, no network required.
 - Hardened Docker image (non-root, HEALTHCHECK on readiness) + standalone
   `deploy/docker-compose.yml` (volumes, optional Redis profile).
 
+[1.0.0]: https://example.com/llm-gateway/releases/tag/v1.0.0
 [0.1.0]: https://example.com/llm-gateway/releases/tag/v0.1.0
