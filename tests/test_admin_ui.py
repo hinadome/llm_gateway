@@ -10,17 +10,19 @@ async def test_admin_ui_served_without_auth(env):
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/html")
     body = resp.text
-    # The shell renders the six dashboard tabs and targets the JSON API.
+    # The shell renders the seven dashboard tabs and targets the JSON API.
     for marker in (
         "LLM Gateway",
         'id="tab-overview"',
         'id="tab-keys"',
+        'id="tab-tenants"',
         'id="tab-prompts"',
         'id="tab-logs"',
         'id="tab-routing"',
         'id="tab-guardrails"',
         "/admin/stats",
         "/admin/keys",
+        "/admin/tenants",
         "/admin/prompts",
         "/admin/logs",
         "/admin/routing",
@@ -35,6 +37,28 @@ async def test_admin_ui_has_no_external_resources(env):
     body = (await env.client.get("/admin/ui")).text
     assert "http://" not in body
     assert "https://" not in body
+
+
+async def test_admin_ui_tenants_surface(env):
+    # The tenants tab is fully wired: table, create dialog with the
+    # tenant fields, and the key dialog's tenancy placement (tenant
+    # select + admin-key checkbox). No fetch happens without a key,
+    # so only the static shell is assertable here.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="tenants-table"',
+        'id="dlg-tenant"',
+        'id="t-name"',
+        'id="t-budget"',
+        'id="btn-newtenant"',
+        'id="k-tenant"',
+        'id="k-admin"',
+        "data-tedit",
+        "data-tdelete",
+        "budgetCellHtml",
+        "bootstrapAdminInfo",
+    ):
+        assert marker in body, marker
 
 
 async def test_admin_redirects_to_ui(env):

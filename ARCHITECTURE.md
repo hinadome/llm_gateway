@@ -484,9 +484,15 @@ gateway/
                             /admin/ui without auth (the shell holds no data);
                             talks to the JSON admin API above with the admin key
                             pasted into a login overlay (kept in sessionStorage,
-                            sent as Bearer). 5 tabs: overview stats (+ usage CSV
-                            export for the selected window), key
-                            management (create/edit/revoke, raw key shown once),
+                            sent as Bearer). 6 tabs: overview stats (+ usage CSV
+                            export for the selected window, by-tenant breakdown
+                            when tenants have traffic), key
+                            management (create/edit/revoke, raw key shown once,
+                            tenant placement + admin-key grants for platform
+                            admins; badges for tenant membership and admin
+                            keys), tenant management (create/edit/delete,
+                            pooled budget bars, kill switch — platform admins
+                            only; a tenant admin lands on a scoped note),
                             request logs (filter, paginate, expand full bodies),
                             routing table with live breaker state + reset,
                             guardrail inventory. A test enforces the
@@ -1151,7 +1157,8 @@ tests/
 │                        sent, skipped-without-URL counting
 ├── test_admin_ui.py     Dashboard shell served unauthenticated at /admin/ui (all data
 │                        endpoints still 401), /admin 307 redirect, offline invariant
-│                        (no http/https substrings), /admin/logs/{id} full row incl.
+│                        (no http/https substrings), tenants surface (table, dialog,
+│                        key-dialog tenancy) markers, /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,
 │                        tool_result, images, stop reasons, error chunks) + e2e through

@@ -175,6 +175,7 @@
 <nav class="tabs" id="tabs">
   <button data-tab="overview" class="active">Overview</button>
   <button data-tab="keys">Keys</button>
+  <button data-tab="tenants">Tenants</button>
   <button data-tab="prompts">Prompts</button>
   <button data-tab="logs">Request logs</button>
   <button data-tab="routing">Routing &amp; breakers</button>
@@ -209,6 +210,10 @@
       <div class="ph">By key</div>
       <div style="overflow-x:auto"><table id="ov-keys"></table></div>
     </div>
+    <div class="panel" id="ov-tenants-panel" style="display:none">
+      <div class="ph">By tenant</div>
+      <div style="overflow-x:auto"><table id="ov-tenants"></table></div>
+    </div>
   </section>
 
   <!-- Keys -->
@@ -218,6 +223,19 @@
         <div class="right"><button class="primary small" id="btn-newkey">+ New key</button></div>
       </div>
       <div style="overflow-x:auto"><table id="keys-table"></table></div>
+    </div>
+  </section>
+
+  <!-- Tenants -->
+  <section class="tab" id="tab-tenants">
+    <div class="panel">
+      <div class="ph">Tenants
+        <div class="right">
+          <span class="muted" style="font-weight:400;font-size:12px">a pooled policy ceiling over a group of keys — strictly narrowing, no admin bypass at the tenant layer</span>
+          <button class="primary small" id="btn-newtenant">+ New tenant</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto"><table id="tenants-table"></table></div>
     </div>
   </section>
 
@@ -312,6 +330,13 @@
       <label class="fld">Name
         <input id="k-name" required placeholder="mobile-app" autocomplete="off">
       </label>
+      <label class="fld" id="k-tenant-row" title="Owning tenant: the key must pass both its own checks and the tenant's pooled ceiling (model allowlist, RPM/TPM, budgets); no tenant = a platform key with no tenant checks. Placing a key in a tenant (and moving it later) is a platform-admin operation — a tenant administrator's keys stay in their own tenant.">
+        Tenant
+        <select id="k-tenant"><option value="">— none (platform key) —</option></select>
+      </label>
+      <label class="fld" id="k-admin-row" style="grid-template-columns:auto 1fr;display:grid;gap:8px;align-items:center;color:var(--text)" title="Admin rights. No tenant: a platform administrator (the operator's full power — delegate deliberately). Inside a tenant: a tenant administrator, scoped to that tenant's keys, logs and usage, and subject to its policy like every member. Cannot be changed after creation.">
+        <input type="checkbox" id="k-admin" style="width:16px;height:16px;accent-color:var(--accent)"> Admin key
+      </label>
       <label class="fld">Allowed models (comma-separated fnmatch patterns; empty = all)
         <input id="k-models" placeholder="gpt-4o*, claude-*" autocomplete="off">
       </label>
@@ -369,6 +394,39 @@
   </form>
 </dialog>
 
+<!-- create / edit tenant dialog -->
+<dialog id="dlg-tenant">
+  <form id="form-tenant" method="dialog" style="min-width:460px">
+    <div class="dh" id="dlg-tenant-title">New tenant</div>
+    <div class="db">
+      <label class="fld" title="Header-safe slug: it surfaces in API responses, log filters and the X-Gateway-Tenant response header (letters, digits, - and _).">Name (slug)
+        <input id="t-name" required placeholder="acme" autocomplete="off">
+      </label>
+      <label class="fld" title="Free-form label for dashboards; the slug is what APIs speak.">Display name
+        <input id="t-display" placeholder="Acme Corp" autocomplete="off">
+      </label>
+      <label class="fld" title="Model allowlist every member key must pass (fnmatch patterns; empty = all) — it can only narrow what the member keys allow.">Allowed models (comma-separated fnmatch patterns; empty = all)
+        <input id="t-models" placeholder="gpt-4o*, claude-*" autocomplete="off">
+      </label>
+      <div class="grid2">
+        <label class="fld" title="Pooled RPM ceiling across every member key">RPM limit <input id="t-rpm" type="number" min="0" placeholder="unlimited"></label>
+        <label class="fld" title="Pooled TPM ceiling across every member key">TPM limit <input id="t-tpm" type="number" min="0" placeholder="unlimited"></label>
+        <label class="fld" title="Pooled spend cap across every member key. Changing it re-arms the tenant's budget alerts (levels the current spend has already crossed count as fired).">Max budget (USD) <input id="t-budget" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+        <label class="fld" title="Pooled spend cap per UTC calendar day; resets at 00:00 UTC">Daily budget (USD) <input id="t-daily" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+        <label class="fld" title="Pooled spend cap per UTC calendar month; resets on the 1st at 00:00 UTC">Monthly budget (USD) <input id="t-monthly" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+      </div>
+      <label class="fld" style="grid-template-columns:auto 1fr;display:grid;gap:8px;align-items:center;color:var(--text)" id="t-active-row" title="Kill switch: while disabled, every member key fails closed (401) until re-enabled — spend state and keys are untouched.">
+        <input type="checkbox" id="t-active" checked style="width:16px;height:16px;accent-color:var(--accent)"> Active
+      </label>
+      <div class="err" id="t-err"></div>
+    </div>
+    <div class="df">
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="ok" class="primary" id="t-submit">Create</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- raw key reveal -->
 <dialog id="dlg-rawkey">
   <div class="dh">Key created</div>
@@ -417,8 +475,11 @@ const state = {
   auto: true,
   logs: { limit: 25, offset: 0, total: 0 },
   editing: null,          // key id being edited (null = create)
+  editingTenant: null,    // tenant id being edited (null = create)
   openLog: null,          // expanded log row id
   openPrompt: null,       // expanded prompt-library name
+  platformAdmin: null,    // null = not probed yet; set at sign-in
+  tenantNames: {},        // tenant id -> slug (name badges, selects)
 };
 
 // ---------- helpers ----------------------------------------------------
@@ -468,7 +529,7 @@ async function api(path, opts = {}) {
   try { body = await res.json(); } catch (e) { /* no body */ }
   if (!res.ok) {
     const msg = body && body.error && body.error.message ? body.error.message : (res.status + " " + res.statusText);
-    throw new Error(msg);
+    throw Object.assign(new Error(msg), { status: res.status });
   }
   return body;
 }
@@ -492,9 +553,25 @@ async function tryLogin() {
     $("#authbox").style.display = "flex";
     $("#login-err").textContent = "";
     setConn(true, "connected");
+    await bootstrapAdminInfo();
     refresh();
   } catch (e) {
     $("#login-err").textContent = e.message || "Sign-in failed";
+  }
+}
+
+// Which kind of administrator signed in: only platform admins may
+// manage tenants (tenant admins get 403 there). Probing once drives
+// every tenancy affordance in the UI — the Tenants tab, tenant
+// placement in the key dialog, tenant name badges.
+async function bootstrapAdminInfo() {
+  try {
+    const r = await api("/admin/tenants");
+    state.tenantNames = Object.fromEntries((r.data || []).map(t => [t.id, t.name]));
+    state.platformAdmin = true;
+  } catch (e) {
+    state.platformAdmin = false;
+    state.tenantNames = {};
   }
 }
 $("#btn-login").addEventListener("click", tryLogin);
@@ -552,6 +629,7 @@ async function refresh() {
   try {
     if (state.tab === "overview") await loadOverview();
     else if (state.tab === "keys") await loadKeys();
+    else if (state.tab === "tenants") await loadTenants();
     else if (state.tab === "prompts") await loadPrompts();
     else if (state.tab === "logs") await loadLogs();
     else if (state.tab === "routing") await loadRouting();
@@ -587,6 +665,55 @@ async function loadOverview() {
   $("#ov-keys").innerHTML = "<thead><tr><th>Key</th><th class=num>Requests</th><th class=num>Cost</th></tr></thead><tbody>" +
     (keys.length ? keys.map(k => `<tr><td>${esc(k.key_name)}</td><td class="num">${fmtInt(k.requests)}</td><td class="num">${fmtUsd(k.cost_usd)}</td></tr>`).join("")
       : `<tr><td colspan="3" class="empty">No requests in this window</td></tr>`) + "</tbody>";
+  // By tenant: present only in a platform admin's stats, and only
+  // worth showing when at least one tenant has traffic.
+  const byTenant = s.by_tenant || [];
+  const hasTenantTraffic = byTenant.some(e => e.tenant_id != null);
+  $("#ov-tenants-panel").style.display = hasTenantTraffic ? "" : "none";
+  if (hasTenantTraffic) {
+    $("#ov-tenants").innerHTML = "<thead><tr><th>Tenant</th><th class=num>Requests</th><th class=num>Cost</th></tr></thead><tbody>" +
+      byTenant.map(e => `<tr><td>${e.tenant_id == null
+        ? '<span class="muted">platform (no tenant)</span>'
+        : esc(state.tenantNames[e.tenant_id] || e.tenant_id)}</td><td class="num">${fmtInt(e.requests)}</td><td class="num">${fmtUsd(e.cost_usd)}</td></tr>`).join("") + "</tbody>";
+  }
+}
+
+// Shared budget cell for keys and tenants — the same machinery: a
+// total-budget bar plus lazily-rolled UTC daily/monthly windows
+// (bucket ids disambiguate the rolled spends), fired alert levels as
+// chips. Keys and tenants are the same shape here by design.
+function budgetCellHtml(e) {
+  const budget = e.max_budget_usd;
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  const monthUtc = todayUtc.slice(0, 7);
+  const winBar = (cap, spend, bucket, current, label) => {
+    if (cap == null || cap <= 0) return "";
+    const s = bucket === current ? (spend || 0) : 0; // window rolled → 0
+    const pct = Math.min(100, (s / cap) * 100);
+    const over = s > cap;
+    const color = over || pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--amber)" : "var(--green)";
+    return `<div class="bar" style="width:90px"><div style="width:${pct.toFixed(1)}%;background:${color}"></div></div>` +
+      `<span class="mono" style="font-size:11px" title="${label} budget (UTC calendar window)">${label[0].toUpperCase()}: ${fmtUsd(s)} / ${fmtUsd(cap)}</span>`;
+  };
+  const winRows =
+    winBar(e.daily_budget_usd, e.daily_spend_usd, e.daily_bucket, todayUtc, "daily") +
+    winBar(e.monthly_budget_usd, e.monthly_spend_usd, e.monthly_bucket, monthUtc, "monthly");
+  if ((budget != null && budget > 0) || winRows) {
+    let totalPart = "";
+    if (budget != null && budget > 0) {
+      const pct = Math.min(100, (e.spend_usd / budget) * 100);
+      const over = e.spend_usd > budget;
+      const color = over || pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--amber)" : "var(--green)";
+      const alerts = (e.budget_alerts_fired || []).map(l => `<span class="b b-amber">${l}%</span>`).join(" ");
+      totalPart = `<div class="budgetcell"><div class="bar"><div style="width:${pct.toFixed(1)}%;background:${color}"></div></div>` +
+        `<span class="mono" style="font-size:12px">${fmtUsd(e.spend_usd)} / ${fmtUsd(budget)}</span>${alerts}</div>`;
+    } else if (e.spend_usd > 0) {
+      totalPart = `<span class="mono" style="font-size:12px">${fmtUsd(e.spend_usd)}</span>`;
+    }
+    return `<div style="display:grid;gap:3px;justify-items:start">${totalPart}${winRows}</div>`;
+  }
+  if (e.spend_usd > 0) return `<span class="mono" style="font-size:12px">${fmtUsd(e.spend_usd)}</span>`;
+  return '<span class="muted">—</span>';
 }
 
 // ---------- keys -------------------------------------------------------
@@ -594,38 +721,7 @@ async function loadOverview() {
 async function loadKeys() {
   const r = await api("/admin/keys");
   const rows = (r.data || []).map(k => {
-    const budget = k.max_budget_usd;
-    const todayUtc = new Date().toISOString().slice(0, 10);
-    const monthUtc = todayUtc.slice(0, 7);
-    const winBar = (cap, spend, bucket, current, label) => {
-      if (cap == null || cap <= 0) return "";
-      const s = bucket === current ? (spend || 0) : 0; // window rolled → 0
-      const pct = Math.min(100, (s / cap) * 100);
-      const over = s > cap;
-      const color = over || pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--amber)" : "var(--green)";
-      return `<div class="bar" style="width:90px"><div style="width:${pct.toFixed(1)}%;background:${color}"></div></div>` +
-        `<span class="mono" style="font-size:11px" title="${label} budget (UTC calendar window)">${label[0].toUpperCase()}: ${fmtUsd(s)} / ${fmtUsd(cap)}</span>`;
-    };
-    const winRows =
-      winBar(k.daily_budget_usd, k.daily_spend_usd, k.daily_bucket, todayUtc, "daily") +
-      winBar(k.monthly_budget_usd, k.monthly_spend_usd, k.monthly_bucket, monthUtc, "monthly");
-    let budgetCell = '<span class="muted">—</span>';
-    if ((budget != null && budget > 0) || winRows) {
-      let totalPart = "";
-      if (budget != null && budget > 0) {
-        const pct = Math.min(100, (k.spend_usd / budget) * 100);
-        const over = k.spend_usd > budget;
-        const color = over || pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--amber)" : "var(--green)";
-        const alerts = (k.budget_alerts_fired || []).map(l => `<span class="b b-amber">${l}%</span>`).join(" ");
-        totalPart = `<div class="budgetcell"><div class="bar"><div style="width:${pct.toFixed(1)}%;background:${color}"></div></div>` +
-          `<span class="mono" style="font-size:12px">${fmtUsd(k.spend_usd)} / ${fmtUsd(budget)}</span>${alerts}</div>`;
-      } else if (k.spend_usd > 0) {
-        totalPart = `<span class="mono" style="font-size:12px">${fmtUsd(k.spend_usd)}</span>`;
-      }
-      budgetCell = `<div style="display:grid;gap:3px;justify-items:start">${totalPart}${winRows}</div>`;
-    } else if (k.spend_usd > 0) {
-      budgetCell = `<span class="mono" style="font-size:12px">${fmtUsd(k.spend_usd)}</span>`;
-    }
+    const budgetCell = budgetCellHtml(k);
     const models = !k.allowed_models ? '<span class="b b-blue">all</span>' :
       k.allowed_models.map(m => `<span class="b b-gray mono">${esc(m)}</span>`).join(" ");
     const grOff = (k.disabled_guardrails || []).length
@@ -646,8 +742,14 @@ async function loadKeys() {
       ? ` <span class="b b-blue" title="Gateway-managed prompt policy: ${esc(promptBits.join(" + "))}">✎</span>`
       : "";
     const expired = k.expires_at && new Date(k.expires_at) < new Date();
+    const tenantBadge = k.tenant_id
+      ? ` <span class="b b-purple" title="Tenant: must also pass this tenant's pooled policy ceiling (models, RPM/TPM, budgets)">${esc(state.tenantNames[k.tenant_id] || k.tenant_id)}</span>`
+      : "";
+    const adminBadge = k.is_admin
+      ? ` <span class="b b-amber" title="${k.tenant_id ? "Tenant administrator — manages this tenant's keys, logs and usage; still subject to the tenant's policy" : "Platform administrator — the operator's full power"}">admin</span>`
+      : "";
     return `<tr>
-      <td><b>${esc(k.name)}</b>${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
+      <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
       <td>${models}${grOff}${scoped}${ipLock}${promptPolicy}</td>
@@ -688,6 +790,13 @@ function openKeyDialog(k) {
   $("#k-submit").textContent = k ? "Save" : "Create";
   $("#k-name").value = k ? k.name : "";
   $("#k-name").disabled = !!k; // name is immutable
+  // Tenancy: only platform admins place keys in tenants (or re-home
+  // them later). A tenant admin's creates land in their own tenant
+  // regardless, and re-homing is refused server-side.
+  $("#k-tenant-row").style.display = state.platformAdmin ? "" : "none";
+  populateTenantSelect(k ? k.tenant_id : null);
+  $("#k-admin").checked = k ? !!k.is_admin : false;
+  $("#k-admin").disabled = !!k; // admin rights are set at creation only
   $("#k-models").value = k && k.allowed_models ? k.allowed_models.join(", ") : "";
   $("#k-guardrails").value = k && k.disabled_guardrails ? k.disabled_guardrails.join(", ") : "";
   $("#k-mappings").value = k && k.model_mappings
@@ -760,6 +869,9 @@ async function submitKeyDialog() {
   try {
     if (state.editing) {
       body.is_active = $("#k-active").checked;
+      // Platform admins may re-home a key between tenants (or out of
+      // one, via "none"); tenant admins never send this field.
+      if (state.platformAdmin) body.tenant_id = $("#k-tenant").value || null;
       await api("/admin/keys/" + state.editing, { method: "PATCH", body: JSON.stringify(body) });
       toast("Key updated");
     } else {
@@ -778,9 +890,14 @@ async function submitKeyDialog() {
       if (body.daily_budget_usd == null) delete body.daily_budget_usd;
       if (body.monthly_budget_usd == null) delete body.monthly_budget_usd;
       if (!body.expires_at) delete body.expires_at;
+      const payload = Object.assign({ name: $("#k-name").value.trim() }, body);
+      if ($("#k-admin").checked) payload.is_admin = true;
+      // Tenant placement (platform admins only; a tenant admin's key
+      // is forced into their own tenant server-side).
+      if (state.platformAdmin && $("#k-tenant").value) payload.tenant_id = $("#k-tenant").value;
       const created = await api("/admin/keys", {
         method: "POST",
-        body: JSON.stringify(Object.assign({ name: $("#k-name").value.trim() }, body)),
+        body: JSON.stringify(payload),
       });
       $("#rawkey").textContent = created.key;
       $("#dlg-rawkey").showModal();
@@ -813,6 +930,143 @@ $("#btn-copykey").addEventListener("click", async () => {
   }
 });
 $("#btn-closeraw").addEventListener("click", () => $("#dlg-rawkey").close());
+
+// ---------- tenants ----------------------------------------------------
+
+// Key-dialog tenant placement: a dropdown of tenants plus "none"
+// (platform key). Names come from the sign-in probe; a key whose
+// tenant is not among them (created after sign-in) still shows.
+function populateTenantSelect(selected) {
+  const sel = $("#k-tenant");
+  const entries = Object.entries(state.tenantNames || {});
+  if (selected && !entries.some(([id]) => id === selected)) entries.push([selected, selected]);
+  sel.innerHTML = '<option value="">— none (platform key) —</option>' +
+    entries.map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join("");
+  sel.value = selected || "";
+}
+
+async function loadTenants() {
+  // Tenant management is a platform-administrator surface; a tenant
+  // admin's own keys, logs and usage live on their tabs.
+  $("#btn-newtenant").style.display = state.platformAdmin ? "" : "none";
+  if (!state.platformAdmin) {
+    $("#tenants-table").innerHTML =
+      "<tbody><tr><td class='empty'>Tenant management is a platform-administrator surface. " +
+      "Your tenant's keys, logs and usage are on their own tabs.</td></tr></tbody>";
+    return;
+  }
+  const [tr, kr] = await Promise.all([
+    api("/admin/tenants"),
+    api("/admin/keys").catch(() => ({ data: [] })), // key counts are cosmetic
+  ]);
+  const keyCounts = {};
+  for (const k of kr.data || []) if (k.tenant_id) keyCounts[k.tenant_id] = (keyCounts[k.tenant_id] || 0) + 1;
+  state.tenantNames = Object.fromEntries((tr.data || []).map(t => [t.id, t.name]));
+  const rows = (tr.data || []).map(t => {
+    const models = !t.allowed_models ? '<span class="b b-blue">all</span>' :
+      t.allowed_models.map(m => `<span class="b b-gray mono">${esc(m)}</span>`).join(" ");
+    const nameCell = `<b>${esc(t.name)}</b>` +
+      (t.display_name ? ` <span class="muted" style="font-size:12px">${esc(t.display_name)}</span>` : "");
+    const stateBadge = t.is_active
+      ? '<span class="b b-green" title="Normal operation">active</span>'
+      : '<span class="b b-red" title="Kill switch: every member key fails closed (401) until re-enabled">disabled</span>';
+    return `<tr>
+      <td>${nameCell}</td>
+      <td>${stateBadge}</td>
+      <td class="num">${fmtInt(keyCounts[t.id] || 0)}</td>
+      <td>${models}</td>
+      <td class="num">${t.rpm_limit == null ? "—" : fmtInt(t.rpm_limit)} / ${t.tpm_limit == null ? "—" : fmtInt(t.tpm_limit)}</td>
+      <td>${budgetCellHtml(t)}</td>
+      <td class="muted" style="font-size:12px">${fmtWhen(t.created_at)}</td>
+      <td style="white-space:nowrap">
+        <button class="small ghost" data-tedit="${esc(t.id)}">Edit</button>
+        <button class="small danger" data-tdelete="${esc(t.id)}" data-name="${esc(t.name)}">Delete</button>
+      </td></tr>`;
+  }).join("");
+  $("#tenants-table").innerHTML =
+    "<thead><tr><th>Tenant</th><th>State</th><th class=num>Keys</th><th>Models</th><th class=num>RPM / TPM</th><th>Budget (pooled)</th><th>Created</th><th></th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="8" class="empty">No tenants — create one, then place keys in it (Keys tab)</td></tr>') + "</tbody>";
+}
+
+$("#tenants-table").addEventListener("click", async e => {
+  const edit = e.target.closest("button[data-tedit]");
+  if (edit) {
+    try { openTenantDialog(await api("/admin/tenants/" + edit.dataset.tedit)); }
+    catch (err) { toast(err.message, true); }
+    return;
+  }
+  const del = e.target.closest("button[data-tdelete]");
+  if (del) {
+    const name = del.dataset.name;
+    if (!confirm(`Delete tenant '${name}'? (Refused with 409 while any key still references it; its keys must be re-homed or deleted first.)`)) return;
+    try {
+      await api("/admin/tenants/" + del.dataset.tdelete, { method: "DELETE" });
+      toast("Tenant deleted");
+      loadTenants();
+    } catch (err) { toast(err.message, true); }
+  }
+});
+
+function openTenantDialog(t) {
+  state.editingTenant = t ? t.id : null;
+  $("#dlg-tenant-title").textContent = t ? "Edit tenant " + t.name : "New tenant";
+  $("#t-submit").textContent = t ? "Save" : "Create";
+  $("#t-name").value = t ? t.name : "";
+  $("#t-name").disabled = !!t; // slug is immutable
+  $("#t-display").value = t && t.display_name ? t.display_name : "";
+  $("#t-models").value = t && t.allowed_models ? t.allowed_models.join(", ") : "";
+  $("#t-rpm").value = t && t.rpm_limit != null ? t.rpm_limit : "";
+  $("#t-tpm").value = t && t.tpm_limit != null ? t.tpm_limit : "";
+  $("#t-budget").value = t && t.max_budget_usd != null ? t.max_budget_usd : "";
+  $("#t-daily").value = t && t.daily_budget_usd != null ? t.daily_budget_usd : "";
+  $("#t-monthly").value = t && t.monthly_budget_usd != null ? t.monthly_budget_usd : "";
+  $("#t-active").checked = t ? t.is_active : true;
+  $("#t-active-row").style.display = t ? "grid" : "none";
+  $("#t-err").textContent = "";
+  $("#dlg-tenant").showModal();
+}
+
+async function submitTenantDialog() {
+  const num = (id) => { const v = $("#" + id).value.trim(); return v === "" ? null : Number(v); };
+  const body = {
+    display_name: $("#t-display").value.trim() || null,
+    allowed_models: $("#t-models").value.trim()
+      ? $("#t-models").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    rpm_limit: num("t-rpm"),
+    tpm_limit: num("t-tpm"),
+    max_budget_usd: num("t-budget"),
+    daily_budget_usd: num("t-daily"),
+    monthly_budget_usd: num("t-monthly"),
+  };
+  try {
+    if (state.editingTenant) {
+      body.is_active = $("#t-active").checked;
+      await api("/admin/tenants/" + state.editingTenant, { method: "PATCH", body: JSON.stringify(body) });
+      toast("Tenant updated");
+    } else {
+      const created = await api("/admin/tenants", {
+        method: "POST",
+        body: JSON.stringify(Object.assign({ name: $("#t-name").value.trim() }, body)),
+      });
+      toast(`Tenant '${created.name}' created — place keys in it from the Keys tab`);
+    }
+    $("#dlg-tenant").close();
+    loadTenants();
+  } catch (e) {
+    $("#t-err").textContent = e.message;
+  }
+}
+
+$("#btn-newtenant").addEventListener("click", () => openTenantDialog(null));
+$("#form-tenant").addEventListener("submit", e => {
+  e.preventDefault();
+  if (e.submitter && e.submitter.value === "cancel") {
+    state.editingTenant = null;
+    $("#dlg-tenant").close();
+    return;
+  }
+  submitTenantDialog();
+});
 
 // ---------- prompt library ---------------------------------------------
 
@@ -1194,7 +1448,7 @@ async function loadGuardrails() {
 if (state.key) {
   $("#login").style.display = "none";
   $("#authbox").style.display = "flex";
-  refresh();
+  bootstrapAdminInfo().finally(() => refresh());
 } else {
   $("#login-key").focus();
 }

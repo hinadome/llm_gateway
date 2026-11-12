@@ -20,6 +20,17 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Tenants in the admin dashboard: a Tenants tab (platform admins
+  only — a tenant admin lands on a note pointing at their scoped tabs)
+  with the tenant table (state incl. kill-switch badge, key count,
+  model allowlist, pooled RPM/TPM, the same budget bars as keys),
+  create/edit/delete via dialog (delete surfaces the 409-while-referenced
+  refusal). The key dialog gains tenant placement (platform admins;
+  edits re-home, including out of a tenant) and an admin-key checkbox
+  (creation only — it is not patchable), and the keys table badges
+  tenant membership and admin keys. The overview gains a by-tenant
+  breakdown when tenants have traffic. The dashboard learns which kind
+  of administrator signed in by probing `/admin/tenants` once.
 - CI workflow (`.github/workflows/ci.yml`): the full test suite on
   Python 3.12 and 3.13 via uv (cached), plus a smoke-check of the
   shipped `config.yaml`. Dormant until the repository is pushed to
