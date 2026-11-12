@@ -6,9 +6,9 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ## [Unreleased]
 
-Image generation and audio — the non-chat modalities, on the same policy
-spine (keys, routing, retries, failover, breakers, budgets, rate limits,
-logging).
+Images, audio and multimodal chat — the non-chat modalities on the same
+policy spine (keys, routing, retries, failover, breakers, budgets, rate
+limits, logging), plus audio input and image output inside chat.
 
 ### Added
 
@@ -50,6 +50,21 @@ logging).
 - Endpoint scopes `images` and `audio` for per-key `allowed_endpoints`.
 - Uploads are never persisted: log rows store file names + sizes; speech
   responses are logged as a note (media type + byte count).
+- Audio input in chat (`input_audio` parts) on every inbound format:
+  OpenAI chat and the Responses bridge (`input_audio` input items) pass
+  them to OpenAI/Azure verbatim; native Gemini `inlineData` audio
+  translates to `input_audio` (and back). The Anthropic adapter refuses
+  audio input with a clear 400 (`audio_input_not_supported`) and
+  `fallback=True`, so mixed routing groups still serve it elsewhere.
+  Guardrails and token estimation see an `[audio]` placeholder, never the
+  bytes.
+- Image-to-image chat: Gemini image models (e.g. `gemini-2.5-flash-image`)
+  on the chat surface get `responseModalities: TEXT+IMAGE` automatically
+  (models with `image` in the name); generated images return as
+  `image_url` content parts in `message.content`, rendered back to
+  `inlineData` on the native Gemini surface. Streaming is refused with a
+  clear 400 (an image has no chunk-delta representation; retry with
+  `stream: false`).
 
 ### Changed
 

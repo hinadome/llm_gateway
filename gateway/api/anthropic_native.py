@@ -279,8 +279,18 @@ def _content_blocks(message: dict) -> list[dict]:
         blocks.append({"type": "text", "text": content})
     elif isinstance(content, list):
         for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
                 blocks.append({"type": "text", "text": str(part.get("text", ""))})
+            elif part.get("type") == "image_url":
+                # Image-generating models routed behind the Anthropic-native
+                # surface: Anthropic assistant messages cannot carry image
+                # blocks, so render an honest note instead of dropping the
+                # image silently.
+                url = (part.get("image_url") or {}).get("url", "")
+                mime = url[5:].split(";")[0] if url.startswith("data:") else "image/png"
+                blocks.append({"type": "text", "text": f"[generated image: {mime}]"})
     for tc in message.get("tool_calls") or []:
         function = tc.get("function") or {}
         try:

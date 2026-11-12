@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 60 Python files, ~14,700 lines, 655 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 60 Python files, ~14,870 lines, 676 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -101,7 +101,9 @@ gateway/
 │                           + async engine management incl. get_engine (readiness
 │                           checks, VACUUM INTO backups)
 ├── bootstrap.py           First-boot seeding: admin key, default virtual key
-├── utils.py                Content flattening, token estimation, truncation helpers
+├── utils.py                Content flattening (text + [image]/[audio] part
+│                           placeholders), token estimation, truncation,
+│                           audio format<->MIME mapping helpers
 │
 ├── api/                    ── HTTP layer (thin: parse → authenticate → delegate) ──
 │   ├── deps.py             require_api_key: extract credential (Bearer,
@@ -122,15 +124,23 @@ gateway/
 │   │                       re-renders responses/SSE (message_start, text/tool
 │   │                       deltas, message_delta usage). Pure translation
 │   │                       functions + a stateful stream renderer, like the
-│   │                       provider adapters but reversed
+│   │                       provider adapters but reversed. Image blocks
+│   │                       become image_url parts; the format has no audio
+│   │                       input blocks at all; an image in an assistant
+│   │                       response (image-capable routing) renders as an
+│   │                       honest [generated image: …] text note
 │   ├── gemini_native.py    POST /v1[/beta]/models/{model}:generateContent and
 │   │                       :streamGenerateContent — native Gemini inbound with
-│   │                       the same structure (parse → pipeline → render)
+│   │                       the same structure (parse → pipeline → render);
+│   │                       inlineData parts parse to image_url (images) or
+│   │                       input_audio (audio) parts and render back to
+│   │                       inlineData on the response side
 │   ├── openai_responses.py POST /v1/responses — OpenAI Responses API inbound
 │   │                       (the OpenAI Agents SDK's default transport):
 │   │                       stateless bridge to the chat-completions core.
 │   │                       Parses the chat-convertible subset (input items,
-│   │                       instructions, function tools, text.format) and
+│   │                       instructions, function tools, text.format,
+│   │                       input_image and input_audio parts) and
 │   │                       re-renders responses/SSE in Responses shape
 │   │                       (response.created → output_text.delta →
 │   │                       response.completed); stateful features
@@ -362,10 +372,18 @@ gateway/
 │   │                       (/openai/deployments/{name}/...?api-version=), api-key
 │   │                       header, optional providers.azure.api_version
 │   ├── anthropic_adapter.py / gemini_adapter.py
-│   │                       Full request/response/stream translation incl. tools & images
-│   │                       (pure translation functions + stateful stream translators);
-│   │                       the Gemini adapter also translates image generation
-│   │                       and editing (OpenAI Images → generateContent with
+│   │                       Full request/response/stream translation incl. tools,
+│   │                       images and audio input (pure translation functions +
+│   │                       stateful stream translators); the Anthropic adapter
+│   │                       refuses input_audio parts (no audio input in the
+│   │                       Messages API) with fallback=True so the routing
+│   │                       group falls through; the Gemini adapter maps
+│   │                       input_audio ↔ inlineData, sets responseModalities
+│   │                       TEXT+IMAGE for image models in chat (image-to-image:
+│   │                       inlineData output becomes image_url content parts,
+│   │                       streaming refused — no chunk-delta representation)
+│   │                       and also translates image generation and editing
+│   │                       (OpenAI Images → generateContent with
 │   │                       responseModalities; uploads ride as inlineData input
 │   │                       parts, one image per call, n = n calls) and speaks
 │   │                       TTS natively (generateContent AUDIO modality,
@@ -565,7 +583,7 @@ Two structural choices make adapters independently testable:
 
 - **Translation is pure** — `anthropic_adapter.translate_request(request, native_model) → dict` and `translate_response(native, public_model) → dict` are side-effect-free functions (unit-tested without HTTP).
 - **Stream translation is a stateful converter** — `AnthropicStreamTranslator` / `GeminiStreamTranslator` consume native SSE events and emit OpenAI chunks; the adapter's I/O shell is thin.
-- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 655 tests run with no network).
+- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 676 tests run with no network).
 
 Note also: because the OpenAI adapter is a passthrough over a configurable `api_base`, **any OpenAI-compatible service (vLLM, Ollama, Groq, Together, …) is already supported** without new code — for chat, embeddings, images and audio.
 
@@ -586,6 +604,19 @@ The modality endpoints (`/v1/images/generations`, `/v1/images/edits`, `/v1/image
 - **Unit-priced accounting** — `_account_cost` mirrors `_account_usage` minus the usage dict: cost comes from `CostCalculator`'s unit prices (`image_usd` per generated/edited image, `audio_usd_per_minute` from the duration a `verbose_json` transcription reports — plain `json` reports none and costs nothing, a documented trade-off — and `speech_usd_per_1m_chars`), while token counters stay estimates for the log row and TPM. For streamed speech, the header carries the (char-based, known-upfront) cost and the actual accounting lands when the body completes — spend survives client disconnects because the finalize path runs in the generator's `finally`.
 - **Multipart at the edge** — the audio and image-edit/variation endpoints parse `multipart/form-data` once in the API layer, validate the upload against `uploads.max_upload_mb` (413 beyond), and the OpenAI adapter re-serializes it upstream with *unknown form fields passed through* (provider-specific parameters keep working without gateway changes). Image parts may be uploaded files (single `image`, repeated `image[]`), or base64 strings (with an optional `data:` URL prefix) for base64-native clients.
 - **Never-persisted uploads** — log rows carry file metadata (names, sizes) only, and a speech response is logged as a note (media type + byte count). No response cache for any of these surfaces (`X-Gateway-Cache: NONE`): generation is non-deterministic and transcription is cheap relative to its upload.
+
+### 4.5 Multimodal chat
+
+Audio and images also ride *inside* chat messages, not just through the modality endpoints. The internal representation is OpenAI's — `input_audio` parts (`{data: <base64>, format: wav|mp3}`) alongside the `image_url` parts vision has always used — and every inbound format reaches it:
+
+- **OpenAI chat / Responses bridge** — `input_audio` parts pass through the OpenAI/Azure adapters verbatim (they are near-passthroughs over content); the Responses bridge accepts `input_audio` input items (the Agents SDK shape) and maps them onto the same parts.
+- **Native Gemini** — `inlineData` parts with an `audio/*` mimeType parse to `input_audio` (format = the MIME subtype, `audio/mpeg` normalized to `mp3`; parameters like `rate=` ride along and round-trip), and `input_audio` renders back to `inlineData` southbound. Image `inlineData` keeps using `image_url` data-URL parts, as before.
+- **Native Anthropic** — the Messages API has no audio input block type at all, so the southbound adapter *refuses* rather than silently dropping the audio: a 400 (`audio_input_not_supported`) with `fallback=True`, so a mixed routing group (Anthropic primary, OpenAI or Gemini fallback) still serves the request — the same pattern as `response_format`.
+
+Two cross-cutting behaviors:
+
+- **Flattening** — guardrails, managed prompts and token estimation see `content_to_text`, where an audio part becomes `[audio]` (like `[image]`). The placeholder keeps guardrail text-matching working and keeps base64 out of anything text-shaped; the trade-off is that TPM pre-flight under-counts audio (real billing uses provider-reported usage).
+- **Image-to-image chat** — a Gemini image model on the chat surface: the adapter sets `responseModalities: [TEXT, IMAGE]` for native models with `image` in the name (covers gemini-2.5-flash-image and the 2.0 preview), input images ride as inline parts, and output `inlineData` becomes an `image_url` content part in `message.content` (mixed text+image responses become content-part lists). Native Gemini responses render the parts back to `inlineData`; the Anthropic-native surface renders a `[generated image: …]` text note (its assistant messages cannot carry image blocks). Streaming is refused with a clear 400 — an image has no chunk-delta representation, and silently dropping it from a stream would be the exact failure mode the gateway exists to prevent.
 
 
 ---
@@ -890,7 +921,7 @@ Shutdown is the mirror image of composition, in reverse dependency order: `/read
 
 Being honest about the seams — these are the current trade-offs (all are localizable; none require redesigning the pipeline concept):
 
-1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Images and audio now exist as first-class non-chat surfaces (`generate_image` / `edit_image` / `vary_image` / `transcribe` / `speak` on `ProviderAdapter`, 501-with-fallback defaults so chat-only providers need no special handling — the router falls through), with OpenAI/Azure passing all of them through, Gemini translating image generation *and editing* to `generateContent` and speaking TTS natively (voice mapping, PCM-as-WAV), and speech streaming end to end. The modality matrix is deliberately shallow: no Gemini or Anthropic *audio understanding* (no Whisper-style transcription APIs), Gemini images have no size/quality/mask mapping and `n` means `n` sequential calls, transcription is billed only from the duration `verbose_json` reports, Gemini TTS is not transcoded to mp3 & friends, and audio inbound is OpenAI-multipart-shaped only. Still missing: native Responses for Anthropic/Gemini (no such endpoint) and inbound *embeddings* in native formats (only chat is translated). Adding those means generalizing `ProviderAdapter` and the schema layer, not just registering something.
+1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Images and audio now exist as first-class non-chat surfaces (`generate_image` / `edit_image` / `vary_image` / `transcribe` / `speak` on `ProviderAdapter`, 501-with-fallback defaults so chat-only providers need no special handling — the router falls through), with OpenAI/Azure passing all of them through, Gemini translating image generation *and editing* to `generateContent` and speaking TTS natively (voice mapping, PCM-as-WAV), and speech streaming end to end. Audio *input in chat* works across every inbound format (`input_audio` parts; Anthropic refuses them — no audio in the Messages API — and falls through, see §4.5), and Gemini image models serve image-to-image chat with images in and out. The modality matrix is deliberately shallow: no Gemini or Anthropic *audio understanding* (no Whisper-style transcription APIs), Gemini images have no size/quality/mask mapping and `n` means `n` sequential calls, transcription is billed only from the duration `verbose_json` reports, Gemini TTS is not transcoded to mp3 & friends, and audio *uploads* are OpenAI-multipart-shaped only. Still missing: native Responses for Anthropic/Gemini (no such endpoint) and inbound *embeddings* in native formats (only chat is translated). Adding those means generalizing `ProviderAdapter` and the schema layer, not just registering something.
 2. **Pipeline phase order is fixed in code.** auth → rate-limit → budget → guardrails → cache → routing → respond. You cannot reorder or disable phases via config (e.g., "check cache before rate limits"). Guardrails *within* the request phase are ordered; *phases* are not.
 3. ~~Request-phase guardrails can only modify `messages`~~ **Solved:** `GuardrailResult` now carries `modified_model` (reject-and-redirect — "serve this on the small model" instead of blocking, with the pipeline re-checking the key's allowlist after the guardrail phase, fail closed) and `modified_request_fields` (arbitrary `ChatCompletionRequest` fields: `temperature`, `tools`, ...). All three compose and chain across guardrails (one `model_copy` per guardrail, each seeing the previous one's output).
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
@@ -1176,8 +1207,24 @@ tests/
 │                        upstream failure → normal failover), Gemini TTS
 │                        (voice mapping alloy→Kore, WAV default with RIFF
 │                        header + exact payload, raw pcm passthrough, voice
-│                        pass-through, per-char cost), audio bytes never in
+│                        pass-through, per-char cost; the voice map is total
+│                        over OpenAI's 11 voices and injective into Gemini's
+│                        prebuilt set), audio bytes never in
 │                        log rows, endpoint scope, auth
+├── test_multimodal_chat.py  Multimodal chat: units (content_to_text [audio]
+│                        placeholder, audio format↔MIME round trips incl.
+│                        parameter-carrying mimes, Gemini input_audio →
+│                        inlineData, Anthropic refusal + unchanged text/image
+│                        translation, Gemini inlineData image output →
+│                        image_url parts, image-model modality config) and
+│                        e2e (OpenAI passthrough of input_audio, Anthropic
+│                        refusal + routing fall-through, Anthropic-only 400,
+│                        Gemini audio round trip, native-Gemini inlineData
+│                        audio round trip, Responses-bridge input_audio incl.
+│                        missing-data 400, image-to-image chat, streaming
+│                        refusal 400, native-Gemini image round trip,
+│                        Anthropic-native [generated image] note, faithful
+│                        request logging)
 └── test_core.py         CostCalculator (prefix pricing + modality unit prices) + RateLimiter windows
 ```
 

@@ -64,8 +64,37 @@ def _translate_user_content(content: Any) -> Any:
     return [{"type": "text", "text": content_to_text(content)}]
 
 
+def _contains_audio_input(messages: list) -> bool:
+    """True if any message carries an input_audio part."""
+    for m in messages:
+        content = getattr(m, "content", None)
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_audio":
+                    return True
+    return False
+
+
 def translate_request(request: ChatCompletionRequest, native_model: str) -> dict:
     """OpenAI ChatCompletionRequest -> Anthropic /v1/messages body."""
+    # Anthropic has no audio input. Silently dropping the audio would let
+    # the request "succeed" while the model never hears it — so refuse
+    # loudly instead (fallback=True lets the router move on to a
+    # deployment whose provider can accept it, e.g. OpenAI or Gemini).
+    if _contains_audio_input(request.messages):
+        raise ProviderError(
+            400,
+            "The Anthropic provider does not support audio input "
+            "(input_audio parts); the Messages API accepts text, images "
+            "and PDFs only. Route audio-capable models to an OpenAI or "
+            "Gemini deployment.",
+            "invalid_request_error",
+            code="audio_input_not_supported",
+            param="messages",
+            provider="anthropic",
+            fallback=True,
+        )
+
     # Anthropic has no JSON mode. Silently dropping response_format would let
     # the request "succeed" while the model is free to answer in prose, which
     # breaks structured-output consumers downstream — so refuse loudly

@@ -593,3 +593,31 @@ async def test_speech_gemini_voice_passthrough_and_cost(tmp_path):
             3 / 1_000_000 * 15.0
         )
         break
+
+
+def test_voice_map_covers_every_openai_voice():
+    """The mapping is total over OpenAI's voice set and injective — every
+    OpenAI voice has a distinct Gemini counterpart; everything else
+    (Gemini's full prebuilt set) passes through by name."""
+    from gateway.providers.gemini_adapter import GeminiProviderAdapter
+
+    openai_voices = {
+        "alloy", "ash", "ballad", "coral", "echo", "fable",
+        "nova", "onyx", "sage", "shimmer", "verse",
+    }
+    voice_map = GeminiProviderAdapter._VOICE_MAP
+    assert set(voice_map) == openai_voices
+    assert len(set(voice_map.values())) == len(voice_map)  # distinct targets
+    # ...and the targets are real Gemini prebuilt voices.
+    gemini_voices = {
+        "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede",
+        "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+        "Despina", "Erinome", "Algenib", "Achernar", "Achird", "Rasalgethi",
+        "Gacrux", "Sadachbia", "Sadaltager", "Schedar", "Sulafar", "Laomedeia",
+        "Pomona", "Vindemiatrix", "Alnilam", "Zubenelgenubi",
+    }
+    assert set(voice_map.values()) <= gemini_voices
+    # Unmapped names pass through untouched (Gemini-native selection).
+    for voice in ("Umbriel", "Pomona", "Laomedeia"):
+        assert voice not in voice_map
+

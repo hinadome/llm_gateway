@@ -101,6 +101,19 @@ def _parse_message_item(item: dict) -> Message:
                     "(file_id-based images are not supported by the gateway)."
                 )
             parts.append({"type": "image_url", "image_url": {"url": url}})
+        elif ptype == "input_audio":
+            audio = part.get("input_audio") or {}
+            if not audio.get("data"):
+                raise _unsupported("input_audio parts require input_audio.data.")
+            parts.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": str(audio.get("data", "")),
+                        "format": str(audio.get("format") or "wav"),
+                    },
+                }
+            )
         else:
             raise _unsupported(f"Unsupported input content part type: {ptype!r}.")
     text_content: Any = (

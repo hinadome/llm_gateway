@@ -22,7 +22,11 @@ from ..schemas import (
     Message,
     SpeechRequest,
 )
-from ..utils import content_to_text, estimate_tokens
+from ..utils import (
+    audio_mime_for_format as _audio_mime,
+    content_to_text,
+    estimate_tokens,
+)
 from .base import ProviderAdapter, network_error, raise_for_provider_status
 from .sse import sse_data_lines
 
@@ -77,6 +81,13 @@ def _find_tool_name(messages: list[Message], tool_call_id: str | None) -> str | 
     return None
 
 
+def _is_image_model(native_model: str) -> bool:
+    """Heuristic: the chat-capable image models (gemini-2.5-flash-image,
+    gemini-2.0-flash-preview-image-generation) carry 'image' in their name
+    and need responseModalities TEXT+IMAGE to emit images from chat."""
+    return "image" in native_model.lower()
+
+
 def _translate_user_content(content: Any) -> list[dict]:
     if isinstance(content, str):
         return [{"text": content}]
@@ -92,6 +103,20 @@ def _translate_user_content(content: Any) -> list[dict]:
                         header, _, data = url.partition(",")
                         mime = header[5:].split(";")[0] or "image/png"
                         parts.append({"inlineData": {"mimeType": mime, "data": data}})
+                elif part.get("type") == "input_audio":
+                    audio = part.get("input_audio") or {}
+                    data = audio.get("data")
+                    if data:
+                        parts.append(
+                            {
+                                "inlineData": {
+                                    "mimeType": _audio_mime(
+                                        str(audio.get("format") or "wav")
+                                    ),
+                                    "data": data,
+                                }
+                            }
+                        )
         return parts or [{"text": ""}]
     return [{"text": content_to_text(content)}]
 
@@ -187,6 +212,12 @@ def translate_request(request: ChatCompletionRequest, native_model: str) -> dict
     if gen_config:
         body["generationConfig"] = gen_config
 
+    # Chat with an image-generating model (image-to-image): those models
+    # need TEXT+IMAGE response modalities to emit inline images, which the
+    # gateway translates back to image_url content parts.
+    if _is_image_model(native_model):
+        body.setdefault("generationConfig", {})["responseModalities"] = ["TEXT", "IMAGE"]
+
     if request.tools:
         body["tools"] = [
             {
@@ -221,10 +252,25 @@ def translate_response(native: dict, public_model: str) -> dict:
     parts = (candidate.get("content") or {}).get("parts") or []
 
     text_parts: list[str] = []
+    image_parts: list[dict] = []
     tool_calls: list[dict] = []
     for part in parts:
         if "text" in part:
             text_parts.append(part["text"])
+        inline = part.get("inlineData") or part.get("inline_data")
+        if isinstance(inline, dict) and inline.get("data"):
+            # Image-generating chat models: the image rides as inlineData
+            # (base64) and becomes an image_url content part — the same
+            # internal shape images use everywhere else in the gateway.
+            # (Audio inlineData has no chat representation and is skipped.)
+            mime = inline.get("mimeType") or "image/png"
+            if mime.startswith("image/"):
+                image_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{inline['data']}"},
+                    }
+                )
         if "functionCall" in part:
             fc = part["functionCall"]
             tool_calls.append(
@@ -239,7 +285,12 @@ def translate_response(native: dict, public_model: str) -> dict:
             )
 
     text = "".join(text_parts)
-    message: dict[str, Any] = {"role": "assistant", "content": text if text else None}
+    if image_parts:
+        # Mixed text + image output (or images only) -> content-parts list.
+        content_out: Any = ([{"type": "text", "text": text}] if text else []) + image_parts
+    else:
+        content_out = text if text else None
+    message: dict[str, Any] = {"role": "assistant", "content": content_out}
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -621,6 +672,23 @@ class GeminiProviderAdapter(ProviderAdapter):
         provider_cfg: ProviderConfig,
         timeout: httpx.Timeout,
     ) -> AsyncIterator[dict]:
+        # Image-generating chat models stream their text but the image
+        # arrives as one opaque inlineData part that has no OpenAI
+        # chunk-delta representation — refuse rather than silently
+        # dropping the image from the stream (retry with stream: false,
+        # where the image lands in message.content).
+        if _is_image_model(deployment.model):
+            raise ProviderError(
+                400,
+                "Streaming is not supported for image-generating chat "
+                f"models (deployment '{deployment.name}'); retry with "
+                "stream: false to receive the image in message.content.",
+                "invalid_request_error",
+                code="image_streaming_not_supported",
+                param="stream",
+                provider=self.name,
+                fallback=True,
+            )
         body = translate_request(request, deployment.model)
         translator = GeminiStreamTranslator(request.model)
         try:

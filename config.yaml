@@ -100,6 +100,13 @@ models:
   # generateContent (n images = n calls; size/quality have no equivalent).
   # Audio (transcription/translation/TTS): OpenAI/Azure pass through; other
   # providers 501 and routing falls through.
+  #
+  # Multimodal chat needs no special declaration either: audio input
+  # (input_audio parts) rides in chat messages on every inbound format
+  # (native Gemini inlineData audio included; Anthropic deployments refuse
+  # it and the routing group falls through), and Gemini image models on the
+  # chat surface (gemini-2.5-flash-image etc.) do image-to-image chat —
+  # images in via image_url parts, images out as image_url content parts.
   - name: gpt-image-1
     deployments:
       - name: openai/gpt-image-1
@@ -112,9 +119,14 @@ models:
         model: whisper-1
   # Gemini TTS: gemini-2.5-*-preview-tts via generateContent (AUDIO
   # modality). OpenAI voice names map to Gemini prebuilt voices (alloy ->
-  # Kore, ash -> Puck, ...; unknown names pass through, so Gemini voice
-  # names like Puck work directly); output is raw PCM, served as WAV
-  # (response_format: pcm serves it raw); speed has no equivalent.
+  # Kore, ash -> Puck, ... — the map covers all 11 OpenAI voices; unknown
+  # names pass through, so every Gemini prebuilt voice works directly:
+  # Zephyr, Puck, Charon, Kore, Fenrir, Leda, Orus, Aoede, Callirrhoe,
+  # Autonoe, Enceladus, Iapetus, Umbriel, Algieba, Despina, Erinome,
+  # Algenib, Achernar, Achird, Rasalgethi, Gacrux, Sadachbia, Sadaltager,
+  # Schedar, Sulafar, Laomedeia, Pomona, Vindemiatrix, Alnilam,
+  # Zubenelgenubi); output is raw PCM, served as WAV (response_format: pcm
+  # serves it raw); speed has no equivalent.
   # - name: gemini-tts
   #   deployments:
   #     - name: gemini/gemini-2.5-flash-preview-tts

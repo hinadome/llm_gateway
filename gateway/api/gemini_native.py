@@ -26,7 +26,7 @@ from starlette.responses import Response
 from ..core.context import AuthContext
 from ..errors import GatewayError
 from ..schemas import ChatCompletionRequest, Message, Tool, ToolFunction
-from ..utils import content_to_text
+from ..utils import audio_format_for_mime as _audio_format, content_to_text
 from .anthropic_native import openai_sse_payloads, passthrough_headers
 from .deps import require_api_key
 
@@ -100,8 +100,22 @@ def _parse_parts(parts: list) -> tuple[list[dict], list[dict]]:
             content_parts.append({"type": "text", "text": str(part["text"])})
         elif isinstance(part.get("inlineData"), dict):
             inline = part["inlineData"]
-            data_url = f"data:{inline.get('mimeType') or 'image/png'};base64,{inline.get('data', '')}"
-            content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            mime = inline.get("mimeType") or "image/png"
+            if mime.startswith("audio/"):
+                # Audio input (the Gemini chat-native way): becomes an
+                # OpenAI input_audio part, the gateway's internal shape.
+                content_parts.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": inline.get("data", ""),
+                            "format": _audio_format(mime),
+                        },
+                    }
+                )
+            else:
+                data_url = f"data:{mime};base64,{inline.get('data', '')}"
+                content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
         elif isinstance(part.get("functionCall"), dict):
             call = part["functionCall"]
             name = str(call.get("name", ""))
@@ -246,8 +260,18 @@ def _candidate_parts(message: dict) -> list[dict]:
         parts.append({"text": content})
     elif isinstance(content, list):
         for p in content:
-            if isinstance(p, dict) and p.get("type") == "text":
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "text":
                 parts.append({"text": str(p.get("text", ""))})
+            elif p.get("type") == "image_url":
+                # Image-generating chat models: the image comes back as a
+                # data-URL image_url part; render it as native inlineData.
+                url = (p.get("image_url") or {}).get("url", "")
+                if url.startswith("data:"):
+                    header, _, data = url.partition(",")
+                    mime = header[5:].split(";")[0] or "image/png"
+                    parts.append({"inlineData": {"mimeType": mime, "data": data}})
     for tc in message.get("tool_calls") or []:
         function = tc.get("function") or {}
         try:

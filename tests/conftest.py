@@ -442,6 +442,31 @@ class MockUpstream:
                     ]
                 },
             )
+        if ":generateContent" in path:
+            # Plain Gemini chat (e.g. audio input): echo the first input
+            # part's shape so tests can assert the translation round trip.
+            in_parts = (body.get("contents") or [{}])[0].get("parts") or []
+            echo = ""
+            for p in in_parts:
+                if isinstance(p, dict) and "text" in p:
+                    echo = str(p["text"])
+                    break
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": f"heard: {echo}"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 5,
+                        "totalTokenCount": 15,
+                    },
+                },
+            )
         if body.get("stream"):
             return httpx.Response(200, text=self.stream_text or STREAM_TEXT)
         return httpx.Response(
