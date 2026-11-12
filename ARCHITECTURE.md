@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 60 Python files, ~15,220 lines, 705 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 60 Python files, ~16,020 lines, 732 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -97,8 +97,8 @@ gateway/
 │                           southbound — the bridge body + pristine-messages snapshot
 ├── errors.py               OpenAI-style error envelope + typed errors (ProviderError, GuardrailBlocked,
 │                           RateLimitError, BudgetExceededError, ...)
-├── models.py / db.py       SQLAlchemy ORM (VirtualKey, RequestLog, Prompt, SettingKV)
-│                           + async engine management incl. get_engine (readiness
+├── models.py / db.py       SQLAlchemy ORM (Tenant, VirtualKey, RequestLog, Prompt,
+│                           SettingKV) + async engine management incl. get_engine (readiness
 │                           checks, VACUUM INTO backups)
 ├── bootstrap.py           First-boot seeding: admin key, default virtual key
 ├── utils.py                Content flattening (text + [image]/[audio] part
@@ -113,7 +113,11 @@ gateway/
 │   │                       scoping (allowed_endpoints — chat / embeddings
 │   │                       (incl. Gemini :embedContent/:batchEmbedContents) /
 │   │                       images / audio / models — + allowed_ips, never
-│   │                       on admins); require_admin
+│   │                       on admins); require_admin gates the admin API,
+│   │                       require_platform_admin additionally excludes
+│   │                       tenant admins (the platform's own config
+│   │                       endpoints: tenants, prompts, routing, guardrails,
+│   │                       reload, backups)
 │   ├── chat.py             POST /v1/chat/completions → pipeline.handle_chat
 │   ├── embeddings.py       POST /v1/embeddings → pipeline.handle_embedding
 │   ├── models.py           GET /v1/models (per-key filtered, incl. the key's mapping
@@ -178,13 +182,23 @@ gateway/
 │   │                       passthrough) + /v1/audio/speech (JSON in,
 │   │                       binary audio streamed out)
 │   └── admin.py            Keys CRUD (incl. per-key model_mappings / default_model,
-│                           prompt policy fields and scoping fields), the prompt
+│                           prompt policy fields and scoping fields; tenancy —
+│                           tenant admins are forced into their own tenant on
+│                           create (mismatch 400), refused re-homing (403),
+│                           and see 404s for other tenants' keys/logs),
+│                           tenants CRUD (platform admins: slug + display
+│                           name + policy ceiling, budget re-arm on PATCH,
+│                           delete refused while keys reference it), the prompt
 │                           library CRUD (create/version, summaries, per-name
 │                           versions, activate/candidate/fraction patch, delete —
 │                           every mutation audited), logs (list omits
 │                           bodies, /admin/logs/{id} returns
-│                           them in full), stats, usage export (CSV/JSON billing
-│                           extract), routing/guardrail introspection (key mutations
+│                           them in full; tenant scoping forced for tenant
+│                           admins, ?tenant_id= filter for platform), stats
+│                           (by_tenant breakdown for platform admins),
+│                           usage export (CSV/JSON billing
+│                           extract, tenant filter + per-tenant aggregates),
+│                           routing/guardrail introspection (key mutations
 │                           and breaker resets emit audit records), operations —
 │                           POST /admin/reload (hot-reload config.yaml; invalid
 │                           config = 400, running one stays live; restart_required
@@ -226,10 +240,23 @@ gateway/
 │   │                       no active version);
 │   │                       step 4.5 re-checks the model allowlist after the
 │   │                       guardrail phase (a reject-and-redirect redirect can
-│   │                       never bypass permissions — fail closed, admins
-│   │                       exempt) and updates ctx.model/span so rate-limit
+│   │                       never bypass permissions — fail closed, key-level
+│   │                       admins exempt; the TENANT allowlist binds every
+│   │                       member, tenant admins included) and updates
+│   │                       ctx.model/span so rate-limit
 │   │                       series, logs, response-phase scopes and cache
 │   │                       identity all see the final model;
+│   │                       tenancy (see §6): member keys additionally pass
+│   │                       the tenant's model allowlist, a second pooled
+│   │                       rate-limit window (tenant:{id} namespace, TPM
+│   │                       included) and the tenant's three budget windows
+│   │                       — no admin bypass at that layer by design;
+│   │                       spend accounting writes the tenant row too and
+│   │                       responses carry X-Gateway-Tenant;
+│   │                       cache lookup/store salt the key with a
+│   │                       response-policy token (tenant + active
+│   │                       response-capable guardrails — see manager.py)
+│   │                       so entries never cross tenants or policies
 │   │                       _stream_with_guardrails runs block-style checks on
 │   │                       the SOURCE text, then chains stream rewriters
 │   │                       (rewrite_stream_text) — held-back text flushes
@@ -255,7 +282,10 @@ gateway/
 │   │                       everywhere; AuthContext carries the key's routing
 │   │                       overrides (model_mappings / default_model) and prompt
 │   │                       policy (system_prompt / system_prompt_ref /
-│   │                       prompt_variables); RequestContext.route names
+│   │                       prompt_variables) plus the snapshotted tenant row
+│   │                       (id/name + its allowlist/limits/budget windows —
+│   │                       the same auth-time-consistency trade-off the key's
+│   │                       budget fields make); RequestContext.route names
 │   │                       the inbound surface (chat / responses /
 │   │                       messages / gemini) that guardrail route
 │   │                       scopes match against
@@ -281,11 +311,15 @@ gateway/
 │   ├── redis_backends.py   RedisRateLimiter + RedisResponseCache + RedisCircuitBreaker
 │   │                       Registry — shared windows, cache entries and circuit-breaker
 │   │                       state across workers/replicas, semantics preserved
-│   ├── cache.py            Exact-match response cache + stream replay (async interface)
+│   ├── cache.py            Exact-match response cache + stream replay (async
+│   │                       interface); cache_key_for salts the normalized
+│   │                       request with the caller's response-policy token
 │   ├── semantic_cache.py   Semantic cache: embeds the normalized request (via the
 │   │                       configured embeddings model, routed like any embeddings
 │   │                       call — see embed_fn_for in router.py) and serves the best
-│   │                       same-model response above a cosine threshold; TTL + LRU
+│   │                       same-model response above a cosine threshold; buckets
+│   │                       are (model, policy token) so near-duplicates never
+│   │                       cross tenants or policies; TTL + LRU
 │   │                       bounded, embedder failures degrade to a miss
 │   ├── cost.py             CostCalculator: per-1M-token pricing, longest-prefix lookup;
 │   │                       unit prices for non-token modalities (image_usd,
@@ -299,7 +333,12 @@ gateway/
 │   │                       supplies all policy) steps + "pkg.module:ClassName"
 │   │                       custom loading, unknown names failing at startup;
 │   │                       auth_context_from_key snapshots a row (incl. scoping
-│   │                       + routing overrides and auth_method for logs)
+│   │                       + routing overrides and auth_method for logs) and
+│   │                       load_tenant_for_key loads the key's tenant row
+│   │                       into the same snapshot — failing closed on a
+│   │                       dangling tenant_id (corrupt state) and a disabled
+│   │                       tenant (the kill switch), so a member key is
+│   │                       never served as an unrestricted platform key
 │   ├── audit.py             AuditLogger: one JSON record per security-relevant
 │   │                       admin action (key create/update/revoke, breaker
 │   │                       reset), delivered best-effort by a background task
@@ -323,11 +362,18 @@ gateway/
 │   │                       cross-replica backstop); feeds pipeline step 0.5
 │   │                       and the A/B mirror (_queue_prompt_ab)
 │   ├── alerts.py           BudgetAlertManager: threshold crossings → webhook. Fired-level
-│   │                       state persists on the key row (survives restarts, correct
-│   │                       across workers); raising a budget re-arms; best-effort delivery
+│   │                       state persists on the budgeted row — key or tenant
+│   │                       (kind= on evaluate; the webhook payload says which,
+│   │                       tenants identified as tenant:{id}) — survives restarts,
+│   │                       correct across workers; raising a budget re-arms;
+│   │                       best-effort delivery
 │   └── logging_svc.py      Request log persistence + spend accounting — add_spend uses
 │                           UPDATE…RETURNING for an atomic post-update snapshot and
 │                           feeds it to the alert manager (same background task);
+│                           _add_tenant_spend runs the identical statement on the
+│                           tenant row (pooled member spend + tenant alerts, a
+│                           separate transaction so a tenant-write failure never
+│                           loses the key's accounting);
 │                           the same statement rolls the daily/monthly budget
 │                           windows (CASE on the stored bucket id: same window →
 │                           accumulate, rolled → replace), so concurrent requests
@@ -357,7 +403,12 @@ gateway/
 │   │                       _in_scope (fnmatch over key name / public model /
 │   │                       inbound route) + per-key disabled_guardrails
 │   │                       override — out-of-scope guardrails are skipped
-│   │                       before any phase runs
+│   │                       before any phase runs; response_policy_token
+│   │                       fingerprints the response-capable guardrails
+│   │                       active for a caller (+ the tenant) to salt cache
+│   │                       identity — a hit skips response guardrails, so
+│   │                       entries may only serve callers whose policy
+│   │                       (and tenant) shaped them
 │   └── builtins/           pii_redaction · prompt_injection · keyword_blocklist ·
 │                           output_moderation · response_schema · request_limits
 │                           (block or reject-and-redirect on exceed) ·
@@ -595,7 +646,7 @@ Two structural choices make adapters independently testable:
 
 - **Translation is pure** — `anthropic_adapter.translate_request(request, native_model) → dict` and `translate_response(native, public_model) → dict` are side-effect-free functions (unit-tested without HTTP).
 - **Stream translation is a stateful converter** — `AnthropicStreamTranslator` / `GeminiStreamTranslator` consume native SSE events and emit OpenAI chunks; the adapter's I/O shell is thin.
-- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 705 tests run with no network).
+- **HTTP client is injected** — every adapter takes an `httpx.AsyncClient`, so tests wire in `httpx.MockTransport` and the same adapter code runs against a fake upstream (all 732 tests run with no network).
 
 Note also: because the OpenAI adapter is a passthrough over a configurable `api_base`, **any OpenAI-compatible service (vLLM, Ollama, Groq, Together, …) is already supported** without new code — for chat, embeddings, images and audio.
 
@@ -664,15 +715,15 @@ sequenceDiagram
     participant DB as Database
 
     C->>A: POST /v1/chat/completions (Bearer sk-gw-... / token)
-    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ jwt → custom steps, first match wins
+    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ jwt → custom steps, first match wins<br/>(a key with a tenant loads its row —<br/>dangling tenant_id or disabled tenant<br/>fails closed, 401)
     A-->>A: token scoping (allowed_endpoints / allowed_ips)
     A->>P: handle_chat(request, auth)
 
     Note over P: 0. model resolution (key model_mappings → real name →<br/>global aliases → key/global default_model).<br/>Resolved name drives every later check,<br/>original kept in log request_body)
     Note over P: 0.5 prompt policy (managed system prompt prepended<br/>when the request has none, template variables resolved,<br/>client system messages always win, prompt-library refs<br/>resolve to the active version, fail-closed 400<br/>when the name has none) — before<br/>guardrails and cache identity, deliberately
-    Note over P: 1. model permission (fnmatch vs allowed_models)
-    Note over P: 2. rate limit RPM/TPM (sliding window)
-    Note over P: 3. budget check (total + daily/monthly windows<br/>vs auth-time spend snapshot)
+    Note over P: 1. model permission (fnmatch vs allowed_models,<br/>platform admins exempt, then the TENANT allowlist,<br/>which binds every member, no bypass)
+    Note over P: 2. rate limit RPM/TPM (sliding window) — then the<br/>pooled tenant window (tenant:{id} namespace)
+    Note over P: 3. budget check (total + daily/monthly windows<br/>vs auth-time spend snapshot) — then the tenant<br/>budget windows (same three, pooled spend)
 
     P->>G: run_request_phase(request, ctx)
     alt a guardrail blocks
@@ -685,7 +736,7 @@ sequenceDiagram
         Note over P: 4.5 redirect re-validation: allowlist<br/>re-checked against the new model (fail closed),<br/>ctx.model/span updated — logs, scopes,<br/>cache identity and routing see the final model
     end
 
-    Note over P: 4. cache lookup (exact hash match,<br/>then semantic similarity if enabled)
+    Note over P: 4. cache lookup (exact hash match,<br/>then semantic similarity if enabled) — keys salted<br/>by the response-policy token (tenant + active<br/>response-capable guardrails): entries never cross<br/>tenants or policies, identical-policy keys share
     alt cache HIT
         P->>L: write log (cache_hit)
         P-->>C: 200 cached response (X-Gateway-Cache: HIT)
@@ -710,7 +761,7 @@ sequenceDiagram
         Note over P: convert → finish_reason: content_filter
     end
 
-    Note over P: account usage → cost → spend (async task,<br/>crossed budget thresholds → webhook alert)
+    Note over P: account usage → cost → spend (async task — key row<br/>then tenant row, crossed thresholds on either<br/>→ webhook alert, kind key or tenant)
     Note over P: mirror to shadow deployments (async task:<br/>non-streaming complete, own log row + metrics,<br/>no guardrails/budgets/rate limits, never affects client)
     P->>L: write request log (tokens, cost, latency, guardrail actions)
     P-->>C: 200 OpenAI response + X-Gateway-* headers
@@ -784,14 +835,36 @@ flowchart TD
 
 ```mermaid
 erDiagram
+    TENANT ||--o{ VIRTUAL_KEY : "tenant_id"
     VIRTUAL_KEY ||--o{ REQUEST_LOG : "key_name (denormalized)"
+    TENANT {
+        str id PK "uuid hex"
+        str name UK "slug, header-safe pattern"
+        str display_name "free-form label for dashboards"
+        bool is_active "false = kill switch for every member key"
+        json allowed_models "fnmatch patterns, NULL = all"
+        int rpm_limit "pooled requests/min, NULL = unlimited"
+        int tpm_limit "pooled tokens/min, NULL = unlimited"
+        float max_budget_usd "pooled across member keys"
+        float spend_usd "accumulated by async post-response task"
+        float daily_budget_usd "UTC calendar-day cap, NULL = unlimited"
+        float daily_spend_usd "stale daily_bucket => counts as 0"
+        str daily_bucket "YYYY-MM-DD of daily_spend_usd"
+        float monthly_budget_usd "UTC calendar-month cap, NULL = unlimited"
+        float monthly_spend_usd "stale monthly_bucket => counts as 0"
+        str monthly_bucket "YYYY-MM of monthly_spend_usd"
+        json budget_alerts_fired "tenant alert threshold levels (%) already fired"
+        datetime created_at
+        datetime updated_at
+    }
     VIRTUAL_KEY {
         str id PK "uuid hex"
         str name UK "human label"
         str key_hash UK "SHA-256 of raw key (raw never stored)"
         str key_prefix "first 12 chars for identification"
         bool is_active
-        bool is_admin
+        bool is_admin "platform admin (tenant_id NULL) or tenant admin"
+        str tenant_id FK "NULL = platform key, no tenant checks"
         json allowed_models "fnmatch patterns, NULL = all"
         int rpm_limit "requests/min, NULL = unlimited"
         int tpm_limit "tokens/min, NULL = unlimited"
@@ -816,6 +889,7 @@ erDiagram
         int id PK
         str request_id "indexed; echoed as X-Request-Id"
         str key_name
+        str tenant_id "indexed; the calling key's tenant, NULL = platform"
         str model "public name"
         str provider
         str deployment
@@ -842,6 +916,8 @@ erDiagram
         str value
     }
 ```
+
+**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them.
 
 Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` with no code changes (only async SQLAlchemy is used; JSON columns are provider-neutral).
 
@@ -952,7 +1028,8 @@ Being honest about the seams — these are the current trade-offs (all are local
 6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. Not covered: mTLS client certificates, and per-key *cache* overrides (per-team TTL/size) still don't exist — the cache is global.
 7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns.
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
-9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a tenant dimension (there is no tenant concept to scope on).
+9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
+10. ~~No tenant concept~~ **Solved:** tenants (`models.Tenant`) group virtual keys under a narrowing policy ceiling — allowlist, RPM/TPM, the three budget windows — with no admin bypass at the tenant layer; tenant admins are scoped (own keys/logs/stats/usage, 404 on cross-tenant ids, 403 on platform endpoints) and auth fails closed on dangling/disabled tenants (see §6). Remaining gaps, honestly: tenant guardrail scoping has no first-class field (item 9), the admin UI has no tenant views (per-endpoint 403s degrade in-page for tenant admins), and tenant API-key budgets are the only pooling dimension — there is no per-tenant *model* pricing or rate-limit overrides per key-within-tenant beyond what the two stacked windows already enforce.
 
 ### 8.3 Extension recipes
 
@@ -1164,6 +1241,18 @@ tests/
 │                        period, e2e enforcement (daily/monthly), stale bucket counts as
 │                        zero + lazy atomic reset, accumulation across requests, cache hits
 │                        add no window spend, admin API fields (create/patch)
+├── test_tenants.py       Multi-tenancy: tenant CRUD (slug validation, duplicate 409,
+│                        delete refused while keys exist, budget re-arm on PATCH),
+│                        tenant-admin scoping (own-tenant keys/logs/stats/usage,
+│                        cross-tenant ids 404, platform endpoints 403, forced key
+│                        creation + mismatch 400, re-homing 403 vs platform-admin
+│                        re-home), enforcement (allowlist narrows incl. tenant
+│                        admins, key+tenant allowlists intersect, pooled RPM
+│                        window, pooled budget 429, inactive-tenant kill switch),
+│                        cache isolation (tenant/policy-token salting for chat
+│                        + embeddings, same-tenant sharing), pooled spend +
+│                        tenant alerts (kind=tenant, fired levels persist),
+│                        X-Gateway-Tenant header, by_tenant stats/usage
 ├── test_azure_adapter.py   Azure OpenAI adapter: deployment-addressed URLs + api-version
 │                        override + quoted deployment names, api-key header (units) and
 │                        e2e chat/stream/embeddings via the mock upstream, cross-provider

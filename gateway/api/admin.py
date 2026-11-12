@@ -18,14 +18,16 @@ from ..core.context import AuthContext
 from ..core.prompt_library import PromptLibrary
 from ..db import get_sessionmaker
 from ..errors import GatewayError
-from ..models import RequestLog, VirtualKey
+from ..models import RequestLog, Tenant, VirtualKey
 from ..schemas import (
     KeyCreateRequest,
     KeyUpdateRequest,
     PromptCreateRequest,
     PromptPatchRequest,
+    TenantCreateRequest,
+    TenantUpdateRequest,
 )
-from .deps import ENDPOINT_SCOPES, hash_key, require_admin
+from .deps import ENDPOINT_SCOPES, hash_key, require_admin, require_platform_admin
 
 router = APIRouter()
 
@@ -88,6 +90,25 @@ def _validate_scoping(allowed_endpoints: list[str] | None) -> None:
         )
 
 
+def _require_key_access(admin: AuthContext, vkey: VirtualKey) -> None:
+    """Tenant admins may only touch their own tenant's keys.
+
+    A 404 (not 403): confirming that another tenant's key id exists
+    would leak key ids to callers outside the tenant — the response is
+    byte-identical to the unknown-key case. Platform admins see it all.
+    """
+    if admin.tenant_id is not None and vkey.tenant_id != admin.tenant_id:
+        raise GatewayError(404, f"Key '{vkey.id}' not found.", "invalid_request_error")
+
+
+def _require_log_access(admin: AuthContext, log: RequestLog) -> None:
+    """Same rule for single log rows (they carry the tenant too)."""
+    if admin.tenant_id is not None and log.tenant_id != admin.tenant_id:
+        raise GatewayError(
+            404, f"Log entry {log.id} not found.", "invalid_request_error"
+        )
+
+
 @router.post("/admin/keys", status_code=201)
 async def create_key(
     body: KeyCreateRequest,
@@ -96,8 +117,29 @@ async def create_key(
 ) -> dict:
     raw_key = _generate_key("sk-gw")
     _validate_scoping(body.allowed_endpoints)
+    # Tenancy: platform admins may place a key in any existing tenant
+    # (or none); tenant admins are confined to their own — a mismatching
+    # explicit tenant_id is refused, not silently overridden.
+    tenant_id = body.tenant_id
+    if admin.tenant_id is not None:
+        if tenant_id is not None and tenant_id != admin.tenant_id:
+            raise GatewayError(
+                400,
+                "Tenant administrators can only create keys in their own "
+                f"tenant ('{admin.tenant_name}').",
+                "invalid_request_error",
+            )
+        tenant_id = admin.tenant_id
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
+        if tenant_id is not None:
+            tenant = await session.get(Tenant, tenant_id)
+            if tenant is None:
+                raise GatewayError(
+                    400,
+                    f"Tenant '{tenant_id}' does not exist.",
+                    "invalid_request_error",
+                )
         existing = await session.execute(
             select(VirtualKey).where(VirtualKey.name == body.name)
         )
@@ -109,6 +151,8 @@ async def create_key(
             name=body.name,
             key_hash=hash_key(raw_key),
             key_prefix=raw_key[:12],
+            tenant_id=tenant_id,
+            is_admin=body.is_admin,
             allowed_models=body.allowed_models,
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
@@ -137,6 +181,7 @@ async def create_key(
         actor=admin,
         key_id=result["id"],
         key_name=body.name,
+        tenant_id=result["tenant_id"],
     )
     # The raw key is returned exactly once, at creation time.
     result["key"] = raw_key
@@ -147,7 +192,10 @@ async def create_key(
 async def list_keys(admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        result = await session.execute(select(VirtualKey).order_by(VirtualKey.created_at))
+        stmt = select(VirtualKey).order_by(VirtualKey.created_at)
+        if admin.tenant_id is not None:  # tenant admin: own tenant only
+            stmt = stmt.where(VirtualKey.tenant_id == admin.tenant_id)
+        result = await session.execute(stmt)
         keys = [v.to_public_dict() for v in result.scalars()]
     return {"object": "list", "data": keys}
 
@@ -159,6 +207,7 @@ async def get_key(key_id: str, admin: Annotated[AuthContext, Depends(require_adm
         vkey = await session.get(VirtualKey, key_id)
         if vkey is None:
             raise GatewayError(404, f"Key '{key_id}' not found.", "invalid_request_error")
+        _require_key_access(admin, vkey)
         return vkey.to_public_dict()
 
 
@@ -174,11 +223,32 @@ async def update_key(
         vkey = await session.get(VirtualKey, key_id)
         if vkey is None:
             raise GatewayError(404, f"Key '{key_id}' not found.", "invalid_request_error")
+        _require_key_access(admin, vkey)
         updates = body.model_dump(exclude_unset=True)
         if "expires_at" in updates:
             vkey.expires_at = _parse_expires(updates.pop("expires_at"))
         if "allowed_endpoints" in updates:
             _validate_scoping(updates["allowed_endpoints"])
+        # Re-homing a key is a platform-admin operation — a tenant admin
+        # moving keys out of (or between) tenants would let keys escape
+        # their scope. The 403 is honest here: the key is theirs.
+        if "tenant_id" in updates:
+            if admin.tenant_id is not None:
+                raise GatewayError(
+                    403,
+                    "Tenant administrators cannot move keys between tenants.",
+                    "invalid_request_error",
+                )
+            new_tenant_id = updates.pop("tenant_id")
+            if new_tenant_id is not None:
+                target = await session.get(Tenant, new_tenant_id)
+                if target is None:
+                    raise GatewayError(
+                        400,
+                        f"Tenant '{new_tenant_id}' does not exist.",
+                        "invalid_request_error",
+                    )
+            vkey.tenant_id = new_tenant_id
         budget_changed = "max_budget_usd" in updates
         for field in (
             "allowed_models",
@@ -232,12 +302,170 @@ async def revoke_key(
         vkey = await session.get(VirtualKey, key_id)
         if vkey is None:
             raise GatewayError(404, f"Key '{key_id}' not found.", "invalid_request_error")
+        _require_key_access(admin, vkey)
         vkey.is_active = False
         await session.commit()
         raw_request.app.state.audit.record(
             "key.revoked", actor=admin, key_id=key_id, key_name=vkey.name
         )
         return {"id": key_id, "revoked": True}
+
+
+# ----------------------------------------------------------------------
+# Tenants (platform admins only)
+# ----------------------------------------------------------------------
+
+
+@router.post("/admin/tenants", status_code=201)
+async def create_tenant(
+    body: TenantCreateRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        existing = await session.execute(select(Tenant).where(Tenant.name == body.name))
+        if existing.scalar_one_or_none() is not None:
+            raise GatewayError(
+                409, f"A tenant named '{body.name}' already exists.", "invalid_request_error"
+            )
+        tenant = Tenant(
+            name=body.name,
+            display_name=body.display_name,
+            is_active=body.is_active,
+            allowed_models=body.allowed_models,
+            rpm_limit=body.rpm_limit,
+            tpm_limit=body.tpm_limit,
+            max_budget_usd=body.max_budget_usd,
+            daily_budget_usd=body.daily_budget_usd,
+            monthly_budget_usd=body.monthly_budget_usd,
+        )
+        session.add(tenant)
+        await session.commit()
+        await session.refresh(tenant)
+        result = tenant.to_public_dict()
+    raw_request.app.state.audit.record(
+        "tenant.created",
+        actor=admin,
+        tenant_id=result["id"],
+        tenant_name=body.name,
+    )
+    return result
+
+
+@router.get("/admin/tenants")
+async def list_tenants(
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        result = await session.execute(select(Tenant).order_by(Tenant.created_at))
+        tenants = [t.to_public_dict() for t in result.scalars()]
+    return {"object": "list", "data": tenants}
+
+
+@router.get("/admin/tenants/{tenant_id}")
+async def get_tenant(
+    tenant_id: str, admin: Annotated[AuthContext, Depends(require_platform_admin)]
+) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        tenant = await session.get(Tenant, tenant_id)
+        if tenant is None:
+            raise GatewayError(
+                404, f"Tenant '{tenant_id}' not found.", "invalid_request_error"
+            )
+        return tenant.to_public_dict()
+
+
+@router.patch("/admin/tenants/{tenant_id}")
+async def update_tenant(
+    tenant_id: str,
+    body: TenantUpdateRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Update a tenant's policy ceiling. The slug is immutable (it is
+    what APIs, log filters and the X-Gateway-Tenant header speak);
+    display_name and every limit are patchable at runtime — the next
+    request snapshots the new values at auth time."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        tenant = await session.get(Tenant, tenant_id)
+        if tenant is None:
+            raise GatewayError(
+                404, f"Tenant '{tenant_id}' not found.", "invalid_request_error"
+            )
+        updates = body.model_dump(exclude_unset=True)
+        budget_changed = "max_budget_usd" in updates
+        for field in (
+            "display_name",
+            "is_active",
+            "allowed_models",
+            "rpm_limit",
+            "tpm_limit",
+            "max_budget_usd",
+            "daily_budget_usd",
+            "monthly_budget_usd",
+        ):
+            if field in updates:
+                setattr(tenant, field, updates[field])
+        if budget_changed:
+            # Raising/lowering the budget re-arms alerts, same as keys.
+            alerter: BudgetAlertManager = raw_request.app.state.alerts
+            tenant.budget_alerts_fired = alerter.rearm_levels(
+                tenant.spend_usd, tenant.max_budget_usd
+            )
+        await session.commit()
+        await session.refresh(tenant)
+        result = tenant.to_public_dict()
+    raw_request.app.state.audit.record(
+        "tenant.updated",
+        actor=admin,
+        tenant_id=tenant_id,
+        tenant_name=result["name"],
+        fields=sorted(updates.keys()),
+    )
+    return result
+
+
+@router.delete("/admin/tenants/{tenant_id}")
+async def delete_tenant(
+    tenant_id: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Delete a tenant. Refused while any key still references it:
+
+    a dangling tenant_id fails closed at auth time (the key cannot be
+    served as an unrestricted platform key), so orphaning keys would
+    silently revoke them. Re-home or revoke the keys first.
+    """
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        tenant = await session.get(Tenant, tenant_id)
+        if tenant is None:
+            raise GatewayError(
+                404, f"Tenant '{tenant_id}' not found.", "invalid_request_error"
+            )
+        key_count = await session.scalar(
+            select(func.count()).where(VirtualKey.tenant_id == tenant_id)
+        )
+        if key_count:
+            raise GatewayError(
+                409,
+                f"Tenant '{tenant.name}' still has {key_count} key(s) — "
+                "re-home or revoke them first (a key without its tenant "
+                "fails closed at auth time).",
+                "invalid_request_error",
+            )
+        name = tenant.name
+        await session.delete(tenant)
+        await session.commit()
+    raw_request.app.state.audit.record(
+        "tenant.deleted", actor=admin, tenant_id=tenant_id, tenant_name=name
+    )
+    return {"id": tenant_id, "deleted": True}
 
 
 # ----------------------------------------------------------------------
@@ -249,7 +477,7 @@ async def revoke_key(
 async def create_prompt_version(
     body: PromptCreateRequest,
     raw_request: Request,
-    admin: Annotated[AuthContext, Depends(require_admin)],
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
 ) -> dict:
     """Append a version to a named prompt. The first version of a name
     auto-activates (an inactive-only prompt could never serve); promote
@@ -268,7 +496,7 @@ async def create_prompt_version(
 
 @router.get("/admin/prompts")
 async def list_prompts(
-    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]
 ) -> dict:
     library: PromptLibrary = raw_request.app.state.prompt_library
     return {"object": "list", "data": await library.list_names()}
@@ -278,7 +506,7 @@ async def list_prompts(
 async def get_prompt_versions(
     name: str,
     raw_request: Request,
-    admin: Annotated[AuthContext, Depends(require_admin)],
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
 ) -> dict:
     library: PromptLibrary = raw_request.app.state.prompt_library
     versions = await library.versions(name)
@@ -294,7 +522,7 @@ async def patch_prompt_version(
     prompt_id: int,
     body: PromptPatchRequest,
     raw_request: Request,
-    admin: Annotated[AuthContext, Depends(require_admin)],
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
 ) -> dict:
     """Activate (promote/rollback), mark as the A/B candidate, retarget
     the mirror fraction, or edit notes."""
@@ -327,7 +555,7 @@ async def patch_prompt_version(
 async def delete_prompt_version(
     prompt_id: int,
     raw_request: Request,
-    admin: Annotated[AuthContext, Depends(require_admin)],
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
 ) -> dict:
     """Delete one version. The active version of a name is refused —
     keys reference the name, so serving must be re-pointed explicitly
@@ -366,6 +594,7 @@ def _log_row(row: RequestLog) -> dict:
         "id": row.id,
         "request_id": row.request_id,
         "key_name": row.key_name,
+        "tenant_id": row.tenant_id,
         "model": row.model,
         "provider": row.provider,
         "deployment": row.deployment,
@@ -398,10 +627,18 @@ async def list_logs(
     model: str | None = None,
     request_id: str | None = None,
     trace_id: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict:
+    """Request log rows. Tenant admins see only their own tenant's rows
+    (the filter is forced, not defaulted); platform admins may filter
+    by any tenant_id."""
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         stmt = select(RequestLog).order_by(RequestLog.id.desc())
+        # Tenant scoping: forced for tenant admins, opt-in for platform.
+        effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+        if effective_tenant:
+            stmt = stmt.where(RequestLog.tenant_id == effective_tenant)
         if status:
             stmt = stmt.where(RequestLog.status == status)
         if key_name:
@@ -432,6 +669,7 @@ async def get_log(
         log = await session.get(RequestLog, log_id)
         if log is None:
             raise GatewayError(404, f"Log entry {log_id} not found.", "invalid_request_error")
+        _require_log_access(admin, log)
         row = _log_row(log)
     row["request_body"] = log.request_body
     row["response_body"] = log.response_body
@@ -459,16 +697,19 @@ async def stats(
     # Client traffic only: shadow (mirrored) rows are excluded so they do
     # not pollute error rates, latency percentiles or cost totals.
     not_shadow = RequestLog.shadow.isnot(True)
+    # Tenant admins see their own tenant's traffic only; platform admins
+    # see everything, broken down by tenant.
+    conds = [RequestLog.created_at >= since, not_shadow]
+    if admin.tenant_id is not None:
+        conds.append(RequestLog.tenant_id == admin.tenant_id)
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        base = select(RequestLog).where(RequestLog.created_at >= since, not_shadow)
+        base = select(RequestLog).where(*conds)
 
         total = await session.scalar(select(func.count()).select_from(base.subquery()))
 
         by_status_rows = await session.execute(
-            select(RequestLog.status, func.count())
-            .where(RequestLog.created_at >= since, not_shadow)
-            .group_by(RequestLog.status)
+            select(RequestLog.status, func.count()).where(*conds).group_by(RequestLog.status)
         )
         by_status = {status: count for status, count in by_status_rows}
 
@@ -479,7 +720,7 @@ async def stats(
                 func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
                 func.coalesce(func.sum(RequestLog.total_tokens), 0),
             )
-            .where(RequestLog.created_at >= since, not_shadow)
+            .where(*conds)
             .group_by(RequestLog.model)
         )
         by_model = [
@@ -493,7 +734,7 @@ async def stats(
                 func.count(),
                 func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
             )
-            .where(RequestLog.created_at >= since, not_shadow)
+            .where(*conds)
             .group_by(RequestLog.key_name)
         )
         by_key = [
@@ -501,11 +742,26 @@ async def stats(
             for key, count, cost in by_key_rows
         ]
 
+        by_tenant: list[dict] | None = None
+        if admin.tenant_id is None:  # platform admin: the whole picture
+            by_tenant_rows = await session.execute(
+                select(
+                    RequestLog.tenant_id,
+                    func.count(),
+                    func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
+                )
+                .where(*conds)
+                .group_by(RequestLog.tenant_id)
+            )
+            by_tenant = [
+                {"tenant_id": tenant, "requests": count, "cost_usd": round(cost, 6)}
+                for tenant, count, cost in by_tenant_rows
+            ]
+
         latency_rows = await session.execute(
             select(RequestLog.latency_ms)
             .where(
-                RequestLog.created_at >= since,
-                not_shadow,
+                *conds,
                 RequestLog.latency_ms.isnot(None),
             )
             .order_by(RequestLog.latency_ms)
@@ -518,7 +774,7 @@ async def stats(
                 func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
                 func.coalesce(func.sum(RequestLog.completion_tokens), 0),
                 func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
-            ).where(RequestLog.created_at >= since, not_shadow)
+            ).where(*conds)
         )
         prompt_tokens, completion_tokens, total_cost = tokens_row.one()
 
@@ -540,6 +796,7 @@ async def stats(
         },
         "by_model": by_model,
         "by_key": by_key,
+        **({"by_tenant": by_tenant} if by_tenant is not None else {}),
     }
 
 
@@ -551,6 +808,7 @@ _USAGE_CSV_COLUMNS = (
     "request_id",
     "created_at",
     "key_name",
+    "tenant_id",
     "model",
     "provider",
     "deployment",
@@ -572,6 +830,7 @@ def _usage_row(row: RequestLog) -> dict:
         "request_id": row.request_id,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "key_name": row.key_name,
+        "tenant_id": row.tenant_id,
         "model": row.model,
         "provider": row.provider,
         "deployment": row.deployment,
@@ -608,6 +867,7 @@ async def export_usage(
     key_name: str | None = None,
     model: str | None = None,
     status: str | None = None,
+    tenant_id: str | None = None,
     include_shadow: bool = False,
     limit: int = Query(100_000, ge=1, le=250_000),
 ) -> Response:
@@ -615,12 +875,15 @@ async def export_usage(
 
     Rows are request-log entries in ``[since, until]`` (ISO-8601
     timestamps; naive values are read as UTC; defaults: the last 30 days
-    up to now), filterable by key, model and status. Mirrored (shadow)
-    calls are excluded by default — they never cost the client anything —
-    ``include_shadow=true`` includes them (flagged). ``format=json``
-    returns ``{summary, requests}`` with totals and per-key / per-model /
-    per-status breakdowns; ``format=csv`` returns one row per request in
-    a stable column order (download attachment).
+    up to now), filterable by key, model, tenant and status. Tenant
+    admins export only their own tenant's usage (the filter is forced);
+    platform admins may filter by any tenant or export everything.
+    Mirrored (shadow) calls are excluded by default — they never cost
+    the client anything — ``include_shadow=true`` includes them
+    (flagged). ``format=json`` returns ``{summary, requests}`` with
+    totals and per-key / per-model / per-status breakdowns;
+    ``format=csv`` returns one row per request in a stable column order
+    (download attachment).
     """
     until_ts = (
         _parse_range_ts(until, "until") if until else datetime.now(timezone.utc)
@@ -639,6 +902,10 @@ async def export_usage(
     ]
     if not include_shadow:
         conditions.append(RequestLog.shadow.isnot(True))
+    # Tenant scoping: forced for tenant admins, opt-in for platform.
+    effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+    if effective_tenant:
+        conditions.append(RequestLog.tenant_id == effective_tenant)
     if key_name:
         conditions.append(RequestLog.key_name == key_name)
     if model:
@@ -689,6 +956,11 @@ async def export_usage(
         by_status_rows = await _grouped(RequestLog.status)
         by_key_rows = await _grouped(RequestLog.key_name)
         by_model_rows = await _grouped(RequestLog.model)
+        # Per-tenant chargeback split, platform admins only (a tenant
+        # admin's export is their own tenant by construction).
+        by_tenant_rows = (
+            await _grouped(RequestLog.tenant_id) if admin.tenant_id is None else None
+        )
 
     total_count, prompt_tokens, completion_tokens, total_cost = totals
 
@@ -710,6 +982,7 @@ async def export_usage(
             "key_name": key_name,
             "model": model,
             "status": status,
+            "tenant_id": effective_tenant,
             "include_shadow": include_shadow,
         },
         "requests": total_count,
@@ -723,6 +996,11 @@ async def export_usage(
         },
         "by_key": _entries(by_key_rows, "key_name"),
         "by_model": _entries(by_model_rows, "model"),
+        **(
+            {"by_tenant": _entries(by_tenant_rows, "tenant_id")}
+            if by_tenant_rows is not None
+            else {}
+        ),
         "row_count": len(rows),
         # the row list is capped by `limit`; aggregates never are
         "truncated": len(rows) < total_count,
@@ -765,7 +1043,7 @@ async def export_usage(
 
 
 @router.get("/admin/routing")
-async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]) -> dict:
     config = raw_request.app.state.config
     breakers = raw_request.app.state.pipeline.router.breakers
     snapshots = await breakers.snapshots()
@@ -800,7 +1078,7 @@ async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depe
 async def reset_circuit(
     deployment_name: str,
     raw_request: Request,
-    admin: Annotated[AuthContext, Depends(require_admin)],
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
 ) -> dict:
     """Force-close a deployment's circuit (next request probes it again)."""
     breakers = raw_request.app.state.pipeline.router.breakers
@@ -823,7 +1101,7 @@ async def reset_circuit(
 
 
 @router.get("/admin/guardrails")
-async def guardrails(raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+async def guardrails(raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]) -> dict:
     manager = raw_request.app.state.pipeline.guardrails
     return {"guardrails": manager.describe()}
 
@@ -835,7 +1113,7 @@ async def guardrails(raw_request: Request, admin: Annotated[AuthContext, Depends
 
 @router.post("/admin/reload")
 async def reload_config(
-    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]
 ) -> dict:
     """Re-read config.yaml and swap the policy components without
     restarting (same path SIGHUP takes).
@@ -870,7 +1148,7 @@ _BACKUP_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01
 
 @router.post("/admin/backup", status_code=201)
 async def create_backup(
-    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]
 ) -> dict:
     """Snapshot the SQLite database to ``settings.backup_dir``.
 
@@ -896,7 +1174,7 @@ async def create_backup(
 
 @router.get("/admin/backups")
 async def list_backups(
-    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]
 ) -> dict:
     backup_dir = Path(raw_request.app.state.settings.backup_dir)
     backups = []
@@ -925,7 +1203,7 @@ async def list_backups(
 async def delete_backup(
     name: str,
     raw_request: Request,
-    admin: Annotated[AuthContext, Depends(require_admin)]
+    admin: Annotated[AuthContext, Depends(require_platform_admin)]
 ) -> dict:
     """Delete one backup by file name (flat names only — no path
     separators accepted, so the endpoint can never reach outside the

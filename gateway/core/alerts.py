@@ -22,7 +22,7 @@ from sqlalchemy import update
 
 from ..config import AlertsConfig
 from ..db import get_sessionmaker
-from ..models import VirtualKey
+from ..models import Tenant, VirtualKey
 from ..observability import metrics
 
 logger = logging.getLogger("gateway.alerts")
@@ -76,12 +76,20 @@ class BudgetAlertManager:
         spend_usd: float,
         budget_usd: float,
         fired: list[int] | None,
+        kind: str = "key",
     ) -> list[int]:
         """Fire webhooks for thresholds newly crossed by this spend.
 
-        Persists the updated fired-levels on the key row first (so a crash
-        during delivery prefers duplicate silence over duplicate noise),
-        then delivers each alert. Returns the levels fired.
+        ``kind`` selects what is being budgeted — "key" (a virtual key)
+        or "tenant" (the pooled spend of every member key); the fired
+        levels persist on the matching table and the webhook payload
+        says which. ``key_id``/``key_name`` are the budgeted entity's
+        (a tenant passes its id, prefixed "tenant:" for uniqueness in
+        payloads that flatten both kinds).
+
+        Persists the updated fired-levels first (so a crash during
+        delivery prefers duplicate silence over duplicate noise), then
+        delivers each alert. Returns the levels fired.
         """
         levels = crossed_levels(
             spend_usd, budget_usd, self.config.budget_thresholds, fired
@@ -89,17 +97,22 @@ class BudgetAlertManager:
         if not levels:
             return []
         new_fired = sorted(set(fired or []) | set(levels))
+        table = VirtualKey if kind == "key" else Tenant
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
             await session.execute(
-                update(VirtualKey)
-                .where(VirtualKey.id == key_id)
+                update(table)
+                .where(table.id == key_id)
                 .values(budget_alerts_fired=new_fired)
             )
             await session.commit()
+        # The payload names the budgeted entity; tenants get a
+        # "tenant:" prefix so flattened consumers can tell kinds apart
+        # (the row update above uses the raw id).
+        payload_id = f"tenant:{key_id}" if kind == "tenant" else key_id
         for level in levels:
             await self._deliver_budget_alert(
-                key_id, key_name, spend_usd, budget_usd, level
+                payload_id, key_name, spend_usd, budget_usd, level, kind=kind
             )
         return levels
 
@@ -112,21 +125,24 @@ class BudgetAlertManager:
         spend_usd: float,
         budget_usd: float,
         level: int,
+        kind: str = "key",
     ) -> dict:
         percent = spend_usd / budget_usd * 100.0 if budget_usd else 0.0
+        what = "tenant" if kind == "tenant" else "virtual key"
         if level >= 100:
             message = (
-                f"Virtual key '{key_name or key_id}' has exhausted its "
+                f"{what.capitalize()} '{key_name or key_id}' has exhausted its "
                 f"${budget_usd:.2f} budget (${spend_usd:.2f} spent)."
             )
         else:
             message = (
-                f"Virtual key '{key_name or key_id}' has spent "
+                f"{what.capitalize()} '{key_name or key_id}' has spent "
                 f"${spend_usd:.2f} of its ${budget_usd:.2f} budget "
                 f"({percent:.1f}%)."
             )
         return {
             "type": "budget_alert",
+            "kind": kind,
             "level_percent": level,
             "key_id": key_id,
             "key_name": key_name,
@@ -144,8 +160,11 @@ class BudgetAlertManager:
         spend_usd: float,
         budget_usd: float,
         level: int,
+        kind: str = "key",
     ) -> None:
-        payload = self._budget_payload(key_id, key_name, spend_usd, budget_usd, level)
+        payload = self._budget_payload(
+            key_id, key_name, spend_usd, budget_usd, level, kind=kind
+        )
         await self._deliver(payload)
 
     async def _deliver(self, payload: dict) -> bool:

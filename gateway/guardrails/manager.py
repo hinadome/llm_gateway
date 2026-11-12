@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import importlib
+import json
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
@@ -102,6 +104,44 @@ class GuardrailManager:
             }
             for g in self._guardrails
         ]
+
+    def response_policy_token(self, ctx: "RequestContext") -> str:
+        """A stable fingerprint of the response policy applying to this
+        request: every *response-capable* guardrail that is active here
+        (name + params) plus the tenant. It salts the exact and semantic
+        cache keys — see the pipeline's cache lookup.
+
+        Why it exists: a cache hit replays the stored body without
+        re-running response-phase guardrails, so two callers may share
+        an entry only when the policy that shapes responses is the same.
+        Applicability here covers everything that can differ: key-level
+        ``disabled_guardrails``, and key/model/route scoping (a
+        redactor scoped to other keys never applied to the stored
+        body). Observe-mode guardrails never modify anything, so they
+        are excluded. The tenant rides along for data isolation — two
+        tenants never read each other's cached responses, even under
+        identical policies. The key id is deliberately NOT part of it:
+        two keys with the same response policy sharing entries is the
+        point of the cache.
+        """
+        parts: list[list[Any]] = []
+        for g in self._active(ctx):
+            if g.mode == "observe":
+                continue  # observe never changes a response
+            can_touch_response = (
+                type(g).check_response is not Guardrail.check_response
+                or type(g).check_stream_delta is not Guardrail.check_stream_delta
+                or bool(getattr(g, "supports_stream_rewrite", False))
+            )
+            if not can_touch_response:
+                continue
+            parts.append([g.name, g.params])
+        payload = json.dumps(
+            {"tenant_id": ctx.auth.tenant_id, "response_guardrails": parts},
+            sort_keys=True,
+            default=repr,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     # -- scoping ----------------------------------------------------------------
 

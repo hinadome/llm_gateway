@@ -17,6 +17,25 @@ class AuthContext:
     is_admin: bool = False
     key_id: str | None = None
     key_name: str | None = None
+    # Tenant membership, snapshotted at auth time from the tenant row
+    # (None = platform key — no tenant checks apply). Tenant checks are
+    # IN ADDITION to the key's own and apply to every member of the
+    # tenant, is_admin keys included: a tenant admin manages that
+    # tenant's keys, not the tenant's policy ceiling. allowed_models /
+    # rpm/tpm / the three budget windows mirror the key-level fields.
+    tenant_id: str | None = None
+    tenant_name: str | None = None
+    tenant_allowed_models: list[str] | None = None  # fnmatch; None = tenant allows all
+    tenant_rpm_limit: int | None = None
+    tenant_tpm_limit: int | None = None
+    tenant_max_budget_usd: float | None = None
+    tenant_spend_usd: float = 0.0
+    tenant_daily_budget_usd: float | None = None
+    tenant_monthly_budget_usd: float | None = None
+    tenant_daily_spend_usd: float | None = None
+    tenant_daily_bucket: str | None = None
+    tenant_monthly_spend_usd: float | None = None
+    tenant_monthly_bucket: str | None = None
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
     rpm_limit: int | None = None
     tpm_limit: int | None = None

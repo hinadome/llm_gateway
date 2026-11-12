@@ -41,6 +41,9 @@ _MESSAGES = {
     "key.created": "Virtual key '{details[key_name]}' was created by {actor}.",
     "key.updated": "Virtual key '{details[key_name]}' was updated by {actor} (fields: {details[fields]}).",
     "key.revoked": "Virtual key '{details[key_name]}' was revoked by {actor}.",
+    "tenant.created": "Tenant '{details[tenant_name]}' was created by {actor}.",
+    "tenant.updated": "Tenant '{details[tenant_name]}' was updated by {actor} (fields: {details[fields]}).",
+    "tenant.deleted": "Tenant '{details[tenant_name]}' was deleted by {actor}.",
     "breaker.reset": "Circuit breaker '{details[deployment]}' was reset by {actor}.",
 }
 

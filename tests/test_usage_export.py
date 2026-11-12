@@ -27,6 +27,7 @@ CSV_COLUMNS = [
     "request_id",
     "created_at",
     "key_name",
+    "tenant_id",
     "model",
     "provider",
     "deployment",
@@ -121,20 +122,22 @@ async def test_csv_export_rows_and_header(tmp_path):
         assert header == CSV_COLUMNS
         assert len(data) == 4  # the cache replay is a row too (unbilled)
 
-        # billed row: tokens, cost, no flags
-        billed = [r for r in data if r[2] == "team-b" and r[3] == "test-model"]
+        # billed row: tokens, cost, no flags (tenant_id is column 3 —
+        # these platform keys carry none)
+        billed = [r for r in data if r[2] == "team-b" and r[4] == "test-model"]
         assert len(billed) == 1
         row = billed[0]
-        assert row[6] == "success"
-        assert row[7] == "10" and row[8] == "7" and row[9] == "17"
-        assert float(row[10]) == costs[1]
-        assert row[12] == "false" and row[14] == "false"
+        assert row[3] == ""
+        assert row[7] == "success"
+        assert row[8] == "10" and row[9] == "7" and row[10] == "17"
+        assert float(row[11]) == costs[1]
+        assert row[13] == "false" and row[15] == "false"
 
         # the cache replay: flagged, provider=cache, free
         replay = [r for r in data if r[2] == "team-a"][1]
-        assert replay[4] == "cache"
-        assert float(replay[10]) == 0.0
-        assert replay[12] == "true"
+        assert replay[5] == "cache"
+        assert float(replay[11]) == 0.0
+        assert replay[13] == "true"
 
         # rows are ordered oldest-first (stable for billing ingestion)
         created = [r[1] for r in data]

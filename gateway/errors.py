@@ -101,18 +101,26 @@ class RateLimitError(GatewayError):
 
 class BudgetExceededError(GatewayError):
     def __init__(
-        self, key_name: str, budget: float, spent: float, period: str = "total"
+        self,
+        key_name: str,
+        budget: float,
+        spent: float,
+        period: str = "total",
+        kind: str = "key",
     ) -> None:
         # period: "total" (lifetime max_budget_usd) | "daily" | "monthly"
-        # (calendar-window caps). Same 429/insufficient_quota semantics.
+        # (calendar-window caps). kind: "key" or "tenant" — tenants pool
+        # every member key's spend, so the message says which was
+        # exhausted. Same 429/insufficient_quota semantics either way.
+        what = "tenant" if kind == "tenant" else "virtual key"
         if period == "total":
             message = (
-                f"Virtual key '{key_name}' has exceeded its budget "
+                f"{what.capitalize()} '{key_name}' has exceeded its budget "
                 f"(${spent:.4f} spent of ${budget:.2f} limit)."
             )
         else:
             message = (
-                f"Virtual key '{key_name}' has exceeded its {period} budget "
+                f"{what.capitalize()} '{key_name}' has exceeded its {period} budget "
                 f"(${spent:.4f} spent of ${budget:.2f} {period} limit)."
             )
         super().__init__(

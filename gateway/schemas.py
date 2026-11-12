@@ -309,6 +309,11 @@ class ChatCompletionChunk(BaseModel):
 
 class KeyCreateRequest(BaseModel):
     name: str
+    # Admin grants access to the admin API. With no tenant: a platform
+    # admin (deliberate delegation, same power as the operator). Inside
+    # a tenant: a tenant admin, scoped to their own tenant by every
+    # endpoint (platform-only endpoints stay 403). Not patchable later.
+    is_admin: bool = False
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
     rpm_limit: int | None = None
     tpm_limit: int | None = None
@@ -338,6 +343,10 @@ class KeyCreateRequest(BaseModel):
     # None = all) and source addresses (plain IP or CIDR; None = any).
     allowed_endpoints: list[str] | None = None
     allowed_ips: list[str] | None = None
+    # Owning tenant (platform admins only; tenant admins' keys are
+    # forced into their own tenant — a mismatching explicit value is
+    # refused rather than silently overridden).
+    tenant_id: str | None = None
 
 
 class KeyUpdateRequest(BaseModel):
@@ -357,6 +366,39 @@ class KeyUpdateRequest(BaseModel):
     prompt_variables: dict[str, str] | None = None
     allowed_endpoints: list[str] | None = None
     allowed_ips: list[str] | None = None
+    # Moving a key between tenants is a platform-admin operation
+    # (tenant admins are refused — it would let keys escape their scope).
+    tenant_id: str | None = None
+
+
+class TenantCreateRequest(BaseModel):
+    """POST /admin/tenants — create a tenant (platform admins only)."""
+
+    # Slug: it surfaces in API responses, log filters and the
+    # X-Gateway-Tenant response header — the pattern keeps it
+    # header-safe (no newlines, spaces or control characters).
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    display_name: str | None = Field(default=None, max_length=128)
+    is_active: bool = True
+    allowed_models: list[str] | None = None  # fnmatch patterns; None = all
+    rpm_limit: int | None = None
+    tpm_limit: int | None = None
+    max_budget_usd: float | None = None
+    daily_budget_usd: float | None = None  # UTC calendar-day cap
+    monthly_budget_usd: float | None = None  # UTC calendar-month cap
+
+
+class TenantUpdateRequest(BaseModel):
+    """PATCH /admin/tenants/{id} — every field optional, like keys."""
+
+    display_name: str | None = Field(default=None, max_length=128)
+    is_active: bool | None = None
+    allowed_models: list[str] | None = None
+    rpm_limit: int | None = None
+    tpm_limit: int | None = None
+    max_budget_usd: float | None = None
+    daily_budget_usd: float | None = None
+    monthly_budget_usd: float | None = None
 
 
 class PromptCreateRequest(BaseModel):

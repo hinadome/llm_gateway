@@ -56,7 +56,15 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 class SemanticCache:
-    """Similarity lookup over cached responses, per model bucket."""
+    """Similarity lookup over cached responses, per (model, policy) bucket.
+
+    The bucket key includes the response-policy token (see
+    GuardrailManager.response_policy_token): a hit skips response
+    guardrails, so near-duplicates may only be served to callers whose
+    response policy — and tenant — matches the one that stored the
+    entry. Same-policy callers (any key) share entries, exactly like
+    the exact cache.
+    """
 
     def __init__(
         self,
@@ -67,11 +75,12 @@ class SemanticCache:
         self.config = config
         self._embed_fn = embed_fn
         self._clock = clock
-        # (model, entry_id) -> (stored_at, embedding, response); insertion
-        # order doubles as LRU order, bounded globally across models.
-        self._entries: OrderedDict[tuple[str, str], tuple[float, list[float], dict]] = (
-            OrderedDict()
-        )
+        # (model, policy_token, entry_id) -> (stored_at, embedding,
+        # response); insertion order doubles as LRU order, bounded
+        # globally across models.
+        self._entries: OrderedDict[
+            tuple[str, str, str], tuple[float, list[float], dict]
+        ] = OrderedDict()
 
     # -- lookup ---------------------------------------------------------
 
@@ -87,19 +96,21 @@ class SemanticCache:
             logger.warning("semantic cache embed failed, treating as miss: %s", exc)
             return None
 
-    async def get(self, model: str, embedding: list[float]) -> dict | None:
-        """Best same-model entry with similarity >= threshold, if any."""
+    async def get(
+        self, model: str, embedding: list[float], policy_token: str = ""
+    ) -> dict | None:
+        """Best same-(model, policy) entry with similarity >= threshold."""
         threshold = self.config.threshold
-        best_key: tuple[str, str] | None = None
+        best_key: tuple[str, str, str] | None = None
         best_score = 0.0
         best_response: dict | None = None
         now = self._clock()
-        expired: list[tuple[str, str]] = []
+        expired: list[tuple[str, str, str]] = []
         for key, (stored_at, entry_embedding, response) in self._entries.items():
             if now - stored_at > self.config.ttl_seconds:
                 expired.append(key)
                 continue
-            if key[0] != model:
+            if key[0] != model or key[1] != policy_token:
                 continue
             score = cosine_similarity(embedding, entry_embedding)
             if score >= threshold and (best_key is None or score > best_score):
@@ -118,11 +129,16 @@ class SemanticCache:
         request: ChatCompletionRequest,
         embedding: list[float],
         response: dict,
+        policy_token: str = "",
     ) -> None:
         """Store a successful response under its normalized-request id."""
         entry_id = cache_key_for(request)
-        self._entries[(model, entry_id)] = (self._clock(), embedding, response)
-        self._entries.move_to_end((model, entry_id))
+        self._entries[(model, policy_token, entry_id)] = (
+            self._clock(),
+            embedding,
+            response,
+        )
+        self._entries.move_to_end((model, policy_token, entry_id))
         while len(self._entries) > self.config.max_entries:
             self._entries.popitem(last=False)
 

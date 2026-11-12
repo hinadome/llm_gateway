@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models: virtual keys, request logs, KV settings."""
+"""SQLAlchemy ORM models: tenants, virtual keys, request logs, KV settings."""
 
 from __future__ import annotations
 
@@ -29,7 +29,16 @@ class VirtualKey(Base):
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     key_prefix: Mapped[str] = mapped_column(String(16), default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Admin grants access to the admin API. With no tenant that is the
+    # platform admin (everything); inside a tenant it is a tenant admin
+    # — full key/log/stats access *scoped to their own tenant*, and the
+    # platform-only endpoints (tenants, prompts, routing, guardrails,
+    # reload, backups) stay 403 (see require_platform_admin).
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Owning tenant (NULL = platform key, no tenant checks apply — the
+    # pre-tenancy behavior, unchanged). A member key must pass both its
+    # own limits and the tenant's; the tenant can only narrow.
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     allowed_models: Mapped[list | None] = mapped_column(JSON, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -93,6 +102,8 @@ class VirtualKey(Base):
             "name": self.name,
             "key_prefix": self.key_prefix,
             "is_active": self.is_active,
+            "is_admin": self.is_admin,
+            "tenant_id": self.tenant_id,
             "allowed_models": self.allowed_models,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
@@ -118,12 +129,88 @@ class VirtualKey(Base):
         }
 
 
+class Tenant(Base):
+    """One tenant (organization) on the gateway.
+
+    Virtual keys reference a tenant via ``tenant_id``; the tenant row
+    carries its own policy ceiling — an allowed-models list, RPM/TPM
+    limits and the three budget windows (total / daily / monthly) — that
+    applies to *every* member key, tenant admins included: a tenant
+    admin manages that tenant's keys, not the tenant's policy. A member
+    key must pass both its own checks and the tenant's; the tenant can
+    only narrow, never widen. Keys with no tenant are platform keys —
+    no tenant checks apply to them (the pre-tenancy behavior,
+    unchanged).
+
+    The budget machinery mirrors VirtualKey's: spend and window bucket
+    ids live on the row and are lazily rolled by ``add_spend``; budget
+    alerts fire per threshold with fired levels persisted here.
+    """
+
+    __tablename__ = "tenants"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    # Slug, validated by the admin API ([A-Za-z0-9][A-Za-z0-9_-]*, at
+    # most 64 chars) — it surfaces in API responses, log filters and
+    # the X-Gateway-Tenant response header, so header-hostile
+    # characters are rejected at creation time, not stripped later.
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    # Free-form label for dashboards; the slug is what APIs speak.
+    display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    allowed_models: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spend_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    # Budget windows: same scheme as VirtualKey (see there) — bucket ids
+    # make the lazily-rolled daily/monthly spends unambiguous.
+    daily_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    monthly_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    daily_spend_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    daily_bucket: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    monthly_spend_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    monthly_bucket: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Budget-alert levels (percent) already fired for this tenant —
+    # same once-per-level semantics as keys.
+    budget_alerts_fired: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    def to_public_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "display_name": self.display_name,
+            "is_active": self.is_active,
+            "allowed_models": self.allowed_models,
+            "rpm_limit": self.rpm_limit,
+            "tpm_limit": self.tpm_limit,
+            "max_budget_usd": self.max_budget_usd,
+            "spend_usd": self.spend_usd,
+            "daily_budget_usd": self.daily_budget_usd,
+            "monthly_budget_usd": self.monthly_budget_usd,
+            "daily_spend_usd": self.daily_spend_usd or 0.0,
+            "daily_bucket": self.daily_bucket,
+            "monthly_spend_usd": self.monthly_spend_usd or 0.0,
+            "monthly_bucket": self.monthly_bucket,
+            "budget_alerts_fired": self.budget_alerts_fired,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class RequestLog(Base):
     __tablename__ = "request_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[str] = mapped_column(String(64), index=True)
     key_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # The tenant the calling key belonged to (NULL = platform key / no
+    # tenant — also admin-key requests, which carry no key row). Copied
+    # from the auth snapshot so per-tenant queries never join.
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     deployment: Mapped[str | None] = mapped_column(String(128), nullable=True)

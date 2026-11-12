@@ -55,8 +55,21 @@ def cache_payload_for(request: ChatCompletionRequest) -> str:
     return json.dumps(payload, sort_keys=True, default=repr)
 
 
-def cache_key_for(request: ChatCompletionRequest) -> str:
-    return hashlib.sha256(cache_payload_for(request).encode()).hexdigest()
+def cache_key_for(request: ChatCompletionRequest, policy_token: str | None = None) -> str:
+    """Cache identity: the normalized request, salted by the caller's
+    response-policy token when one applies.
+
+    The token (GuardrailManager.response_policy_token) folds in every
+    response-capable guardrail active for this caller plus the tenant,
+    because a cache hit skips response guardrails — callers may share
+    an entry only when the policy that shaped it matches. None keeps
+    the historical key (tests, embeddings-path symmetry): no policy,
+    nothing to salt.
+    """
+    payload = cache_payload_for(request)
+    if policy_token:
+        payload = f"{policy_token}|{payload}"
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 class ResponseCache:

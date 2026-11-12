@@ -50,10 +50,10 @@ from sqlalchemy import select
 from ..config import AuthConfig, JWTAuthConfig
 from ..db import get_sessionmaker
 from ..errors import AuthError, GatewayError
-from ..models import VirtualKey
+from ..models import Tenant, VirtualKey
 from ..observability import metrics
 from .context import AuthContext
-from .logging_svc import get_key_by_hash
+from .logging_svc import get_key_by_hash, get_tenant_by_id
 
 logger = logging.getLogger("gateway.auth")
 
@@ -83,18 +83,48 @@ def _is_expired(expires_at: datetime | None) -> bool:
 
 
 def auth_context_from_key(
-    vkey: VirtualKey, auth_method: str | None = None
+    vkey: VirtualKey,
+    tenant: Tenant | None = None,
+    auth_method: str | None = None,
 ) -> AuthContext:
-    """Snapshot a virtual key row into an AuthContext.
+    """Snapshot a virtual key row (and its tenant) into an AuthContext.
 
-    ``auth_method`` records *how* the caller proved possession of this key
-    ("virtual_key" for the raw key, "jwt" for a token naming it) — it lands
-    on request-log rows and audit events.
+    ``tenant`` is the key's tenant row when it has one (``None`` for
+    platform keys). Its policy ceiling is snapshotted alongside the
+    key's — the same auth-time-consistency trade-off the key's budget
+    fields make. ``auth_method`` records *how* the caller proved
+    possession of this key ("virtual_key" for the raw key, "jwt" for a
+    token naming it) — it lands on request-log rows and audit events.
     """
     return AuthContext(
         is_admin=bool(vkey.is_admin),
         key_id=vkey.id,
         key_name=vkey.name,
+        tenant_id=(tenant.id if tenant is not None else None),
+        tenant_name=(tenant.name if tenant is not None else None),
+        tenant_allowed_models=(tenant.allowed_models if tenant is not None else None),
+        tenant_rpm_limit=(tenant.rpm_limit if tenant is not None else None),
+        tenant_tpm_limit=(tenant.tpm_limit if tenant is not None else None),
+        tenant_max_budget_usd=(
+            tenant.max_budget_usd if tenant is not None else None
+        ),
+        tenant_spend_usd=(tenant.spend_usd if tenant is not None else 0.0),
+        tenant_daily_budget_usd=(
+            tenant.daily_budget_usd if tenant is not None else None
+        ),
+        tenant_monthly_budget_usd=(
+            tenant.monthly_budget_usd if tenant is not None else None
+        ),
+        tenant_daily_spend_usd=(
+            tenant.daily_spend_usd if tenant is not None else None
+        ),
+        tenant_daily_bucket=(tenant.daily_bucket if tenant is not None else None),
+        tenant_monthly_spend_usd=(
+            tenant.monthly_spend_usd if tenant is not None else None
+        ),
+        tenant_monthly_bucket=(
+            tenant.monthly_bucket if tenant is not None else None
+        ),
         allowed_models=vkey.allowed_models,
         rpm_limit=vkey.rpm_limit,
         tpm_limit=vkey.tpm_limit,
@@ -125,6 +155,28 @@ async def get_key_by_name(name: str) -> VirtualKey | None:
             select(VirtualKey).where(VirtualKey.name == name)
         )
         return result.scalar_one_or_none()
+
+
+async def load_tenant_for_key(vkey: VirtualKey) -> Tenant | None:
+    """The key's tenant row, or None for platform keys.
+
+    Fails closed on both failure modes: a dangling tenant_id (the
+    delete endpoint refuses while keys reference a tenant, so a missing
+    row is corrupted state — serving the key as an unrestricted
+    platform key would bypass the tenant's policy) and a disabled
+    tenant (the platform admin's kill switch for every member key).
+    """
+    if not vkey.tenant_id:
+        return None
+    tenant = await get_tenant_by_id(vkey.tenant_id)
+    if tenant is None:
+        raise AuthError(
+            "This key's tenant no longer exists — ask the platform "
+            "administrator to repair it."
+        )
+    if not tenant.is_active:
+        raise AuthError("This key's tenant has been disabled.")
+    return tenant
 
 
 class Authenticator(abc.ABC):
@@ -171,7 +223,10 @@ class VirtualKeyAuthenticator(Authenticator):
             raise AuthError()
         if _is_expired(vkey.expires_at):
             raise AuthError("This API key has expired.")
-        return auth_context_from_key(vkey, auth_method=self.name)
+        tenant = await load_tenant_for_key(vkey)
+        return auth_context_from_key(
+            vkey, tenant=tenant, auth_method=self.name
+        )
 
 
 class JWTAuthenticator(Authenticator):
@@ -244,7 +299,8 @@ class JWTAuthenticator(Authenticator):
             raise AuthError()
         if _is_expired(vkey.expires_at):
             raise AuthError("This API key has expired.")
-        return auth_context_from_key(vkey, auth_method=self.name)
+        tenant = await load_tenant_for_key(vkey)
+        return auth_context_from_key(vkey, tenant=tenant, auth_method=self.name)
 
     # -- verification ---------------------------------------------------------
 

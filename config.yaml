@@ -353,6 +353,10 @@ audit:
 # The jwt step accepts OAuth/JWT bearer tokens: the token's key_claim
 # (default sub) names the virtual key whose policy applies — budgets,
 # limits, spend and logs accrue to that key exactly as its raw key would.
+# Virtual keys may belong to a tenant (admin-API-managed, like the keys
+# themselves): a member additionally passes the tenant's pooled allowlist,
+# rate limit and budgets, with no admin bypass at the tenant layer —
+# see README "Multi-tenancy".
 # Requires PyJWT: pip install 'llm-gateway[auth]'
 auth:
   chain: [admin_key, virtual_key]        # the default

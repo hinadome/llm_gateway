@@ -153,3 +153,26 @@ async def require_admin(auth: Annotated[AuthContext, Depends(require_api_key)]) 
             code="forbidden",
         )
     return auth
+
+
+async def require_platform_admin(
+    auth: Annotated[AuthContext, Depends(require_admin)],
+) -> AuthContext:
+    """Admin *and* outside every tenant — the operator.
+
+    Endpoints that configure the platform itself (tenants, prompt
+    library, routing, guardrail inspection, hot reload, backups) take
+    this dependency: a tenant admin may manage their own tenant's
+    keys and read its logs/stats, but the platform's policy is not
+    theirs to change. 403, not 404 — tenant admins know these
+    endpoints exist (they ship in the same API surface).
+    """
+    if auth.tenant_id is not None:
+        raise GatewayError(
+            status_code=403,
+            message="Platform administrator access required — tenant "
+            "administrators cannot manage platform settings.",
+            error_type="invalid_request_error",
+            code="forbidden",
+        )
+    return auth

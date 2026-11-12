@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import case, delete, func, select, update
 
 from ..db import get_sessionmaker
-from ..models import RequestLog, VirtualKey
+from ..models import RequestLog, Tenant, VirtualKey
 from ..observability.metrics import LOGS_DROPPED, LOGS_PRUNED
 from ..utils import daily_bucket, monthly_bucket, truncate
 from .context import RequestContext
@@ -57,6 +57,7 @@ class LoggingService:
             log = RequestLog(
                 request_id=ctx.request_id,
                 key_name=ctx.auth.key_name,
+                tenant_id=ctx.auth.tenant_id,
                 model=ctx.model,
                 provider=ctx.provider,
                 deployment=ctx.deployment,
@@ -110,8 +111,10 @@ class LoggingService:
             LOGS_PRUNED.inc(removed)
         return removed
 
-    async def add_spend(self, key_id: str | None, cost_usd: float) -> None:
-        """Accumulate spend on a virtual key (best-effort).
+    async def add_spend(
+        self, key_id: str | None, cost_usd: float, tenant_id: str | None = None
+    ) -> None:
+        """Accumulate spend on a virtual key and its tenant (best-effort).
 
         The UPDATE ... RETURNING gives the post-update totals atomically,
         which is what budget alerts evaluate against — concurrent requests
@@ -124,6 +127,12 @@ class LoggingService:
         replaces (the window has rolled since the last write — the old
         spend becomes this request's cost). One statement, so concurrent
         requests can never straddle a window boundary incorrectly.
+
+        When the key belongs to a tenant, the identical update runs on
+        the tenant row (tenant budgets pool every member key's spend) and
+        tenant thresholds alert the same way. The two updates are
+        separate transactions: a tenant write failing must not lose the
+        key's accounting.
         """
         if not key_id or cost_usd <= 0:
             return
@@ -162,18 +171,82 @@ class LoggingService:
             )
             row = result.first()
             await session.commit()
-        if row is None or self.alerts is None:
+        if row is None:
+            return
+        if self.alerts is not None:
+            try:
+                await self.alerts.evaluate(
+                    key_id,
+                    row.name,
+                    row.spend_usd,
+                    row.max_budget_usd,
+                    row.budget_alerts_fired,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("budget alert evaluation failed for key %s", key_id)
+        if tenant_id:
+            await self._add_tenant_spend(tenant_id, cost_usd, now, day, month)
+
+    async def _add_tenant_spend(
+        self,
+        tenant_id: str,
+        cost_usd: float,
+        now: datetime,
+        day: str,
+        month: str,
+    ) -> None:
+        """The tenant half of add_spend: pooled spend + tenant alerts.
+
+        Same window-rolling UPDATE ... RETURNING, on the tenant row; a
+        failed tenant write never loses the key's accounting (already
+        committed above).
+        """
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            result = await session.execute(
+                update(Tenant)
+                .where(Tenant.id == tenant_id)
+                .values(
+                    spend_usd=Tenant.spend_usd + cost_usd,
+                    daily_spend_usd=case(
+                        (
+                            Tenant.daily_bucket == day,
+                            func.coalesce(Tenant.daily_spend_usd, 0.0) + cost_usd,
+                        ),
+                        else_=cost_usd,
+                    ),
+                    daily_bucket=day,
+                    monthly_spend_usd=case(
+                        (
+                            Tenant.monthly_bucket == month,
+                            func.coalesce(Tenant.monthly_spend_usd, 0.0) + cost_usd,
+                        ),
+                        else_=cost_usd,
+                    ),
+                    monthly_bucket=month,
+                )
+                .returning(
+                    Tenant.name,
+                    Tenant.spend_usd,
+                    Tenant.max_budget_usd,
+                    Tenant.budget_alerts_fired,
+                )
+            )
+            trow = result.first()
+            await session.commit()
+        if trow is None or self.alerts is None:
             return
         try:
             await self.alerts.evaluate(
-                key_id,
-                row.name,
-                row.spend_usd,
-                row.max_budget_usd,
-                row.budget_alerts_fired,
+                tenant_id,
+                trow.name,
+                trow.spend_usd,
+                trow.max_budget_usd,
+                trow.budget_alerts_fired,
+                kind="tenant",
             )
         except Exception:  # noqa: BLE001
-            logger.exception("budget alert evaluation failed for key %s", key_id)
+            logger.exception("budget alert evaluation failed for tenant %s", tenant_id)
 
 
 async def get_key_by_hash(key_hash: str) -> VirtualKey | None:
@@ -183,6 +256,12 @@ async def get_key_by_hash(key_hash: str) -> VirtualKey | None:
             select(VirtualKey).where(VirtualKey.key_hash == key_hash)
         )
         return result.scalar_one_or_none()
+
+
+async def get_tenant_by_id(tenant_id: str) -> Tenant | None:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        return await session.get(Tenant, tenant_id)
 
 
 class _Stop:

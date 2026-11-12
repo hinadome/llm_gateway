@@ -75,19 +75,25 @@ def _sse(obj: Any) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def embedding_cache_key_for(request: EmbeddingRequest) -> str:
-    """Cache key for embeddings: model + input + dimensions.
+def embedding_cache_key_for(
+    request: EmbeddingRequest, tenant_id: str | None = None
+) -> str:
+    """Cache key for embeddings: model + input + dimensions (+ tenant).
 
     ``encoding_format`` is deliberately not part of the key — the cache
     stores the canonical float form and base64 is (re-)encoded per request.
     Embeddings are deterministic for the same model+input, which makes
-    them ideal cache targets.
+    them ideal cache targets. No response guardrails run on embeddings,
+    so the salt is the tenant alone: data isolation between tenants,
+    sharing preserved for everyone else (platform keys, same-tenant
+    keys — an embedding is an embedding).
     """
     payload = {
         "kind": "embedding",
         "model": request.model,
         "input": [request.input] if isinstance(request.input, str) else request.input,
         "dimensions": request.dimensions,
+        **({"tenant_id": tenant_id} if tenant_id else {}),
     }
     serialized = json.dumps(payload, sort_keys=True, default=repr)
     return hashlib.sha256(serialized.encode()).hexdigest()
@@ -301,9 +307,9 @@ class GatewayPipeline:
         if prompt_changed:
             ctx.effective_request = request.model_dump(exclude_none=True)
 
-        # 1. Model permission (admins bypass)
-        if not ctx.auth.is_admin:
-            self._check_model_permission(ctx.auth, request.model)
+        # 1. Model permission: key allowlist (platform admins bypass
+        # inside) + the tenant's allowlist, which binds every member.
+        self._check_model_permission(ctx.auth, request.model)
 
         # 2. Rate limit (pre-flight)
         estimated_tokens = sum(
@@ -332,21 +338,27 @@ class GatewayPipeline:
         # name is used as-is (no alias re-resolution: a guardrail redirect
         # targets a public model); an unknown target 404s in the router.
         if request.model != pre_guardrail_model:
-            if not ctx.auth.is_admin:
-                self._check_model_permission(ctx.auth, request.model)
+            self._check_model_permission(ctx.auth, request.model)
             ctx.model = request.model
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", request.model)
 
-        # 5. Cache lookup: exact match first, then semantic (similarity)
-        key = cache_key_for(request) if self.cache.enabled else None
+        # 5. Cache lookup: exact match first, then semantic (similarity).
+        #    Both are salted by the caller's response-policy token: a hit
+        #    skips response guardrails, so an entry may only serve a
+        #    caller whose response policy (and tenant) matches the one
+        #    that stored it — keys with identical policies still share.
+        policy_token = self.guardrails.response_policy_token(ctx)
+        key = cache_key_for(request, policy_token) if self.cache.enabled else None
         semantic_embedding: list[float] | None = None
         cached = await self.cache.get(key) if key is not None else None
         hit_kind = "hit" if cached is not None else None
         if cached is None and self.semantic is not None:
             semantic_embedding = await self.semantic.embed(request)
             if semantic_embedding is not None:
-                cached = await self.semantic.get(request.model, semantic_embedding)
+                cached = await self.semantic.get(
+                    request.model, semantic_embedding, policy_token
+                )
                 if cached is not None:
                     hit_kind = "semantic"
         if hit_kind is not None:
@@ -382,6 +394,7 @@ class GatewayPipeline:
                     chunk_iterator,
                     cache_key=key,
                     semantic_embedding=semantic_embedding,
+                    policy_token=policy_token,
                 ),
                 ctx,
                 headers,
@@ -421,7 +434,9 @@ class GatewayPipeline:
             and self.semantic is not None
             and ctx.status == "success"
         ):
-            await self.semantic.put(request.model, request, semantic_embedding, response)
+            await self.semantic.put(
+                request.model, request, semantic_embedding, response, policy_token
+            )
 
         self._request_metric(ctx)
         metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
@@ -527,9 +542,9 @@ class GatewayPipeline:
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", resolved)
 
-        # 1. Model permission (admins bypass)
-        if not ctx.auth.is_admin:
-            self._check_model_permission(ctx.auth, request.model)
+        # 1. Model permission: key allowlist (platform admins bypass
+        # inside) + the tenant's allowlist, which binds every member.
+        self._check_model_permission(ctx.auth, request.model)
 
         # 2. Rate limit (pre-flight, ~chars/4 per input)
         inputs = [request.input] if isinstance(request.input, str) else request.input
@@ -539,7 +554,11 @@ class GatewayPipeline:
         self._check_budget(ctx)
 
         # 4. Cache lookup — embeddings are deterministic per model+input
-        key = embedding_cache_key_for(request) if self.cache.enabled else None
+        key = (
+            embedding_cache_key_for(request, ctx.auth.tenant_id)
+            if self.cache.enabled
+            else None
+        )
         if key is not None:
             cached = await self.cache.get(key)
             if cached is not None:
@@ -686,8 +705,9 @@ class GatewayPipeline:
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", resolved)
 
-        if not ctx.auth.is_admin:
-            self._check_model_permission(ctx.auth, request.model)
+        # Model permission: key allowlist (platform admins bypass
+        # inside) + the tenant's allowlist, which binds every member.
+        self._check_model_permission(ctx.auth, request.model)
 
         await self._check_rate_limit(ctx, estimate_tokens(prompt or ""))
         self._check_budget(ctx)
@@ -754,8 +774,9 @@ class GatewayPipeline:
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", resolved)
 
-        if not ctx.auth.is_admin:
-            self._check_model_permission(ctx.auth, request.model)
+        # Model permission: key allowlist (platform admins bypass
+        # inside) + the tenant's allowlist, which binds every member.
+        self._check_model_permission(ctx.auth, request.model)
 
         await self._check_rate_limit(ctx, estimate_tokens(request.prompt or ""))
         self._check_budget(ctx)
@@ -813,8 +834,9 @@ class GatewayPipeline:
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", resolved)
 
-        if not ctx.auth.is_admin:
-            self._check_model_permission(ctx.auth, request.model)
+        # Model permission: key allowlist (platform admins bypass
+        # inside) + the tenant's allowlist, which binds every member.
+        self._check_model_permission(ctx.auth, request.model)
 
         await self._check_rate_limit(ctx, estimate_tokens(request.input))
         self._check_budget(ctx)
@@ -944,6 +966,7 @@ class GatewayPipeline:
         chunk_iterator: AsyncIterator[dict],
         cache_key: str | None,
         semantic_embedding: list[float] | None = None,
+        policy_token: str | None = None,
     ) -> AsyncIterator[str]:
         """Wrap provider chunks with stream guardrails + rewriting + accounting + logging.
 
@@ -1096,7 +1119,11 @@ class GatewayPipeline:
                     await self.cache.put(cache_key, full_response)
                 if semantic_embedding is not None and self.semantic is not None:
                     await self.semantic.put(
-                        request.model, request, semantic_embedding, full_response
+                        request.model,
+                        request,
+                        semantic_embedding,
+                        full_response,
+                        policy_token or "",
                     )
             await self._log(ctx)
 
@@ -1187,73 +1214,152 @@ class GatewayPipeline:
         return self.config.default_model or model
 
     def _check_model_permission(self, auth: AuthContext, model: str) -> None:
+        """Model allowlists. Two layers:
+
+        - the key's own ``allowed_models`` — platform admins bypass it
+          (they are the operators); tenant admins do not, see below;
+        - the tenant's ``allowed_models`` — applies to every member of
+          the tenant, tenant admins included (a tenant admin manages
+          that tenant's keys, not the tenant's policy ceiling), and
+          only narrows: the model must pass both lists.
+        """
         import fnmatch
 
-        patterns = auth.allowed_models
-        if not patterns:
-            return
-        if any(fnmatch.fnmatch(model, pattern) for pattern in patterns):
-            return
-        raise ModelNotAllowedError(model)
+        if not auth.is_admin:
+            patterns = auth.allowed_models
+            if patterns and not any(
+                fnmatch.fnmatch(model, pattern) for pattern in patterns
+            ):
+                raise ModelNotAllowedError(model)
+        # The tenant layer has no admin bypass — that is the point of
+        # tenancy: the ceiling binds everyone the tenant contains.
+        tenant_patterns = auth.tenant_allowed_models
+        if auth.tenant_id is not None and tenant_patterns:
+            if not any(fnmatch.fnmatch(model, pattern) for pattern in tenant_patterns):
+                raise ModelNotAllowedError(model)
 
     async def _check_rate_limit(self, ctx: RequestContext, estimated_tokens: int) -> None:
         key = ctx.auth.key_id
-        if key is None:  # admin/env key: unlimited
-            return
-        allowed, retry_after = await self.rate_limiter.check(
-            key, ctx.auth.rpm_limit, ctx.auth.tpm_limit, estimated_tokens
-        )
-        if not allowed:
-            raise RateLimitError(
-                "Rate limit reached for this key "
-                f"(rpm={ctx.auth.rpm_limit}, tpm={ctx.auth.tpm_limit}). "
-                f"Retry after {retry_after:.1f}s.",
-                retry_after=retry_after,
+        if key is not None:  # admin/env key: unlimited (at the key layer)
+            allowed, retry_after = await self.rate_limiter.check(
+                key, ctx.auth.rpm_limit, ctx.auth.tpm_limit, estimated_tokens
             )
-        await self.rate_limiter.record_request(key)
+            if not allowed:
+                raise RateLimitError(
+                    "Rate limit reached for this key "
+                    f"(rpm={ctx.auth.rpm_limit}, tpm={ctx.auth.tpm_limit}). "
+                    f"Retry after {retry_after:.1f}s.",
+                    retry_after=retry_after,
+                )
+            await self.rate_limiter.record_request(key)
+        # Tenant layer: a second, pooled window under its own namespace —
+        # every member key's requests count together. No admin bypass:
+        # the tenant ceiling binds tenant admins like everyone else in
+        # the tenant (tenant-less callers skip this entirely).
+        if ctx.auth.tenant_id is not None:
+            tenant_key = f"tenant:{ctx.auth.tenant_id}"
+            allowed, retry_after = await self.rate_limiter.check(
+                tenant_key,
+                ctx.auth.tenant_rpm_limit,
+                ctx.auth.tenant_tpm_limit,
+                estimated_tokens,
+            )
+            if not allowed:
+                raise RateLimitError(
+                    "Rate limit reached for tenant "
+                    f"'{ctx.auth.tenant_name or ctx.auth.tenant_id}' "
+                    f"(rpm={ctx.auth.tenant_rpm_limit}, "
+                    f"tpm={ctx.auth.tenant_tpm_limit}). "
+                    f"Retry after {retry_after:.1f}s.",
+                    retry_after=retry_after,
+                )
+            await self.rate_limiter.record_request(tenant_key)
 
     def _check_budget(self, ctx: RequestContext) -> None:
-        if ctx.auth.key_id is None:
-            return
-        if ctx.auth.max_budget_usd is not None:
-            if ctx.auth.spend_usd >= ctx.auth.max_budget_usd:
-                raise BudgetExceededError(
-                    ctx.auth.key_name or ctx.auth.key_id,
-                    ctx.auth.max_budget_usd,
-                    ctx.auth.spend_usd,
+        if ctx.auth.key_id is not None:
+            if ctx.auth.max_budget_usd is not None:
+                if ctx.auth.spend_usd >= ctx.auth.max_budget_usd:
+                    raise BudgetExceededError(
+                        ctx.auth.key_name or ctx.auth.key_id,
+                        ctx.auth.max_budget_usd,
+                        ctx.auth.spend_usd,
+                    )
+            # Daily / monthly windows: like the total, evaluated against the
+            # auth-time snapshot. A stored bucket that differs from the current
+            # one means the window has rolled — that spend counts as 0.
+            now = datetime.now(timezone.utc)
+            if ctx.auth.daily_budget_usd is not None:
+                today = daily_bucket(now)
+                spent = (
+                    ctx.auth.daily_spend_usd or 0.0
+                    if ctx.auth.daily_bucket == today
+                    else 0.0
                 )
-        # Daily / monthly windows: like the total, evaluated against the
-        # auth-time snapshot. A stored bucket that differs from the current
-        # one means the window has rolled — that spend counts as 0.
-        now = datetime.now(timezone.utc)
-        if ctx.auth.daily_budget_usd is not None:
-            today = daily_bucket(now)
-            spent = (
-                ctx.auth.daily_spend_usd or 0.0
-                if ctx.auth.daily_bucket == today
-                else 0.0
-            )
-            if spent >= ctx.auth.daily_budget_usd:
-                raise BudgetExceededError(
-                    ctx.auth.key_name or ctx.auth.key_id,
-                    ctx.auth.daily_budget_usd,
-                    spent,
-                    period="daily",
+                if spent >= ctx.auth.daily_budget_usd:
+                    raise BudgetExceededError(
+                        ctx.auth.key_name or ctx.auth.key_id,
+                        ctx.auth.daily_budget_usd,
+                        spent,
+                        period="daily",
+                    )
+            if ctx.auth.monthly_budget_usd is not None:
+                month = monthly_bucket(now)
+                spent = (
+                    ctx.auth.monthly_spend_usd or 0.0
+                    if ctx.auth.monthly_bucket == month
+                    else 0.0
                 )
-        if ctx.auth.monthly_budget_usd is not None:
-            month = monthly_bucket(now)
-            spent = (
-                ctx.auth.monthly_spend_usd or 0.0
-                if ctx.auth.monthly_bucket == month
-                else 0.0
-            )
-            if spent >= ctx.auth.monthly_budget_usd:
-                raise BudgetExceededError(
-                    ctx.auth.key_name or ctx.auth.key_id,
-                    ctx.auth.monthly_budget_usd,
-                    spent,
-                    period="monthly",
+                if spent >= ctx.auth.monthly_budget_usd:
+                    raise BudgetExceededError(
+                        ctx.auth.key_name or ctx.auth.key_id,
+                        ctx.auth.monthly_budget_usd,
+                        spent,
+                        period="monthly",
+                    )
+        # Tenant budgets: the same three windows against the pooled tenant
+        # spend (auth-time snapshot). Like the tenant rate limit, this has
+        # no admin bypass — a tenant admin is still a member of the tenant.
+        if ctx.auth.tenant_id is not None:
+            tenant_label = ctx.auth.tenant_name or ctx.auth.tenant_id
+            now = datetime.now(timezone.utc)
+            if ctx.auth.tenant_max_budget_usd is not None:
+                if ctx.auth.tenant_spend_usd >= ctx.auth.tenant_max_budget_usd:
+                    raise BudgetExceededError(
+                        tenant_label,
+                        ctx.auth.tenant_max_budget_usd,
+                        ctx.auth.tenant_spend_usd,
+                        kind="tenant",
+                    )
+            if ctx.auth.tenant_daily_budget_usd is not None:
+                today = daily_bucket(now)
+                spent = (
+                    ctx.auth.tenant_daily_spend_usd or 0.0
+                    if ctx.auth.tenant_daily_bucket == today
+                    else 0.0
                 )
+                if spent >= ctx.auth.tenant_daily_budget_usd:
+                    raise BudgetExceededError(
+                        tenant_label,
+                        ctx.auth.tenant_daily_budget_usd,
+                        spent,
+                        period="daily",
+                        kind="tenant",
+                    )
+            if ctx.auth.tenant_monthly_budget_usd is not None:
+                month = monthly_bucket(now)
+                spent = (
+                    ctx.auth.tenant_monthly_spend_usd or 0.0
+                    if ctx.auth.tenant_monthly_bucket == month
+                    else 0.0
+                )
+                if spent >= ctx.auth.tenant_monthly_budget_usd:
+                    raise BudgetExceededError(
+                        tenant_label,
+                        ctx.auth.tenant_monthly_budget_usd,
+                        spent,
+                        period="monthly",
+                        kind="tenant",
+                    )
 
     # ------------------------------------------------------------------
     # Accounting helpers
@@ -1279,6 +1385,12 @@ class GatewayPipeline:
             if ctx.auth.key_id is not None and not ctx.cache_hit:
                 await self.rate_limiter.record_usage(
                     ctx.auth.key_id, prompt_tokens + completion_tokens
+                )
+            # ... pooled into the tenant's window too, same condition.
+            if ctx.auth.tenant_id is not None and not ctx.cache_hit:
+                await self.rate_limiter.record_usage(
+                    f"tenant:{ctx.auth.tenant_id}",
+                    prompt_tokens + completion_tokens,
                 )
         if ctx.cache_hit:
             return  # no upstream spend on cache hits
@@ -1402,9 +1514,13 @@ class GatewayPipeline:
 
         async def _apply() -> None:
             try:
-                await self.logging_service.add_spend(ctx.auth.key_id, cost)
+                await self.logging_service.add_spend(
+                    ctx.auth.key_id, cost, tenant_id=ctx.auth.tenant_id
+                )
             except Exception:  # noqa: BLE001
-                logger.exception("failed to record spend for key %s", ctx.auth.key_id)
+                logger.exception(
+                    "failed to record spend for key %s", ctx.auth.key_id
+                )
 
         try:
             self._spawn(_apply())
@@ -1785,6 +1901,7 @@ class GatewayPipeline:
             "X-Request-Id": ctx.request_id,
             "X-Gateway-Model": ctx.model,
             "X-Gateway-Cache": cache_state,
+            **({"X-Gateway-Tenant": ctx.auth.tenant_name} if ctx.auth.tenant_id else {}),
             **({"X-Gateway-Provider": ctx.provider} if ctx.provider else {}),
             **({"X-Gateway-Deployment": ctx.deployment} if ctx.deployment else {}),
             **({"X-Gateway-Cost-Usd": f"{ctx.cost_usd:.8f}"} if ctx.cost_usd else {}),
@@ -1817,6 +1934,7 @@ class GatewayPipeline:
                 "trace_id": ctx.trace_id,
                 "span_id": ctx.span_id,
                 "key_name": ctx.auth.key_name,
+                "tenant": ctx.auth.tenant_name,
                 "model": ctx.model,
                 "provider": ctx.provider,
                 "deployment": ctx.deployment,

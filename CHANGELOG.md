@@ -9,10 +9,55 @@ All notable changes to the LLM Gateway are documented here. Format follows
 Images, audio and multimodal chat — the non-chat modalities on the same
 policy spine (keys, routing, retries, failover, breakers, budgets, rate
 limits, logging), plus audio input and image output inside chat, audio
-output in chat, and native Gemini embeddings inbound.
+output in chat, and native Gemini embeddings inbound. Multi-tenancy —
+tenants (organizations) with a pooled, narrowing policy ceiling over
+groups of virtual keys, tenant admins scoped to their own tenant, and
+tenant-isolated caches.
 
 ### Added
 
+- Multi-tenancy: `POST /admin/tenants`, `GET /admin/tenants`,
+  `GET/PATCH/DELETE /admin/tenants/{id}` (platform admins). A tenant
+  groups virtual keys under a shared policy ceiling — model allowlist,
+  RPM/TPM, total/daily/monthly budgets, the same budget machinery as
+  keys but pooled across every member. Strictly narrowing: a member key
+  must pass both its own checks and the tenant's; there is **no admin
+  bypass at the tenant layer** (a tenant admin is still a member). The
+  slug is validated header-safe (`^[A-Za-z0-9][A-Za-z0-9_-]*$`, it
+  surfaces in `X-Gateway-Tenant` and log filters); delete is refused
+  with 409 while any key still references the tenant.
+- Tenant admins: `POST /admin/keys` gains `is_admin` (admin rights;
+  inside a tenant that means a tenant admin — not patchable later) and
+  `tenant_id` (placement, platform admins only: tenant admins' creates
+  are forced into their own tenant and a mismatching explicit value is
+  a 400). Tenant admins manage their own tenant's keys and read its
+  logs/stats/usage; cross-tenant ids answer 404 (no existence leaks);
+  the platform's config endpoints (tenants, prompts, routing,
+  guardrails, reload, backups) answer 403 via `require_platform_admin`;
+  re-homing keys between tenants is platform-admin only (403 for tenant
+  admins, unknown target 400).
+- Tenant enforcement on every inbound surface (chat, native
+  Anthropic/Gemini, the Responses bridge, embeddings, images, audio):
+  a second pooled rate-limit window (`tenant:{id}` namespace, TPM
+  included), pooled budget checks on all three windows (429
+  `insufficient_quota` naming the tenant), and the tenant's model
+  allowlist applied to every member key (404 like the key's own).
+  Data-plane responses carry `X-Gateway-Tenant`.
+- Tenant fail-closed auth: a dangling `tenant_id` (corrupt state) or a
+  disabled tenant (`is_active: false` — the kill switch, re-enable
+  restores) rejects every member key with 401.
+- Pooled spend + tenant budget alerts: every member request accumulates
+  on both the key row and the tenant row (separate transactions, so a
+  tenant-write failure never loses the key's accounting); alerts fire
+  per level on either, with `kind: "key" | "tenant"` in the webhook
+  payload and fired levels persisted on the matching row; PATCHing a
+  tenant's budget re-arms its alerts.
+- Tenancy observability: log rows and the usage export carry
+  `tenant_id` (CSV column after `key_name`, empty for platform keys),
+  `/admin/logs?tenant_id=` filter (forced for tenant admins), and
+  `by_tenant` breakdowns in `/admin/stats` and the JSON usage export
+  (platform admins).
+- Audit records for tenant created/updated/deleted.
 - `POST /v1/images/generations` — OpenAI Images API. OpenAI/Azure pass
   through; Gemini translates to `generateContent` with image output
   (`n` images = `n` sequential calls; `size`/`quality` have no Gemini
@@ -95,6 +140,18 @@ output in chat, and native Gemini embeddings inbound.
 
 ### Changed
 
+- Response-cache identity is now policy-salted: the exact and semantic
+  chat caches fold in a **response-policy token** (the tenant plus every
+  response-capable guardrail active for the caller — so `disabled_guardrails`
+  and guardrail scoping split entries), and the embeddings cache is salted
+  by tenant alone. Entries never cross tenants or policies; keys with
+  identical policies still share. (Correctness fix: previously a caller
+  whose response guardrails differed — e.g. a redactor disabled — could be
+  served an entry stored under the other policy, skipping guardrails.)
+- Key-level model-allowlist enforcement moved inside
+  `_check_model_permission`; the bypass is now precisely "platform admin"
+  (`is_admin` with no tenant) — tenant admins pass their tenant's
+  allowlist like every member.
 - `handle_embedding` and the new modality handlers share one pipeline
   wrapper (`_serve_simple`); embeddings behavior is unchanged.
 - The multipart upload cap covers image-edit/variation uploads too
