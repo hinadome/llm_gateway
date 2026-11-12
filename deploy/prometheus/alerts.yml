@@ -1,0 +1,100 @@
+# Alerting rules for the LLM Gateway.
+#
+# Rules evaluate without an Alertmanager (visible in the Prometheus UI under
+# Alerts); hook one up for notifications.
+
+groups:
+  - name: llm-gateway
+    rules:
+      - alert: GatewayHighErrorRate
+        expr: >-
+          sum(rate(gateway_requests_total{status="error"}[5m]))
+            / clamp_min(sum(rate(gateway_requests_total{status!="retry"}[5m])), 1e-9)
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway error rate above 5%"
+          description: >-
+            {{ $value | humanizePercentage }} of gateway requests (excluding
+            retries) have failed over the last 5 minutes.
+
+      - alert: GatewayNoSuccessfulRequests
+        expr: >-
+          sum(increase(gateway_requests_total{status=~"success|cache_hit"}[15m])) == 0
+            and sum(increase(gateway_requests_total{status!="retry"}[15m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful gateway requests"
+          description: >-
+            Requests are arriving but none have succeeded (including cache
+            hits) for 15+ minutes.
+
+      - alert: GatewayGuardrailBlocksSpike
+        expr: sum(increase(gateway_guardrail_blocks_total[15m])) > 25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardrail blocks spiking"
+          description: >-
+            {{ $value | humanize }} requests/chunks were blocked by
+            guardrails in the last 15 minutes — possibly an attack or a
+            misbehaving client key.
+
+      - alert: GatewayHighLatencyP95
+        expr: >-
+          histogram_quantile(0.95, sum by (le) (rate(gateway_request_latency_seconds_bucket[5m]))) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 gateway latency above 10s"
+          description: >-
+            The 95th percentile end-to-end request latency is
+            {{ $value | humanizeDuration }}.
+
+      - alert: GatewayHighTTFTP95
+        expr: >-
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stream_ttft_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 time-to-first-token above 2s"
+          description: >-
+            Streams take {{ $value | humanizeDuration }} to deliver their
+            first chunk at p95 — providers or the gateway are struggling.
+
+      - alert: GatewayRetryStorm
+        expr: >-
+          sum(rate(gateway_requests_total{status="retry"}[5m]))
+            / clamp_min(sum(rate(gateway_requests_total{status!="retry"}[5m])), 1e-9)
+            > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than half of upstream attempts are retries"
+          description: >-
+            {{ $value | humanizePercentage }} of request attempts ended in a
+            retry over the last 5 minutes — check provider health and
+            fallback configuration.
+
+      - alert: GatewayCircuitOpen
+        expr: max(gateway_circuit_state) == 2
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A deployment's circuit breaker is open"
+          description: >-
+            At least one deployment has been skipped by the router for over
+            a minute ({{ with printf "gateway_circuit_state == 2" | query }}
+            {{ range . }} {{ .Labels.deployment }} ({{ .Labels.provider }})
+            {{ end }} {{ end }}). Traffic is failing over to other
+            deployments; if this persists, the upstream is likely down or
+            erroring — the breaker will probe it again after its cooldown.

@@ -1,0 +1,951 @@
+"""Admin API: virtual key management, request logs, stats, usage export, routing/guardrail inspection."""
+
+from __future__ import annotations
+
+import csv
+import io
+import secrets
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from sqlalchemy import func, select
+
+from ..core.alerts import BudgetAlertManager
+from ..core.context import AuthContext
+from ..core.prompt_library import PromptLibrary
+from ..db import get_sessionmaker
+from ..errors import GatewayError
+from ..models import RequestLog, VirtualKey
+from ..schemas import (
+    KeyCreateRequest,
+    KeyUpdateRequest,
+    PromptCreateRequest,
+    PromptPatchRequest,
+)
+from .deps import ENDPOINT_SCOPES, hash_key, require_admin
+
+router = APIRouter()
+
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
+@router.get("/admin")
+async def admin_root() -> RedirectResponse:
+    """The admin dashboard lives at /admin/ui."""
+    return RedirectResponse(url="/admin/ui", status_code=307)
+
+
+@router.get("/admin/ui")
+async def admin_ui() -> FileResponse:
+    """Serve the self-contained admin dashboard.
+
+    One static HTML file (inline CSS/JS, no build step, no external
+    resources — works offline). It fetches the JSON admin API above with
+    the admin key the operator enters; the shell itself contains no data
+    and therefore needs no auth (all data endpoints still do).
+    """
+    return FileResponse(_STATIC_DIR / "admin.html", media_type="text/html")
+
+
+def _generate_key(prefix: str) -> str:
+    return f"{prefix}-{secrets.token_urlsafe(24)}"
+
+
+def _parse_expires(expires_at: str | None) -> datetime | None:
+    if not expires_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GatewayError(
+            400, f"Invalid expires_at: {exc}", "invalid_request_error", param="expires_at"
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# ----------------------------------------------------------------------
+# Virtual keys
+# ----------------------------------------------------------------------
+
+
+def _validate_scoping(allowed_endpoints: list[str] | None) -> None:
+    """Scope names are a closed set — catch typos at set time, not as a
+    silently-never-matching restriction later."""
+    if allowed_endpoints is None:
+        return
+    unknown = [s for s in allowed_endpoints if s not in ENDPOINT_SCOPES]
+    if unknown:
+        raise GatewayError(
+            400,
+            f"Unknown endpoint scope(s): {', '.join(unknown)}. "
+            f"Valid scopes: {', '.join(sorted(ENDPOINT_SCOPES))}.",
+            "invalid_request_error",
+        )
+
+
+@router.post("/admin/keys", status_code=201)
+async def create_key(
+    body: KeyCreateRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    raw_key = _generate_key("sk-gw")
+    _validate_scoping(body.allowed_endpoints)
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        existing = await session.execute(
+            select(VirtualKey).where(VirtualKey.name == body.name)
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise GatewayError(
+                409, f"A key named '{body.name}' already exists.", "invalid_request_error"
+            )
+        vkey = VirtualKey(
+            name=body.name,
+            key_hash=hash_key(raw_key),
+            key_prefix=raw_key[:12],
+            allowed_models=body.allowed_models,
+            rpm_limit=body.rpm_limit,
+            tpm_limit=body.tpm_limit,
+            max_budget_usd=body.max_budget_usd,
+            daily_budget_usd=body.daily_budget_usd,
+            monthly_budget_usd=body.monthly_budget_usd,
+            expires_at=_parse_expires(body.expires_at),
+            metadata_json=body.metadata,
+            disabled_guardrails=body.disabled_guardrails,
+            model_mappings=body.model_mappings,
+            default_model=body.default_model,
+            system_prompt=body.system_prompt,
+            system_prompt_ref=body.system_prompt_ref,
+            prompt_variables=body.prompt_variables,
+            allowed_endpoints=body.allowed_endpoints,
+            allowed_ips=body.allowed_ips,
+        )
+        session.add(vkey)
+        await session.commit()
+        await session.refresh(vkey)
+        result = vkey.to_public_dict()
+    # Audit AFTER a successful commit, and never the raw key itself —
+    # it was shown to the administrator once and is nowhere else.
+    raw_request.app.state.audit.record(
+        "key.created",
+        actor=admin,
+        key_id=result["id"],
+        key_name=body.name,
+    )
+    # The raw key is returned exactly once, at creation time.
+    result["key"] = raw_key
+    return result
+
+
+@router.get("/admin/keys")
+async def list_keys(admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        result = await session.execute(select(VirtualKey).order_by(VirtualKey.created_at))
+        keys = [v.to_public_dict() for v in result.scalars()]
+    return {"object": "list", "data": keys}
+
+
+@router.get("/admin/keys/{key_id}")
+async def get_key(key_id: str, admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        vkey = await session.get(VirtualKey, key_id)
+        if vkey is None:
+            raise GatewayError(404, f"Key '{key_id}' not found.", "invalid_request_error")
+        return vkey.to_public_dict()
+
+
+@router.patch("/admin/keys/{key_id}")
+async def update_key(
+    key_id: str,
+    body: KeyUpdateRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        vkey = await session.get(VirtualKey, key_id)
+        if vkey is None:
+            raise GatewayError(404, f"Key '{key_id}' not found.", "invalid_request_error")
+        updates = body.model_dump(exclude_unset=True)
+        if "expires_at" in updates:
+            vkey.expires_at = _parse_expires(updates.pop("expires_at"))
+        if "allowed_endpoints" in updates:
+            _validate_scoping(updates["allowed_endpoints"])
+        budget_changed = "max_budget_usd" in updates
+        for field in (
+            "allowed_models",
+            "rpm_limit",
+            "tpm_limit",
+            "max_budget_usd",
+            "daily_budget_usd",
+            "monthly_budget_usd",
+            "is_active",
+            "disabled_guardrails",
+            "model_mappings",
+            "default_model",
+            "system_prompt",
+            "system_prompt_ref",
+            "prompt_variables",
+            "allowed_endpoints",
+            "allowed_ips",
+        ):
+            if field in updates:
+                setattr(vkey, field, updates[field])
+        if budget_changed:
+            # Raising (or lowering) the budget re-arms alerts: levels the
+            # current spend has already crossed count as fired, so only
+            # future crossings fire a webhook.
+            alerter: BudgetAlertManager = raw_request.app.state.alerts
+            vkey.budget_alerts_fired = alerter.rearm_levels(
+                vkey.spend_usd, vkey.max_budget_usd
+            )
+        await session.commit()
+        await session.refresh(vkey)
+        result = vkey.to_public_dict()
+    # Audit AFTER a successful commit: which fields the admin touched.
+    raw_request.app.state.audit.record(
+        "key.updated",
+        actor=admin,
+        key_id=key_id,
+        key_name=result["name"],
+        fields=sorted(updates.keys()),
+    )
+    return result
+
+
+@router.delete("/admin/keys/{key_id}")
+async def revoke_key(
+    key_id: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        vkey = await session.get(VirtualKey, key_id)
+        if vkey is None:
+            raise GatewayError(404, f"Key '{key_id}' not found.", "invalid_request_error")
+        vkey.is_active = False
+        await session.commit()
+        raw_request.app.state.audit.record(
+            "key.revoked", actor=admin, key_id=key_id, key_name=vkey.name
+        )
+        return {"id": key_id, "revoked": True}
+
+
+# ----------------------------------------------------------------------
+# Prompt library (prompt ops)
+# ----------------------------------------------------------------------
+
+
+@router.post("/admin/prompts", status_code=201)
+async def create_prompt_version(
+    body: PromptCreateRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Append a version to a named prompt. The first version of a name
+    auto-activates (an inactive-only prompt could never serve); promote
+    later versions via PATCH {activate: true}."""
+    library: PromptLibrary = raw_request.app.state.prompt_library
+    result = await library.create_version(body.name, body.body, body.notes)
+    raw_request.app.state.audit.record(
+        "prompt.created",
+        actor=admin,
+        prompt_name=body.name,
+        version=result["version"],
+        auto_activated=result["is_active"],
+    )
+    return result
+
+
+@router.get("/admin/prompts")
+async def list_prompts(
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+) -> dict:
+    library: PromptLibrary = raw_request.app.state.prompt_library
+    return {"object": "list", "data": await library.list_names()}
+
+
+@router.get("/admin/prompts/{name}")
+async def get_prompt_versions(
+    name: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    library: PromptLibrary = raw_request.app.state.prompt_library
+    versions = await library.versions(name)
+    if versions is None:
+        raise GatewayError(
+            404, f"Prompt '{name}' not found.", "invalid_request_error"
+        )
+    return {"object": "list", "data": versions}
+
+
+@router.patch("/admin/prompts/{prompt_id}")
+async def patch_prompt_version(
+    prompt_id: int,
+    body: PromptPatchRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Activate (promote/rollback), mark as the A/B candidate, retarget
+    the mirror fraction, or edit notes."""
+    library: PromptLibrary = raw_request.app.state.prompt_library
+    result = await library.patch_version(
+        prompt_id,
+        activate=body.activate,
+        candidate=body.candidate,
+        ab_fraction=body.ab_fraction,
+        notes=body.notes,
+    )
+    if result is None:
+        raise GatewayError(
+            404, f"Prompt version {prompt_id} not found.", "invalid_request_error"
+        )
+    raw_request.app.state.audit.record(
+        "prompt.updated",
+        actor=admin,
+        prompt_name=result["name"],
+        version=result["version"],
+        fields=sorted(
+            f for f in ("activate", "candidate", "ab_fraction", "notes")
+            if getattr(body, f) is not None
+        ),
+    )
+    return result
+
+
+@router.delete("/admin/prompts/{prompt_id}")
+async def delete_prompt_version(
+    prompt_id: int,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Delete one version. The active version of a name is refused —
+    keys reference the name, so serving must be re-pointed explicitly
+    (activate another version) before the active row can go away."""
+    library: PromptLibrary = raw_request.app.state.prompt_library
+    result = await library.delete_version(prompt_id)
+    if result is None:
+        raise GatewayError(
+            404, f"Prompt version {prompt_id} not found.", "invalid_request_error"
+        )
+    if isinstance(result, tuple):  # ("active", row) — refusal
+        row = result[1]
+        raise GatewayError(
+            409,
+            f"Version {row['version']} is the active version of "
+            f"'{row['name']}' — activate another version before deleting it.",
+            "invalid_request_error",
+        )
+    raw_request.app.state.audit.record(
+        "prompt.deleted",
+        actor=admin,
+        prompt_name=result["name"],
+        version=result["version"],
+    )
+    return result
+
+
+# ----------------------------------------------------------------------
+# Request logs
+# ----------------------------------------------------------------------
+
+
+def _log_row(row: RequestLog) -> dict:
+    """Log fields safe for list views (bodies excluded — they can be large)."""
+    return {
+        "id": row.id,
+        "request_id": row.request_id,
+        "key_name": row.key_name,
+        "model": row.model,
+        "provider": row.provider,
+        "deployment": row.deployment,
+        "status": row.status,
+        "error_message": row.error_message,
+        "guardrail_actions": row.guardrail_actions,
+        "stream": row.stream,
+        "prompt_tokens": row.prompt_tokens,
+        "completion_tokens": row.completion_tokens,
+        "cost_usd": row.cost_usd,
+        "latency_ms": row.latency_ms,
+        "cache_hit": row.cache_hit,
+        "shadow": bool(row.shadow),
+        "prompt_variant": row.prompt_variant,
+        "trace_id": row.trace_id,
+        "span_id": row.span_id,
+        "auth_method": row.auth_method,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.get("/admin/logs")
+async def list_logs(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    status: str | None = None,
+    key_name: str | None = None,
+    model: str | None = None,
+    request_id: str | None = None,
+    trace_id: str | None = None,
+) -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        stmt = select(RequestLog).order_by(RequestLog.id.desc())
+        if status:
+            stmt = stmt.where(RequestLog.status == status)
+        if key_name:
+            stmt = stmt.where(RequestLog.key_name == key_name)
+        if model:
+            stmt = stmt.where(RequestLog.model == model)
+        if request_id:
+            stmt = stmt.where(RequestLog.request_id == request_id)
+        if trace_id:
+            stmt = stmt.where(RequestLog.trace_id == trace_id)
+        total = await session.scalar(
+            select(func.count()).select_from(stmt.subquery())
+        )
+        result = await session.execute(stmt.limit(limit).offset(offset))
+        rows = result.scalars().all()
+        data = [_log_row(row) for row in rows]
+    return {"object": "list", "total": total, "limit": limit, "offset": offset, "data": data}
+
+
+@router.get("/admin/logs/{log_id}")
+async def get_log(
+    log_id: int,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """One log row in full, including the stored request/response bodies."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        log = await session.get(RequestLog, log_id)
+        if log is None:
+            raise GatewayError(404, f"Log entry {log_id} not found.", "invalid_request_error")
+        row = _log_row(log)
+    row["request_body"] = log.request_body
+    row["response_body"] = log.response_body
+    return row
+
+
+# ----------------------------------------------------------------------
+# Stats
+# ----------------------------------------------------------------------
+
+
+def _percentile(sorted_values: list[int], pct: float) -> int | None:
+    if not sorted_values:
+        return None
+    idx = min(len(sorted_values) - 1, max(0, round(pct * (len(sorted_values) - 1))))
+    return sorted_values[idx]
+
+
+@router.get("/admin/stats")
+async def stats(
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    hours: int = Query(24, ge=1, le=24 * 30),
+) -> dict:
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    # Client traffic only: shadow (mirrored) rows are excluded so they do
+    # not pollute error rates, latency percentiles or cost totals.
+    not_shadow = RequestLog.shadow.isnot(True)
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        base = select(RequestLog).where(RequestLog.created_at >= since, not_shadow)
+
+        total = await session.scalar(select(func.count()).select_from(base.subquery()))
+
+        by_status_rows = await session.execute(
+            select(RequestLog.status, func.count())
+            .where(RequestLog.created_at >= since, not_shadow)
+            .group_by(RequestLog.status)
+        )
+        by_status = {status: count for status, count in by_status_rows}
+
+        by_model_rows = await session.execute(
+            select(
+                RequestLog.model,
+                func.count(),
+                func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
+                func.coalesce(func.sum(RequestLog.total_tokens), 0),
+            )
+            .where(RequestLog.created_at >= since, not_shadow)
+            .group_by(RequestLog.model)
+        )
+        by_model = [
+            {"model": model, "requests": count, "cost_usd": round(cost, 6), "tokens": tokens}
+            for model, count, cost, tokens in by_model_rows
+        ]
+
+        by_key_rows = await session.execute(
+            select(
+                RequestLog.key_name,
+                func.count(),
+                func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
+            )
+            .where(RequestLog.created_at >= since, not_shadow)
+            .group_by(RequestLog.key_name)
+        )
+        by_key = [
+            {"key_name": key, "requests": count, "cost_usd": round(cost, 6)}
+            for key, count, cost in by_key_rows
+        ]
+
+        latency_rows = await session.execute(
+            select(RequestLog.latency_ms)
+            .where(
+                RequestLog.created_at >= since,
+                not_shadow,
+                RequestLog.latency_ms.isnot(None),
+            )
+            .order_by(RequestLog.latency_ms)
+            .limit(5000)
+        )
+        latencies = [row[0] for row in latency_rows if row[0] is not None]
+
+        tokens_row = await session.execute(
+            select(
+                func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
+                func.coalesce(func.sum(RequestLog.completion_tokens), 0),
+                func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
+            ).where(RequestLog.created_at >= since, not_shadow)
+        )
+        prompt_tokens, completion_tokens, total_cost = tokens_row.one()
+
+    errors = by_status.get("error", 0) + by_status.get("blocked", 0)
+    return {
+        "window_hours": hours,
+        "total_requests": total,
+        "by_status": by_status,
+        "error_rate": (errors / total) if total else 0.0,
+        "tokens": {
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+        },
+        "cost_usd_total": round(total_cost, 6),
+        "latency_ms": {
+            "p50": _percentile(latencies, 0.50),
+            "p95": _percentile(latencies, 0.95),
+            "p99": _percentile(latencies, 0.99),
+        },
+        "by_model": by_model,
+        "by_key": by_key,
+    }
+
+
+# ----------------------------------------------------------------------
+# Usage export (billing / chargeback)
+# ----------------------------------------------------------------------
+
+_USAGE_CSV_COLUMNS = (
+    "request_id",
+    "created_at",
+    "key_name",
+    "model",
+    "provider",
+    "deployment",
+    "status",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cost_usd",
+    "latency_ms",
+    "cache_hit",
+    "stream",
+    "shadow",
+)
+
+
+def _usage_row(row: RequestLog) -> dict:
+    """Billing-relevant log fields (stable set + column order for CSV)."""
+    return {
+        "request_id": row.request_id,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "key_name": row.key_name,
+        "model": row.model,
+        "provider": row.provider,
+        "deployment": row.deployment,
+        "status": row.status,
+        "prompt_tokens": row.prompt_tokens,
+        "completion_tokens": row.completion_tokens,
+        "total_tokens": row.total_tokens,
+        "cost_usd": round(row.cost_usd, 6) if row.cost_usd is not None else None,
+        "latency_ms": row.latency_ms,
+        "cache_hit": bool(row.cache_hit),
+        "stream": bool(row.stream),
+        "shadow": bool(row.shadow),
+        "prompt_variant": row.prompt_variant,
+    }
+
+
+def _parse_range_ts(value: str, field: str) -> datetime:
+    try:
+        ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GatewayError(
+            400, f"Invalid {field}: {exc}", "invalid_request_error", param=field
+        ) from exc
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+
+@router.get("/admin/usage/export")
+async def export_usage(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    format: str = Query("json", pattern="^(json|csv)$"),
+    since: str | None = None,
+    until: str | None = None,
+    key_name: str | None = None,
+    model: str | None = None,
+    status: str | None = None,
+    include_shadow: bool = False,
+    limit: int = Query(100_000, ge=1, le=250_000),
+) -> Response:
+    """Usage export for billing / chargeback: request rows plus aggregates.
+
+    Rows are request-log entries in ``[since, until]`` (ISO-8601
+    timestamps; naive values are read as UTC; defaults: the last 30 days
+    up to now), filterable by key, model and status. Mirrored (shadow)
+    calls are excluded by default — they never cost the client anything —
+    ``include_shadow=true`` includes them (flagged). ``format=json``
+    returns ``{summary, requests}`` with totals and per-key / per-model /
+    per-status breakdowns; ``format=csv`` returns one row per request in
+    a stable column order (download attachment).
+    """
+    until_ts = (
+        _parse_range_ts(until, "until") if until else datetime.now(timezone.utc)
+    )
+    since_ts = (
+        _parse_range_ts(since, "since") if since else until_ts - timedelta(days=30)
+    )
+    if since_ts > until_ts:
+        raise GatewayError(
+            400, "'since' must not be after 'until'.", "invalid_request_error"
+        )
+
+    conditions = [
+        RequestLog.created_at >= since_ts,
+        RequestLog.created_at <= until_ts,
+    ]
+    if not include_shadow:
+        conditions.append(RequestLog.shadow.isnot(True))
+    if key_name:
+        conditions.append(RequestLog.key_name == key_name)
+    if model:
+        conditions.append(RequestLog.model == model)
+    if status:
+        conditions.append(RequestLog.status == status)
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(RequestLog)
+                    .where(*conditions)
+                    .order_by(RequestLog.created_at, RequestLog.id)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        async def _grouped(*group_cols):
+            stmt = (
+                select(
+                    *group_cols,
+                    func.count(),
+                    func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
+                    func.coalesce(func.sum(RequestLog.completion_tokens), 0),
+                    func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
+                )
+                .where(*conditions)
+                .group_by(*group_cols)
+                .order_by(func.sum(RequestLog.cost_usd).desc())
+            )
+            return (await session.execute(stmt)).all()
+
+        totals = (
+            await session.execute(
+                select(
+                    func.count(),
+                    func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
+                    func.coalesce(func.sum(RequestLog.completion_tokens), 0),
+                    func.coalesce(func.sum(RequestLog.cost_usd), 0.0),
+                ).where(*conditions)
+            )
+        ).one()
+        by_status_rows = await _grouped(RequestLog.status)
+        by_key_rows = await _grouped(RequestLog.key_name)
+        by_model_rows = await _grouped(RequestLog.model)
+
+    total_count, prompt_tokens, completion_tokens, total_cost = totals
+
+    def _entries(rows_, label):
+        return [
+            {
+                label: value,
+                "requests": count,
+                "prompt_tokens": p,
+                "completion_tokens": c,
+                "cost_usd": round(cost, 6),
+            }
+            for value, count, p, c, cost in rows_
+        ]
+
+    summary = {
+        "range": {"since": since_ts.isoformat(), "until": until_ts.isoformat()},
+        "filters": {
+            "key_name": key_name,
+            "model": model,
+            "status": status,
+            "include_shadow": include_shadow,
+        },
+        "requests": total_count,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cost_usd": round(total_cost, 6),
+        "by_status": {
+            value: {"requests": count, "cost_usd": round(cost, 6)}
+            for value, count, _, _, cost in by_status_rows
+        },
+        "by_key": _entries(by_key_rows, "key_name"),
+        "by_model": _entries(by_model_rows, "model"),
+        "row_count": len(rows),
+        # the row list is capped by `limit`; aggregates never are
+        "truncated": len(rows) < total_count,
+    }
+
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(_USAGE_CSV_COLUMNS)
+        for row in (_usage_row(r) for r in rows):
+            writer.writerow(
+                [
+                    (
+                        str(row[col]).lower()
+                        if isinstance(row[col], bool)
+                        else ("" if row[col] is None else row[col])
+                    )
+                    for col in _USAGE_CSV_COLUMNS
+                ]
+            )
+        filename = f"usage_{since_ts:%Y%m%d}_{until_ts:%Y%m%d}.csv"
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    return JSONResponse(
+        {
+            "object": "usage_export",
+            "summary": summary,
+            "requests": [_usage_row(r) for r in rows],
+        }
+    )
+
+
+# ----------------------------------------------------------------------
+# Introspection: routing table + guardrails
+# ----------------------------------------------------------------------
+
+
+@router.get("/admin/routing")
+async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+    config = raw_request.app.state.config
+    breakers = raw_request.app.state.pipeline.router.breakers
+    snapshots = await breakers.snapshots()
+    return {
+        "circuit_breaker": {
+            "enabled": breakers.enabled,
+            "deployments": snapshots,
+        },
+        "models": [
+            {
+                "name": model.name,
+                "deployments": [
+                    {
+                        "name": d.name,
+                        "provider": d.provider,
+                        "model": d.model,
+                        "priority": d.priority,
+                        "weight": d.weight,
+                        "shadow": d.shadow,
+                        "shadow_fraction": d.shadow_fraction,
+                        "breaker": snapshots.get(d.name),
+                    }
+                    for d in model.deployments
+                ],
+            }
+            for model in config.models
+        ],
+    }
+
+
+@router.post("/admin/routing/breakers/{deployment_name:path}/reset")
+async def reset_circuit(
+    deployment_name: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Force-close a deployment's circuit (next request probes it again)."""
+    breakers = raw_request.app.state.pipeline.router.breakers
+    try:
+        await breakers.reset(deployment_name)
+    except KeyError:
+        raise GatewayError(
+            404,
+            f"Deployment '{deployment_name}' does not exist.",
+            "invalid_request_error",
+            code="deployment_not_found",
+        )
+    raw_request.app.state.audit.record(
+        "breaker.reset", actor=admin, deployment=deployment_name
+    )
+    return {
+        "deployment": deployment_name,
+        "breaker": (await breakers.snapshots())[deployment_name],
+    }
+
+
+@router.get("/admin/guardrails")
+async def guardrails(raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+    manager = raw_request.app.state.pipeline.guardrails
+    return {"guardrails": manager.describe()}
+
+
+# ----------------------------------------------------------------------
+# Operations: hot-reload + SQLite backup/restore
+# ----------------------------------------------------------------------
+
+
+@router.post("/admin/reload")
+async def reload_config(
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+) -> dict:
+    """Re-read config.yaml and swap the policy components without
+    restarting (same path SIGHUP takes).
+
+    Reloads guardrails, models/deployments, routing policy, pricing and
+    prompt-policy knobs. Infra-bound settings (provider credentials, the
+    auth chain, cache/rate-limit backends, telemetry) are not hot-swapped;
+    a config that changed any of them reports it in ``restart_required``.
+    An invalid config is a 400 and leaves the running one live."""
+    from ..main import reload_gateway
+
+    try:
+        summary = await reload_gateway(raw_request.app, source="admin")
+    except Exception as exc:  # noqa: BLE001 — any load/validate failure = bad config
+        raise GatewayError(
+            400,
+            f"Configuration reload failed (running config unchanged): {exc}",
+            "invalid_request_error",
+            code="config_invalid",
+        ) from exc
+    raw_request.app.state.audit.record(
+        "config.reloaded",
+        actor=admin,
+        config_path=summary["config_path"],
+        source=summary["source"],
+    )
+    return summary
+
+
+_BACKUP_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+
+
+@router.post("/admin/backup", status_code=201)
+async def create_backup(
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+) -> dict:
+    """Snapshot the SQLite database to ``settings.backup_dir``.
+
+    Uses SQLite's online ``VACUUM INTO``: a consistent, compact copy of
+    the live database without blocking traffic (safe while requests are
+    being served and logged). Restore is deliberately offline — stop the
+    gateway, replace the database file, start it again; restoring under
+    a live engine is a footgun the API refuses to be."""
+    from ..db import get_engine
+
+    backup_dir = Path(raw_request.app.state.settings.backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    path = backup_dir / f"gateway-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.db"
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.exec_driver_sql("VACUUM INTO ?", (str(path),))
+    size = path.stat().st_size
+    raw_request.app.state.audit.record(
+        "backup.created", actor=admin, name=path.name, size_bytes=size
+    )
+    return {"name": path.name, "path": str(path), "size_bytes": size}
+
+
+@router.get("/admin/backups")
+async def list_backups(
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_admin)]
+) -> dict:
+    backup_dir = Path(raw_request.app.state.settings.backup_dir)
+    backups = []
+    if backup_dir.is_dir():
+        # Newest first: mtime desc (name = timestamp + random suffix, so
+        # same-second backups tie-break deterministically by name).
+        entries = [
+            (entry.stat().st_mtime, entry.name, entry)
+            for entry in backup_dir.iterdir()
+            if entry.is_file() and entry.name.endswith(".db")
+        ]
+        for _, name, entry in sorted(entries, reverse=True):
+            backups.append(
+                {
+                    "name": name,
+                    "size_bytes": entry.stat().st_size,
+                    "created_at": datetime.fromtimestamp(
+                        entry.stat().st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                }
+            )
+    return {"object": "list", "data": backups}
+
+
+@router.delete("/admin/backups/{name}")
+async def delete_backup(
+    name: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)]
+) -> dict:
+    """Delete one backup by file name (flat names only — no path
+    separators accepted, so the endpoint can never reach outside the
+    backup directory)."""
+    if not name or set(name) - _BACKUP_NAME_CHARS:
+        raise GatewayError(
+            400,
+            "Invalid backup name.",
+            "invalid_request_error",
+            code="invalid_backup_name",
+        )
+    backup_dir = Path(raw_request.app.state.settings.backup_dir)
+    target = backup_dir / name
+    if not target.is_file():
+        raise GatewayError(
+            404,
+            f"Backup '{name}' does not exist.",
+            "invalid_request_error",
+            code="backup_not_found",
+        )
+    target.unlink()
+    raw_request.app.state.audit.record("backup.deleted", actor=admin, name=name)
+    return {"deleted": name}

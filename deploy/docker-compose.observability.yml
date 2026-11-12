@@ -1,0 +1,107 @@
+# ============================================================
+# Full observability stack for the LLM Gateway
+# ============================================================
+#   docker compose -f deploy/docker-compose.observability.yml up --build
+#
+# UIs:
+#   Gateway     http://localhost:8000   (/metrics, /health, /v1/*, /admin/*)
+#   Jaeger      http://localhost:16686  (traces)
+#   Prometheus  http://localhost:9090   (metrics + alert rules)
+#   Grafana     http://localhost:3000   (dashboard "LLM Gateway", logs)
+#
+# Flow:
+#   gateway --OTLP traces--> collector --tail sampling--> jaeger
+#   gateway --OTLP logs---> collector --> loki
+#   prometheus --scrape /metrics--> gateway          (metrics stay here)
+#
+# Run from the repo root so the gateway build context resolves. Pin image
+# tags for anything long-lived; `latest` keeps the demo current.
+
+name: llm-gateway-observability
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      GATEWAY_ADMIN_KEY: ${GATEWAY_ADMIN_KEY:-sk-gw-change-me}
+      GATEWAY_DATABASE_URL: sqlite+aiosqlite:////data/gateway.db
+      GATEWAY_LOG_FORMAT: json
+      GATEWAY_OTEL_ENABLED: "true"
+      OTEL_SERVICE_NAME: llm-gateway
+      # Per-signal endpoints: traces and logs go to the collector. Metrics
+      # are deliberately NOT sent via OTLP — Prometheus scrapes /metrics
+      # directly (see prometheus/prometheus.yml). To also bridge metrics,
+      # add OTEL_EXPORTER_OTLP_METRICS_ENDPOINT and enable the collector's
+      # metrics pipeline (see otel-collector/config.yaml).
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: http://otel-collector:4318/v1/logs
+      # Provider credentials referenced by config.yaml (api_key_env)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - gateway-data:/data
+      - ../config.yaml:/app/config.yaml:ro
+    depends_on:
+      - otel-collector
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/readyz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4318:4318" # OTLP/HTTP (also usable from the host)
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # Jaeger UI
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - gateway
+
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      # dev-friendly: no login required
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
+
+volumes:
+  gateway-data:
+  loki-data:

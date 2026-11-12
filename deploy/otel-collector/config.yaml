@@ -1,0 +1,68 @@
+# OpenTelemetry Collector for the LLM Gateway stack.
+#
+# Receives OTLP traces and logs from the gateway (the metrics path is
+# Prometheus scraping /metrics directly — see prometheus/prometheus.yml).
+#
+# Tail-based sampling decides AFTER a trace completes, so we can keep the
+# interesting 100% and drop most of the healthy traffic. The gateway itself
+# only does head-based sampling (OTEL_TRACES_SAMPLER), which is the right
+# split: cheap in-process, smart at the collector.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  tail_sampling:
+    decision_wait: 5s
+    num_traces: 50000
+    policies:
+      - name: errors # every trace with an error status
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: slow-traces # every trace slower than 5s end-to-end
+        type: latency
+        latency:
+          threshold_ms: 5000
+      - name: baseline # 10% of everything else
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+exporters:
+  # Traces -> Jaeger (all-in-one OTLP endpoint)
+  otlphttp/jaeger:
+    endpoint: http://jaeger:4318
+  # Logs -> Loki (native OTLP ingestion, Loki >= 3.0)
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  # Metrics exporter for the gateway's Prometheus->OTel bridge. Off in this
+  # stack (Prometheus scrapes /metrics); enable together with the metrics
+  # pipeline below and OTEL_EXPORTER_OTLP_METRICS_ENDPOINT on the gateway
+  # when sending metrics to an OTLP-native backend.
+  # prometheus:
+  #   endpoint: 0.0.0.0:8889
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [otlphttp/jaeger]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki]
+    # metrics:
+    #   receivers: [otlp]
+    #   processors: [batch]
+    #   exporters: [prometheus]

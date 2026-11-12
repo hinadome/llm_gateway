@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Environment & local data
+.env
+*.db
+*.sqlite3
+backups/
+
+# Tooling
+.pytest_cache/
+.coverage
+nohup.out
+
+# Editors
+.idea/
+.vscode/
+.DS_Store

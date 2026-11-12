@@ -1,0 +1,67 @@
+# LLM Gateway — standalone deployment (gateway + optional Redis).
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# The gateway serves on http://localhost:8000 (admin UI at /admin/ui).
+# SQLite state lives in the `gateway-data` volume; point
+# GATEWAY_DATABASE_URL at PostgreSQL (or SQLite on a shared volume) for
+# multi-replica setups. The full observability stack (Jaeger, Prometheus,
+# Grafana, Loki) is in docker-compose.observability.yml — both files can
+# run side by side, or be merged with `docker compose -f a -f b`.
+#
+# For shared state across replicas, uncomment the `redis` service below,
+# run with `--profile redis`, and set the cache/rate-limit/breaker
+# backends to `redis` in your config.yaml (see config.yaml's `redis:`
+# block for the URL — it defaults to localhost, so point it at
+# `redis://redis:6379/0` when running in compose).
+
+name: llm-gateway
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      # Optional (compose >= 2.24): GATEWAY_* settings from .env when present.
+      - path: ../.env
+        required: false
+    environment:
+      # SQLite inside the volume; the container's working dir is /app.
+      GATEWAY_DATABASE_URL: sqlite+aiosqlite:////data/gateway.db
+      GATEWAY_CONFIG_PATH: /app/config.yaml
+      GATEWAY_BACKUP_DIR: /app/backups
+    volumes:
+      - gateway-data:/data
+      # Mount your own config over the baked-in default to change models,
+      # guardrails or routing without rebuilding:
+      # - ../config.yaml:/app/config.yaml:ro
+      - gateway-backups:/app/backups
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # In-flight requests + background drain need longer than the default
+    # 10s the moment traffic is flowing; keep in sync with the Dockerfile's
+    # uvicorn --timeout-graceful-shutdown.
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+  # Shared state for multi-replica deployments (cache entries, rate-limit
+  # windows, circuit breakers). Enable with: docker compose --profile redis up
+  redis:
+    image: redis:7-alpine
+    profiles: ["redis"]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  gateway-data:
+  gateway-backups:
+  redis-data:

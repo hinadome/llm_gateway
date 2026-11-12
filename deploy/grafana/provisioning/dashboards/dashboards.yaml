@@ -1,0 +1,13 @@
+# Dashboard provider: load dashboards from the mounted directory.
+
+apiVersion: 1
+
+providers:
+  - name: llm-gateway
+    folder: LLM Gateway
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

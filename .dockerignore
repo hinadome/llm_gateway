@@ -1,0 +1,16 @@
+# everything not needed inside the image
+.git
+.gitignore
+.venv
+.env
+__pycache__
+*.pyc
+*.pyo
+tests
+scripts
+deploy
+*.db
+*.db-journal
+.pytest_cache
+.ruff_cache
+uv.lock

@@ -1,0 +1,318 @@
+# ============================================================
+# LLM Gateway configuration
+# ============================================================
+# Public model names ("models[].name") are what clients send in the
+# `model` field. Each maps to one or more deployments, tried in
+# ascending `priority` order (lower = preferred), with `max_retries`
+# attempts (configurable per-deployment or globally in `routing`).
+
+providers:
+  openai:
+    api_base: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+  anthropic:
+    api_base: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+  gemini:
+    api_base: https://generativelanguage.googleapis.com
+    api_key_env: GEMINI_API_KEY
+  # Azure OpenAI speaks the OpenAI wire format but addresses *deployments*:
+  # a deployment's `model` below is the Azure deployment name, auth uses
+  # the api-key header, and every call carries ?api-version= (defaults to a
+  # recent stable value; pin it per provider with api_version).
+  # azure:
+  #   api_base: https://myresource.openai.azure.com
+  #   api_key_env: AZURE_OPENAI_API_KEY
+  #   api_version: "2024-10-21"
+
+models:
+  - name: gpt-4o
+    deployments:
+      - name: openai/gpt-4o
+        provider: openai
+        model: gpt-4o
+      # Fallback: if OpenAI fails after retries, route to Anthropic
+      - name: anthropic/claude-sonnet-4-5
+        provider: anthropic
+        model: claude-sonnet-4-5
+        priority: 200
+      # Shadow deployment: never serves clients — instead a mirrored copy
+      # of `shadow_fraction` (default all) of successful requests is sent
+      # to it in the background, for latency/status/content comparison
+      # before promotion (own log rows + gateway_shadow_* metrics; the
+      # client never sees an effect). Canary rollouts need no separate
+      # flag: raise `weight` gradually within a priority tier instead.
+      # - name: azure/gpt-4o-shadow
+      #   provider: azure
+      #   model: gpt-4o-prod            # Azure deployment name
+      #   shadow: true
+      #   shadow_fraction: 0.1
+
+  - name: gpt-4o-mini
+    deployments:
+      - name: openai/gpt-4o-mini
+        provider: openai
+        model: gpt-4o-mini
+        # Native Responses southbound (opt-in): requests that arrived via
+        # POST /v1/responses are forwarded to the provider's /responses
+        # endpoint in their original shape instead of the chat conversion,
+        # so Responses-specific fields the conversion drops survive the
+        # round trip. The response is translated back into chat shape —
+        # guardrails/cache/budgets/logging are unaffected. If a guardrail
+        # or the prompt policy modified the request, the adapter falls
+        # back to the chat conversion (modifications are never dropped).
+        # Plain chat requests ignore the flag. OpenAI + Azure only.
+        # native_responses: true
+
+  - name: claude-sonnet-4-5
+    deployments:
+      - name: anthropic/claude-sonnet-4-5
+        provider: anthropic
+        model: claude-sonnet-4-5
+      - name: gemini/gemini-2.5-pro
+        provider: gemini
+        model: gemini-2.5-pro
+        priority: 200
+
+  - name: gemini-2.5-flash
+    deployments:
+      - name: gemini/gemini-2.5-flash
+        provider: gemini
+        model: gemini-2.5-flash
+
+  # Embeddings models serve POST /v1/embeddings. Declared like chat models;
+  # they also show up in GET /v1/models (as on OpenAI). Any OpenAI-compatible
+  # api_base works; Gemini is translated to batchEmbedContents. Anthropic has
+  # no embeddings API — its deployments return a clear 501 and routing falls
+  # through to the next deployment.
+  - name: text-embedding-3-small
+    deployments:
+      - name: openai/text-embedding-3-small
+        provider: openai
+        model: text-embedding-3-small
+
+# ------------------------------------------------------------
+# Gateway-managed prompt policy (applied after model resolution,
+# before guardrails and cache lookup — checks and cache identity see
+# the final prompt; the log row keeps what the client sent).
+#
+# system_prompt: prepended to requests that carry NO system message of
+#   their own. A per-key system_prompt (admin API/UI) overrides this, and
+#   a client-supplied system message always wins over both — the gateway
+#   manages the prompt for callers that don't provide one.
+# variables: resolve {{placeholders}} in message text and in the managed
+#   system prompt. A key's prompt_variables merge over these (key wins).
+#   Only known names are replaced — unknown placeholders and literal
+#   braces (code snippets, JSON examples) pass through untouched.
+# ------------------------------------------------------------
+prompts:
+  system_prompt: "You are a helpful assistant. Be concise."
+  variables:
+    company: "Acme"
+    tone: "formal"
+  # How long a key's resolved system_prompt_ref (named library prompt)
+  # is cached in-process. Writes through this process's admin API
+  # invalidate immediately; the TTL is the cross-replica backstop.
+  library_cache_seconds: 30
+
+# ------------------------------------------------------------
+# Guardrails run over every request/response.
+# Built-ins: pii_redaction, prompt_injection, keyword_blocklist,
+#            output_moderation, response_schema, request_limits,
+#            presidio_pii (needs `uv sync --extra guardrails`)
+# Custom:    set `class: "pkg.module:ClassName"` to load your own
+#            Guardrail subclass.
+#
+# `mode` (default: enforce):
+#   enforce — block/modify verdicts take effect
+#   observe — verdicts are logged and counted
+#             (gateway_guardrail_observed_total) but requests flow on
+#             untouched; for measuring false positives before rollout.
+# ------------------------------------------------------------
+guardrails:
+  - name: pii_redaction
+    enabled: true
+    params:
+      mask_in_response: true
+      # Mask PII in *streamed* output as it streams (mid-stream
+      # rewriting). Holds back the last stream_reserve_chars of each
+      # delta so a match split across provider chunks (an email arriving
+      # in pieces) never leaks; held-back text flushes redacted before
+      # the stream's finish chunk. Patterns that can grow longer than
+      # the reserve would still be split — raise it for those.
+      mask_in_stream: false
+      stream_reserve_chars: 100
+
+  - name: prompt_injection
+    enabled: true
+    params:
+      threshold: 3            # weighted pattern score needed to block
+
+  - name: keyword_blocklist
+    enabled: false
+    params:
+      blocked_terms: []       # plain substrings, case-insensitive
+      blocked_patterns: []    # regexes
+
+  - name: output_moderation
+    enabled: true
+
+  - name: response_schema
+    enabled: true
+
+  # Coarse per-request limits. on_exceed: redirect sends oversized
+  # requests to a cheaper model instead of blocking them
+  # (reject-and-redirect); redirect_model must be a configured public
+  # model the calling key may use.
+  - name: request_limits
+    enabled: false
+    params:
+      max_messages: 100
+      max_chars: 200000
+      on_exceed: block        # block | redirect
+      redirect_model: gpt-4o-mini
+
+  # Production-grade PII detection via Microsoft Presidio (optional
+  # 'guardrails' extra). Replaces the regex heuristics above — disable
+  # pii_redaction when enabling this.
+  # - name: presidio_pii
+  #   enabled: true
+  #   mode: enforce           # observe → log-only, no enforcement
+  #   params:
+  #     # Curated default set; PERSON/LOCATION need the NLP engine
+  #     entities: [EMAIL_ADDRESS, PHONE_NUMBER, CREDIT_CARD, IBAN_CODE,
+  #                IP_ADDRESS, US_SSN, US_ITIN, US_BANK_NUMBER,
+  #                PERSON, LOCATION]
+  #     block_entities: [CREDIT_CARD]  # block instead of redact (subset)
+  #     mask_in_response: true         # also redact model output
+  #     score_threshold: 0.3           # presidio score floor
+  #     placeholder: "<{ENTITY}>"       # replacement template
+  #     use_nlp: true                   # false → pattern-only, no model load
+  #     language: en
+
+cache:
+  enabled: true
+  ttl_seconds: 300
+  max_entries: 256
+  # backend: memory (default) | redis — redis shares cache entries across
+  # workers/replicas (requires the redis section below)
+  backend: memory
+
+# Semantic (approximate-match) cache, on top of the exact cache above:
+# after an exact miss, embed the normalized request and serve the best
+# same-model cached response with >= threshold cosine similarity.
+# Costs one embeddings call per uncached request (billed to the
+# gateway's provider key). Off by default. Store is per-process.
+#semantic_cache:
+#  enabled: true
+#  model: text-embedding-3-small   # embeddings model (needs a deployment)
+#  threshold: 0.95                 # cosine similarity required for a hit
+#  ttl_seconds: 300
+#  max_entries: 256
+
+# Shared state for multi-worker / multi-replica deployments. Enable by
+# setting rate_limit.backend, cache.backend and/or
+# routing.breaker.backend to "redis".
+redis:
+  url: redis://localhost:6379/0
+  url_env: REDIS_URL        # env var that overrides url when set
+  prefix: llm-gateway
+
+rate_limit:
+  backend: memory           # memory | redis
+
+routing:
+  timeout_seconds: 300
+  max_retries: 2
+  retry_backoff_base: 0.5
+  # Per-deployment circuit breaker: a deployment that fails
+  # `failure_threshold` consecutive requests (after retries) is skipped
+  # for `cooldown_seconds`, then probed with one request before being
+  # readmitted. If every deployment of a model is open, the router tries
+  # anyway (availability beats protection). State is per-process by
+  # default; backend: redis shares it, so one replica's trip opens the
+  # circuit for the whole fleet (fails open if Redis is down).
+  breaker:
+    enabled: true
+    # backend: memory        # memory (default) | redis
+    failure_threshold: 3
+    cooldown_seconds: 30
+
+logging:
+  max_body_chars: 20000
+  # Background queued log writes (opt-in hot-path optimization): instead
+  # of awaiting the row INSERT in the response path, request-log writes
+  # are handed to a bounded queue drained by a background consumer.
+  # Semantics change: a returned response no longer implies its log row
+  # is queryable (typically a milliseconds-long gap); a full queue drops
+  # rows (counted on gateway_logs_dropped_total) rather than blocking.
+  # Shutdown drains everything pending.
+  #background_write: true
+  #queue_size: 1000
+
+# Prometheus behaviour. per_key (opt-in — key names are unbounded label
+# cardinality) adds per-key series: gateway_key_requests_total,
+# gateway_key_tokens_total and gateway_key_cost_usd_total. Distinct keys
+# beyond per_key_max_series collapse into the __overflow__ label (counted
+# on gateway_key_label_overflow_total) instead of growing the series
+# forever. Shadow-mirrored calls are excluded.
+metrics:
+  per_key: false
+  #per_key_max_series: 256
+
+# Budget alerting: fire a webhook when a virtual key's cumulative spend
+# crosses a threshold of its max_budget_usd. Each level fires once per key
+# (state persists in the DB, so it survives restarts and holds across
+# workers); raising a key's budget re-arms the levels below the new spend.
+# Delivery runs in the background spend task — it never blocks requests —
+# and is best-effort (timeout + retry, counted on gateway_alerts_total).
+# Without a URL, crossings are only counted as outcome="skipped".
+# (Daily/monthly budget windows — daily_budget_usd / monthly_budget_usd —
+# are set per key via the admin API and are NOT alert-tracked; alerts
+# always compare against the total max_budget_usd.)
+alerts:
+  budget_thresholds: [50, 80, 90, 100]   # % of max_budget_usd
+  # webhook_url: https://hooks.slack.com/services/T000/B000/XXXX
+  # url_env: ALERT_WEBHOOK_URL           # env var that overrides webhook_url
+  # timeout_seconds: 5                   # per POST attempt
+  # max_attempts: 2                      # attempts per alert (1 retry, 0.5s backoff)
+
+# Audit trail: POST one JSON record per security-relevant admin action
+# (virtual key create/update/revoke, circuit-breaker reset) to your SIEM.
+# Records identify the actor (key name + how they authenticated) and what
+# changed; the raw key of a new virtual key is never included. Delivery is
+# a background task — a dead endpoint never slows or fails the admin call —
+# counted on gateway_audit_events_total (skipped when no URL is set).
+audit:
+  enabled: true                          # records only go out when a URL is set
+  # webhook_url: https://siem.example.com/collect
+  # url_env: AUDIT_WEBHOOK_URL
+  # timeout_seconds: 5
+  # max_attempts: 2
+
+# The authentication chain: which strategies may authenticate a caller,
+# in order (first match wins; a step can also reject outright → 401).
+# Entries are built-in names (admin_key, virtual_key, jwt) or
+# "pkg.module:ClassName" paths to custom Authenticator subclasses.
+# The jwt step accepts OAuth/JWT bearer tokens: the token's key_claim
+# (default sub) names the virtual key whose policy applies — budgets,
+# limits, spend and logs accrue to that key exactly as its raw key would.
+# Requires PyJWT: pip install 'llm-gateway[auth]'
+auth:
+  chain: [admin_key, virtual_key]        # the default
+  # To also accept tokens:
+  # chain: [admin_key, virtual_key, jwt]
+  # jwt:
+  #   secret: shared-hs256-secret          # or jwks_url for asymmetric keys:
+  #   # jwks_url: https://idp.example.com/.well-known/jwks.json
+  #   # jwks_cache_seconds: 300            # refreshes early on unknown kid
+  #   key_claim: sub                       # claim naming the virtual key
+  #   issuer: https://idp.example.com      # enforced when set (exp always is)
+  #   audience: llm-gateway
+  #   leeway_seconds: 30                   # clock-skew tolerance
+
+# Per-1M-token pricing overrides (USD). Merged over built-in defaults;
+# longest model-prefix match wins. Embeddings are input-only.
+pricing: {}
+  # gpt-4o: {input: 2.5, output: 10.0}
+  # text-embedding-3-small: {input: 0.02}

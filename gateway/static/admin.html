@@ -1,0 +1,1203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway · Admin</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #11151c; --panel2: #161c26; --border: #232b38;
+    --text: #dce3ec; --muted: #7d8a9c; --accent: #4d9fff;
+    --green: #3fb950; --red: #f85149; --amber: #d29922; --purple: #bc8cff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 10px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15px; }
+  .brand .hex { color: var(--accent); font-size: 18px; }
+  .brand .tag {
+    font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); border: 1px solid var(--border); padding: 2px 7px; border-radius: 10px;
+  }
+  .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.ok { background: var(--green); } .dot.bad { background: var(--red); }
+  .authbox { display: flex; align-items: center; gap: 8px; }
+  input, select, button, textarea {
+    font: inherit; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px;
+  }
+  input:focus, select:focus, button:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; }
+  button.danger { color: var(--red); border-color: rgba(248,81,73,.4); background: transparent; }
+  button.danger:hover { background: rgba(248,81,73,.12); }
+  button.small { padding: 3px 9px; font-size: 12px; border-radius: 6px; }
+
+  nav.tabs { display: flex; gap: 2px; padding: 0 20px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  nav.tabs button {
+    background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted);
+    padding: 10px 14px; font-weight: 600; border-radius: 0;
+  }
+  nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  nav.tabs button:hover { color: var(--text); }
+
+  main { padding: 20px; max-width: 1200px; margin: 0 auto; }
+  section.tab { display: none; }
+  section.tab.active { display: block; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .card .v { font-size: 24px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 18px; }
+  .panel > .ph {
+    display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); font-weight: 600;
+  }
+  .panel > .ph .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .panel > .pb { padding: 14px 16px; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(77,159,255,.05); }
+  td.num, th.num { text-align: right; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .muted { color: var(--muted); }
+
+  .b { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); }
+  .b-green { color: var(--green); border-color: rgba(63,185,80,.45); background: rgba(63,185,80,.08); }
+  .b-red { color: var(--red); border-color: rgba(248,81,73,.45); background: rgba(248,81,73,.08); }
+  .b-amber { color: var(--amber); border-color: rgba(210,153,34,.45); background: rgba(210,153,34,.08); }
+  .b-blue { color: var(--accent); border-color: rgba(77,159,255,.45); background: rgba(77,159,255,.08); }
+  .b-purple { color: var(--purple); border-color: rgba(188,140,255,.45); background: rgba(188,140,255,.08); }
+  .b-gray { color: var(--muted); }
+
+  .bar { background: var(--panel2); border-radius: 5px; height: 7px; width: 120px; overflow: hidden; border: 1px solid var(--border); }
+  .bar > div { height: 100%; border-radius: 5px; }
+  .budgetcell { display: flex; align-items: center; gap: 8px; }
+
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toolbar input, .toolbar select { width: auto; }
+  .toolbar .grow { flex: 1; }
+
+  dialog {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 12px; padding: 0; min-width: 420px; max-width: 90vw;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog .dh { padding: 14px 18px; font-weight: 700; border-bottom: 1px solid var(--border); }
+  dialog .db { padding: 18px; display: grid; gap: 12px; }
+  dialog .df { padding: 14px 18px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+  label.fld { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .err { color: var(--red); font-size: 13px; min-height: 16px; }
+
+  #login {
+    position: fixed; inset: 0; background: rgba(11,14,20,.92); z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #login .card-login {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 28px; width: 380px; display: grid; gap: 14px;
+  }
+  #login h1 { margin: 0; font-size: 18px; }
+  #login p { margin: 0; color: var(--muted); font-size: 13px; }
+  #login input { width: 100%; font-family: var(--mono); }
+
+  .keyreveal {
+    font-family: var(--mono); font-size: 13px; background: var(--panel2);
+    border: 1px dashed var(--amber); border-radius: 8px; padding: 12px;
+    word-break: break-all; user-select: all;
+  }
+  pre.json {
+    font-family: var(--mono); font-size: 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+    overflow: auto; max-height: 320px; margin: 0; white-space: pre-wrap; word-break: break-word;
+  }
+  tr.detail td { background: var(--bg); padding: 14px 16px; }
+  .detailgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .detailgrid h4 { margin: 0 0 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; margin-bottom: 12px; }
+  .kv span:nth-child(odd) { color: var(--muted); }
+
+  #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 200; }
+  .toast {
+    background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 10px 14px; font-size: 13px; max-width: 380px;
+    animation: slide .18s ease-out;
+  }
+  .toast.error { border-left-color: var(--red); }
+  @keyframes slide { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .empty { color: var(--muted); text-align: center; padding: 28px; }
+  .pager { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+  .modelgroup td { background: var(--panel2); font-weight: 700; color: var(--accent); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand"><span class="hex">&#x2B21;</span> LLM Gateway <span class="tag">admin</span></div>
+  <div class="spacer"></div>
+  <span class="dot" id="conn"></span><span class="muted" style="font-size:12px" id="connlabel">disconnected</span>
+  <div class="authbox" id="authbox" style="display:none">
+    <button class="ghost small" id="btn-logout">Log out</button>
+  </div>
+</header>
+
+<div id="login">
+  <div class="card-login">
+    <h1>&#x2B21; LLM Gateway admin</h1>
+    <p>Paste the gateway admin key (the value of <span class="mono">GATEWAY_ADMIN_KEY</span>).
+       It is kept in this browser tab's session storage only and sent as a bearer token
+       to the admin API.</p>
+    <input type="password" id="login-key" placeholder="sk-gw-..." autocomplete="off">
+    <div class="err" id="login-err"></div>
+    <button class="primary" id="btn-login">Sign in</button>
+  </div>
+</div>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="keys">Keys</button>
+  <button data-tab="prompts">Prompts</button>
+  <button data-tab="logs">Request logs</button>
+  <button data-tab="routing">Routing &amp; breakers</button>
+  <button data-tab="guardrails">Guardrails</button>
+  <button data-tab="system">System</button>
+  <span style="flex:1"></span>
+  <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;padding:8px 0">
+    <input type="checkbox" id="auto" checked style="accent-color:var(--accent)"> auto-refresh 5s
+  </label>
+</nav>
+
+<main>
+
+  <!-- Overview -->
+  <section class="tab active" id="tab-overview">
+    <div class="toolbar" style="margin-bottom:14px">
+      <span class="muted">Window</span>
+      <select id="hours">
+        <option value="1">last hour</option>
+        <option value="24" selected>last 24 hours</option>
+        <option value="168">last 7 days</option>
+        <option value="720">last 30 days</option>
+      </select>
+      <button class="ghost small" id="btn-export" title="Download the current window's usage as CSV (billing / chargeback; shadow mirrors excluded)">⬇ Export usage (CSV)</button>
+    </div>
+    <div class="cards" id="ov-cards"></div>
+    <div class="panel">
+      <div class="ph">By model</div>
+      <div style="overflow-x:auto"><table id="ov-models"></table></div>
+    </div>
+    <div class="panel">
+      <div class="ph">By key</div>
+      <div style="overflow-x:auto"><table id="ov-keys"></table></div>
+    </div>
+  </section>
+
+  <!-- Keys -->
+  <section class="tab" id="tab-keys">
+    <div class="panel">
+      <div class="ph">Virtual keys
+        <div class="right"><button class="primary small" id="btn-newkey">+ New key</button></div>
+      </div>
+      <div style="overflow-x:auto"><table id="keys-table"></table></div>
+    </div>
+  </section>
+
+  <!-- Prompt library -->
+  <section class="tab" id="tab-prompts">
+    <div class="panel">
+      <div class="ph">Prompt library
+        <div class="right">
+          <span class="muted" style="font-weight:400;font-size:12px">keys reference a prompt by name &middot; the <b>active</b> version serves &middot; a <b>candidate</b> A/B-mirrors in the background (never serves clients)</span>
+          <button class="primary small" id="btn-newprompt">+ New version</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto"><table id="prompts-table"></table></div>
+    </div>
+  </section>
+
+  <!-- Logs -->
+  <section class="tab" id="tab-logs">
+    <div class="panel">
+      <div class="ph">Filters
+        <div class="right"><span class="pager" id="log-pager"></span></div>
+      </div>
+      <div class="pb toolbar">
+        <input id="f-key" placeholder="key name">
+        <input id="f-model" placeholder="model">
+        <select id="f-status">
+          <option value="">any status</option>
+          <option>success</option><option>error</option><option>blocked</option>
+        </select>
+        <input id="f-reqid" placeholder="request id" class="mono" style="width:180px">
+        <input id="f-trace" placeholder="trace id" class="mono" style="width:180px">
+        <button class="primary small" id="btn-filter">Apply</button>
+        <button class="ghost small" id="btn-clearfilter">Reset</button>
+      </div>
+      <div style="overflow-x:auto"><table id="logs-table"></table></div>
+    </div>
+  </section>
+
+  <!-- Routing -->
+  <section class="tab" id="tab-routing">
+    <div class="panel">
+      <div class="ph">Routing table
+        <div class="right muted" style="font-weight:400;font-size:12px">lower priority = preferred &middot; same tier is weighted-random</div>
+      </div>
+      <div style="overflow-x:auto"><table id="routing-table"></table></div>
+    </div>
+  </section>
+
+  <!-- Guardrails -->
+  <section class="tab" id="tab-guardrails">
+    <div class="panel">
+      <div class="ph">Registered guardrails</div>
+      <div style="overflow-x:auto"><table id="guardrails-table"></table></div>
+    </div>
+  </section>
+
+  <!-- System: health, config reload, backups -->
+  <section class="tab" id="tab-system">
+    <div class="panel">
+      <div class="ph">Health
+        <div class="right muted" style="font-weight:400;font-size:12px">/healthz liveness · /readyz readiness (503 while starting, draining, or DB-down)</div>
+      </div>
+      <div id="system-health" class="muted" style="padding:8px 2px">Loading…</div>
+    </div>
+    <div class="panel">
+      <div class="ph">Configuration
+        <div class="right" style="font-weight:400">
+          <button class="ghost small" id="btn-reload" title="Re-read config.yaml and swap guardrails / models / routing / pricing without a restart (same as sending SIGHUP). Provider credentials, auth chain and cache backends need a restart.">&#x21bb; Reload config</button>
+        </div>
+      </div>
+      <div id="system-reload-result" class="muted" style="padding:0 2px 8px;font-size:12px"></div>
+      <div class="muted" style="padding:0 2px 8px;font-size:12px" id="system-config-path"></div>
+    </div>
+    <div class="panel">
+      <div class="ph">Database backups
+        <div class="right" style="font-weight:400">
+          <button class="ghost small" id="btn-backup" title="Snapshot the SQLite database (VACUUM INTO — consistent copy of the live DB, no downtime). Restore: stop the gateway, replace the DB file, start again.">&#128190; Create backup</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto"><table id="backups-table"></table></div>
+      <div class="muted" style="padding:6px 2px;font-size:12px">Restore is offline by design: stop the gateway, replace the database file with a backup, start it again.</div>
+    </div>
+  </section>
+
+</main>
+
+<!-- create / edit key dialog -->
+<dialog id="dlg-key">
+  <form id="form-key" method="dialog" style="min-width:480px">
+    <div class="dh" id="dlg-key-title">New virtual key</div>
+    <div class="db">
+      <label class="fld">Name
+        <input id="k-name" required placeholder="mobile-app" autocomplete="off">
+      </label>
+      <label class="fld">Allowed models (comma-separated fnmatch patterns; empty = all)
+        <input id="k-models" placeholder="gpt-4o*, claude-*" autocomplete="off">
+      </label>
+      <label class="fld" title="Guardrails skipped for requests from this key — a runtime override of the config scope">
+        Disabled guardrails (comma-separated names; empty = none)
+        <input id="k-guardrails" placeholder="prompt_injection, pii_redaction" autocomplete="off">
+      </label>
+      <label class="fld" title="Per-key model routing: requested name = public model to serve instead. Applied before global aliases and wins even over real public model names — per-team steering.">
+        Model mappings (comma-separated name=target pairs; empty = none)
+        <input id="k-mappings" placeholder="gpt-4o=gpt-4o-mini, claude-opus=claude-sonnet" autocomplete="off">
+      </label>
+      <label class="fld" title="Catch-all public model for names this key requests that match nothing else (beats the global default_model)">
+        Default model (public name; empty = global default)
+        <input id="k-default-model" placeholder="gpt-4o-mini" autocomplete="off">
+      </label>
+      <label class="fld" title="System prompt prepended to this key's requests that carry no system message of their own (overrides the global prompts.system_prompt; a client-supplied system message always wins)">
+        System prompt (prepended when the request has none; empty = global)
+        <textarea id="k-system-prompt" rows="3" placeholder="You are a helpful assistant for Acme Corp." autocomplete="off"></textarea>
+      </label>
+      <label class="fld" title="Named prompt from the library whose ACTIVE version serves as this key's system prompt — wins over the inline prompt above; editing the library prompt (new version + activate) needs no key change and no restart. A name without an active version fails closed at request time (400).">
+        Library prompt reference (serves its active version instead of the inline prompt; empty = inline / global)
+        <select id="k-prompt-ref"><option value="">— none (inline / global) —</option></select>
+      </label>
+      <label class="fld" title="{{variable}} substitutions in message text and the system prompt (merged over the global prompts.variables; unknown placeholders are left untouched)">
+        Prompt variables (key=value pairs; empty = global only)
+        <input id="k-prompt-vars" placeholder="company=Acme, tone=formal" autocomplete="off">
+      </label>
+      <label class="fld" title="Data-plane scopes this key may call. 'chat' covers OpenAI chat, the Responses API and the native Anthropic/Gemini formats; empty = all scopes">
+        Allowed endpoints (comma-separated: chat, embeddings, models; empty = all)
+        <input id="k-endpoints" placeholder="chat, models" autocomplete="off">
+      </label>
+      <label class="fld" title="Source addresses calls must come from — plain IPs or CIDR blocks (10.0.0.0/8); empty = any">
+        Allowed IPs (comma-separated IP/CIDR; empty = any)
+        <input id="k-ips" placeholder="10.1.2.3, 192.168.0.0/16" autocomplete="off">
+      </label>
+      <div class="grid2">
+        <label class="fld">RPM limit <input id="k-rpm" type="number" min="0" placeholder="unlimited"></label>
+        <label class="fld">TPM limit <input id="k-tpm" type="number" min="0" placeholder="unlimited"></label>
+        <label class="fld">Max budget (USD) <input id="k-budget" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+        <label class="fld">Expires at <input id="k-expires" type="datetime-local"></label>
+        <label class="fld" title="Spend cap per UTC calendar day; resets at 00:00 UTC">
+          Daily budget (USD) <input id="k-daily" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+        <label class="fld" title="Spend cap per UTC calendar month; resets on the 1st at 00:00 UTC">
+          Monthly budget (USD) <input id="k-monthly" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+      </div>
+      <label class="fld" style="grid-template-columns:auto 1fr;display:grid;gap:8px;align-items:center;color:var(--text)" id="k-active-row">
+        <input type="checkbox" id="k-active" checked style="width:16px;height:16px;accent-color:var(--accent)"> Active
+      </label>
+      <div class="err" id="k-err"></div>
+    </div>
+    <div class="df">
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="ok" class="primary" id="k-submit">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- raw key reveal -->
+<dialog id="dlg-rawkey">
+  <div class="dh">Key created</div>
+  <div class="db">
+    <p class="muted" style="margin:0">Copy the raw key now — it is shown <b>only once</b>.
+       Only its hash is stored.</p>
+    <div class="keyreveal" id="rawkey"></div>
+    <div class="err" id="copy-err"></div>
+  </div>
+  <div class="df"><button class="primary" id="btn-copykey">Copy</button><button id="btn-closeraw" class="ghost">Close</button></div>
+</dialog>
+
+<!-- new prompt version dialog -->
+<dialog id="dlg-prompt">
+  <form id="form-prompt" method="dialog" style="min-width:520px">
+    <div class="dh">New prompt version</div>
+    <div class="db">
+      <label class="fld">Prompt name (an existing name appends a new version to that prompt; a new name starts at v1 — the first version of a name activates automatically)
+        <input id="p-name" required placeholder="support-persona" autocomplete="off">
+      </label>
+      <label class="fld">Body (the system prompt text; {{variable}} placeholders resolve per key)
+        <textarea id="p-body" rows="6" placeholder="You are the support assistant for {{company}}. Be concise." autocomplete="off"></textarea>
+      </label>
+      <label class="fld">Notes (what changed in this version — shown in the version list)
+        <input id="p-notes" placeholder="softer opening tone" autocomplete="off">
+      </label>
+      <div class="err" id="p-err"></div>
+    </div>
+    <div class="df">
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="ok" class="primary">Create version</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toasts"></div>
+
+<script>
+"use strict";
+
+const $ = s => document.querySelector(s);
+const state = {
+  key: sessionStorage.getItem("gw-admin-key") || "",
+  tab: "overview",
+  hours: 24,
+  auto: true,
+  logs: { limit: 25, offset: 0, total: 0 },
+  editing: null,          // key id being edited (null = create)
+  openLog: null,          // expanded log row id
+  openPrompt: null,       // expanded prompt-library name
+};
+
+// ---------- helpers ----------------------------------------------------
+
+function esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function fmtUsd(v) {
+  if (v == null) return "—";
+  if (v >= 1) return "$" + v.toFixed(2);
+  if (v >= 0.01) return "$" + v.toFixed(4);
+  return "$" + v.toFixed(6);
+}
+function fmtInt(v) { return v == null ? "—" : Number(v).toLocaleString("en-US"); }
+function fmtMs(v) { return v == null ? "—" : Math.round(v).toLocaleString("en-US") + " ms"; }
+function fmtWhen(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return isNaN(d) ? esc(iso) : d.toLocaleString();
+}
+function toast(msg, isError) {
+  const el = document.createElement("div");
+  el.className = "toast" + (isError ? " error" : "");
+  el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), 3800);
+}
+function setConn(ok, label) {
+  $("#conn").className = "dot " + (ok ? "ok" : "bad");
+  $("#connlabel").textContent = label;
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  if (state.key) headers["Authorization"] = "Bearer " + state.key;
+  let res;
+  try {
+    res = await fetch(path, Object.assign({}, opts, { headers }));
+  } catch (e) {
+    setConn(false, "unreachable");
+    throw e;
+  }
+  if (res.status === 401) { showLogin(); throw new Error("Authentication required"); }
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* no body */ }
+  if (!res.ok) {
+    const msg = body && body.error && body.error.message ? body.error.message : (res.status + " " + res.statusText);
+    throw new Error(msg);
+  }
+  return body;
+}
+
+// ---------- auth -------------------------------------------------------
+
+function showLogin() {
+  state.key = "";
+  sessionStorage.removeItem("gw-admin-key");
+  $("#login").style.display = "flex";
+  $("#authbox").style.display = "none";
+}
+async function tryLogin() {
+  const k = $("#login-key").value.trim();
+  if (!k) return;
+  state.key = k;
+  try {
+    await api("/admin/keys");
+    sessionStorage.setItem("gw-admin-key", k);
+    $("#login").style.display = "none";
+    $("#authbox").style.display = "flex";
+    $("#login-err").textContent = "";
+    setConn(true, "connected");
+    refresh();
+  } catch (e) {
+    $("#login-err").textContent = e.message || "Sign-in failed";
+  }
+}
+$("#btn-login").addEventListener("click", tryLogin);
+$("#login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryLogin(); });
+$("#btn-logout").addEventListener("click", () => { showLogin(); $("#login-key").focus(); });
+
+// ---------- tabs + refresh --------------------------------------------
+
+$("#tabs").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-tab]");
+  if (!btn) return;
+  state.tab = btn.dataset.tab;
+  document.querySelectorAll("nav.tabs button[data-tab]").forEach(b => b.classList.toggle("active", b === btn));
+  document.querySelectorAll("section.tab").forEach(s => s.classList.toggle("active", s.id === "tab-" + state.tab));
+  refresh();
+});
+$("#hours").addEventListener("change", e => { state.hours = e.target.value; loadOverview(); });
+$("#auto").addEventListener("change", e => { state.auto = e.target.checked; });
+
+$("#btn-export").addEventListener("click", async () => {  // billing export for the selected window (api() assumes JSON; this
+  // one is a file download)
+  try {
+    const res = await fetch("/admin/usage/export?format=csv&since=" +
+      encodeURIComponent(new Date(Date.now() - state.hours * 3600e3).toISOString()),
+      { headers: { Authorization: "Bearer " + state.key } });
+    if (!res.ok) { toast("Export failed: " + res.status, true); return; }
+    const blob = await res.blob();
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(blob),
+      download: (res.headers.get("content-disposition") || "").match(/"([^"]+)"/)?.[1] || "usage.csv",
+    });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast("Usage export downloaded");
+  } catch (e) { toast("Export failed: " + (e.message || e), true); }
+});
+
+// ---------- system wiring ----------------------------------------------
+
+$("#btn-reload").addEventListener("click", reloadConfig);
+$("#btn-backup").addEventListener("click", createBackup);
+$("#backups-table").addEventListener("click", async e => {
+  const btn = e.target.closest("button[data-del-backup]");
+  if (!btn) return;
+  const name = btn.getAttribute("data-del-backup");
+  try {
+    await api("/admin/backups/" + encodeURIComponent(name), { method: "DELETE" });
+    toast(`Deleted ${name}`);
+    await refreshBackups();
+  } catch (err) { toast(err.message, true); }
+});
+
+async function refresh() {
+  if (!state.key) return;
+  try {
+    if (state.tab === "overview") await loadOverview();
+    else if (state.tab === "keys") await loadKeys();
+    else if (state.tab === "prompts") await loadPrompts();
+    else if (state.tab === "logs") await loadLogs();
+    else if (state.tab === "routing") await loadRouting();
+    else if (state.tab === "guardrails") await loadGuardrails();
+    else if (state.tab === "system") await loadSystem();
+    setConn(true, "connected");
+  } catch (e) {
+    if (state.key) setConn(true, "error: " + (e.message || e));
+  }
+}
+setInterval(() => { if (state.auto && state.key) refresh(); }, 5000);
+
+// ---------- overview ---------------------------------------------------
+
+async function loadOverview() {
+  const s = await api("/admin/stats?hours=" + state.hours);
+  const bs = s.by_status || {};
+  const statusChips = ["success", "error", "blocked"].map(st =>
+    `<span class="b ${st === "success" ? "b-green" : st === "error" ? "b-red" : "b-amber"}">${st} ${fmtInt(bs[st] || 0)}</span>`
+  ).join(" ");
+  $("#ov-cards").innerHTML = `
+    <div class="card"><div class="k">Requests (${s.window_hours}h)</div><div class="v">${fmtInt(s.total_requests)}</div><div class="sub">${statusChips}</div></div>
+    <div class="card"><div class="k">Error rate</div><div class="v">${(s.error_rate * 100).toFixed(1)}%</div><div class="sub">errors + blocked</div></div>
+    <div class="card"><div class="k">Spend</div><div class="v">${fmtUsd(s.cost_usd_total)}</div><div class="sub">window total</div></div>
+    <div class="card"><div class="k">Latency p95</div><div class="v">${fmtMs(s.latency_ms.p95)}</div><div class="sub">p50 ${fmtMs(s.latency_ms.p50)} · p99 ${fmtMs(s.latency_ms.p99)}</div></div>
+    <div class="card"><div class="k">Prompt tokens</div><div class="v">${fmtInt(s.tokens.prompt)}</div></div>
+    <div class="card"><div class="k">Completion tokens</div><div class="v">${fmtInt(s.tokens.completion)}</div></div>`;
+  const models = s.by_model || [];
+  $("#ov-models").innerHTML = "<thead><tr><th>Model</th><th class=num>Requests</th><th class=num>Tokens</th><th class=num>Cost</th></tr></thead><tbody>" +
+    (models.length ? models.map(m => `<tr><td class="mono">${esc(m.model)}</td><td class="num">${fmtInt(m.requests)}</td><td class="num">${fmtInt(m.tokens)}</td><td class="num">${fmtUsd(m.cost_usd)}</td></tr>`).join("")
+      : `<tr><td colspan="4" class="empty">No requests in this window</td></tr>`) + "</tbody>";
+  const keys = s.by_key || [];
+  $("#ov-keys").innerHTML = "<thead><tr><th>Key</th><th class=num>Requests</th><th class=num>Cost</th></tr></thead><tbody>" +
+    (keys.length ? keys.map(k => `<tr><td>${esc(k.key_name)}</td><td class="num">${fmtInt(k.requests)}</td><td class="num">${fmtUsd(k.cost_usd)}</td></tr>`).join("")
+      : `<tr><td colspan="3" class="empty">No requests in this window</td></tr>`) + "</tbody>";
+}
+
+// ---------- keys -------------------------------------------------------
+
+async function loadKeys() {
+  const r = await api("/admin/keys");
+  const rows = (r.data || []).map(k => {
+    const budget = k.max_budget_usd;
+    const todayUtc = new Date().toISOString().slice(0, 10);
+    const monthUtc = todayUtc.slice(0, 7);
+    const winBar = (cap, spend, bucket, current, label) => {
+      if (cap == null || cap <= 0) return "";
+      const s = bucket === current ? (spend || 0) : 0; // window rolled → 0
+      const pct = Math.min(100, (s / cap) * 100);
+      const over = s > cap;
+      const color = over || pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--amber)" : "var(--green)";
+      return `<div class="bar" style="width:90px"><div style="width:${pct.toFixed(1)}%;background:${color}"></div></div>` +
+        `<span class="mono" style="font-size:11px" title="${label} budget (UTC calendar window)">${label[0].toUpperCase()}: ${fmtUsd(s)} / ${fmtUsd(cap)}</span>`;
+    };
+    const winRows =
+      winBar(k.daily_budget_usd, k.daily_spend_usd, k.daily_bucket, todayUtc, "daily") +
+      winBar(k.monthly_budget_usd, k.monthly_spend_usd, k.monthly_bucket, monthUtc, "monthly");
+    let budgetCell = '<span class="muted">—</span>';
+    if ((budget != null && budget > 0) || winRows) {
+      let totalPart = "";
+      if (budget != null && budget > 0) {
+        const pct = Math.min(100, (k.spend_usd / budget) * 100);
+        const over = k.spend_usd > budget;
+        const color = over || pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--amber)" : "var(--green)";
+        const alerts = (k.budget_alerts_fired || []).map(l => `<span class="b b-amber">${l}%</span>`).join(" ");
+        totalPart = `<div class="budgetcell"><div class="bar"><div style="width:${pct.toFixed(1)}%;background:${color}"></div></div>` +
+          `<span class="mono" style="font-size:12px">${fmtUsd(k.spend_usd)} / ${fmtUsd(budget)}</span>${alerts}</div>`;
+      } else if (k.spend_usd > 0) {
+        totalPart = `<span class="mono" style="font-size:12px">${fmtUsd(k.spend_usd)}</span>`;
+      }
+      budgetCell = `<div style="display:grid;gap:3px;justify-items:start">${totalPart}${winRows}</div>`;
+    } else if (k.spend_usd > 0) {
+      budgetCell = `<span class="mono" style="font-size:12px">${fmtUsd(k.spend_usd)}</span>`;
+    }
+    const models = !k.allowed_models ? '<span class="b b-blue">all</span>' :
+      k.allowed_models.map(m => `<span class="b b-gray mono">${esc(m)}</span>`).join(" ");
+    const grOff = (k.disabled_guardrails || []).length
+      ? ' <span class="b b-amber" title="Guardrails disabled for this key">GR off: ' +
+        k.disabled_guardrails.map(n => `<span class="mono">${esc(n)}</span>`).join(", ") + '</span>'
+      : "";
+    const scoped = (k.allowed_endpoints || []).length
+      ? ` <span class="b b-blue" title="Endpoint scopes allowed for this key">⇢ ${k.allowed_endpoints.map(esc).join(", ")}</span>`
+      : "";
+    const ipLock = (k.allowed_ips || []).length
+      ? ` <span class="b b-gray" title="Calls must come from these IP/CIDR entries">🔒 ${k.allowed_ips.map(esc).join(", ")}</span>`
+      : "";
+    const promptBits = [];
+    if (k.system_prompt_ref) promptBits.push("library prompt '" + k.system_prompt_ref + "'");
+    if (k.system_prompt) promptBits.push("inline system prompt");
+    if (k.prompt_variables) promptBits.push("variables: " + Object.keys(k.prompt_variables).join(", "));
+    const promptPolicy = promptBits.length
+      ? ` <span class="b b-blue" title="Gateway-managed prompt policy: ${esc(promptBits.join(" + "))}">✎</span>`
+      : "";
+    const expired = k.expires_at && new Date(k.expires_at) < new Date();
+    return `<tr>
+      <td><b>${esc(k.name)}</b>${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
+      <td class="mono muted">${esc(k.key_prefix)}…</td>
+      <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
+      <td>${models}${grOff}${scoped}${ipLock}${promptPolicy}</td>
+      <td class="num">${k.rpm_limit == null ? "—" : fmtInt(k.rpm_limit)} / ${k.tpm_limit == null ? "—" : fmtInt(k.tpm_limit)}</td>
+      <td>${budgetCell}</td>
+      <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
+      <td style="white-space:nowrap">
+        <button class="small ghost" data-edit="${esc(k.id)}">Edit</button>
+        ${k.is_active ? `<button class="small danger" data-revoke="${esc(k.id)}" data-name="${esc(k.name)}">Revoke</button>` : ""}
+      </td></tr>`;
+  }).join("");
+  $("#keys-table").innerHTML = "<thead><tr><th>Key</th><th>Prefix</th><th>State</th><th>Models / Guardrails</th><th class=num>RPM / TPM</th><th>Budget</th><th>Expires</th><th></th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="8" class="empty">No keys — create one</td></tr>') + "</tbody>";
+}
+
+$("#keys-table").addEventListener("click", async e => {
+  const edit = e.target.closest("button[data-edit]");
+  if (edit) {
+    try { openKeyDialog(await api("/admin/keys/" + edit.dataset.edit)); }
+    catch (err) { toast(err.message, true); }
+    return;
+  }
+  const revoke = e.target.closest("button[data-revoke]");
+  if (revoke) {
+    const name = revoke.dataset.name;
+    if (!confirm(`Revoke key '${name}'? Existing requests with it will start failing (the key is deactivated, not deleted).`)) return;
+    try {
+      await api("/admin/keys/" + revoke.dataset.revoke, { method: "DELETE" });
+      toast("Key revoked");
+      loadKeys();
+    } catch (err) { toast(err.message, true); }
+  }
+});
+
+function openKeyDialog(k) {
+  state.editing = k ? k.id : null;
+  $("#dlg-key-title").textContent = k ? "Edit key " + k.name : "New virtual key";
+  $("#k-submit").textContent = k ? "Save" : "Create";
+  $("#k-name").value = k ? k.name : "";
+  $("#k-name").disabled = !!k; // name is immutable
+  $("#k-models").value = k && k.allowed_models ? k.allowed_models.join(", ") : "";
+  $("#k-guardrails").value = k && k.disabled_guardrails ? k.disabled_guardrails.join(", ") : "";
+  $("#k-mappings").value = k && k.model_mappings
+    ? Object.entries(k.model_mappings).map(([a, b]) => a + "=" + b).join(", ") : "";
+  $("#k-default-model").value = k && k.default_model ? k.default_model : "";
+  $("#k-system-prompt").value = k && k.system_prompt ? k.system_prompt : "";
+  $("#k-prompt-vars").value = k && k.prompt_variables
+    ? Object.entries(k.prompt_variables).map(([a, b]) => a + "=" + b).join(", ") : "";
+  populatePromptRefSelect(k ? k.system_prompt_ref : null);
+  $("#k-endpoints").value = k && k.allowed_endpoints ? k.allowed_endpoints.join(", ") : "";
+  $("#k-ips").value = k && k.allowed_ips ? k.allowed_ips.join(", ") : "";
+  $("#k-rpm").value = k && k.rpm_limit != null ? k.rpm_limit : "";
+  $("#k-tpm").value = k && k.tpm_limit != null ? k.tpm_limit : "";
+  $("#k-budget").value = k && k.max_budget_usd != null ? k.max_budget_usd : "";
+  $("#k-daily").value = k && k.daily_budget_usd != null ? k.daily_budget_usd : "";
+  $("#k-monthly").value = k && k.monthly_budget_usd != null ? k.monthly_budget_usd : "";
+  $("#k-expires").value = "";
+  if (k && k.expires_at) {
+    const d = new Date(k.expires_at);
+    if (!isNaN(d)) $("#k-expires").value = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+  $("#k-active").checked = k ? k.is_active : true;
+  $("#k-active-row").style.display = k ? "grid" : "none";
+  $("#k-err").textContent = "";
+  $("#dlg-key").showModal();
+}
+
+async function submitKeyDialog() {
+  const num = (id) => { const v = $("#" + id).value.trim(); return v === "" ? null : Number(v); };
+  // "a=b, c=d" -> {a: b, c: d}; invalid pairs are reported inline
+  const mappings = {};
+  let mappingsErr = "";
+  for (const pair of $("#k-mappings").value.split(",").map(s => s.trim()).filter(Boolean)) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0 || eq === pair.length - 1) { mappingsErr = `Bad mapping "${pair}" — use name=target`; break; }
+    mappings[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+  if (mappingsErr) { $("#k-err").textContent = mappingsErr; return; }
+  // "a=b, c=d" -> {a: b, c: d}; invalid pairs are reported inline
+  const vars = {};
+  let varsErr = "";
+  for (const pair of $("#k-prompt-vars").value.split(",").map(s => s.trim()).filter(Boolean)) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0 || eq === pair.length - 1) { varsErr = `Bad variable "${pair}" — use name=value`; break; }
+    vars[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+  if (varsErr) { $("#k-err").textContent = varsErr; return; }
+  const body = {
+    allowed_models: $("#k-models").value.trim()
+      ? $("#k-models").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    disabled_guardrails: $("#k-guardrails").value.trim()
+      ? $("#k-guardrails").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    model_mappings: Object.keys(mappings).length ? mappings : null,
+    default_model: $("#k-default-model").value.trim() || null,
+    system_prompt: $("#k-system-prompt").value.trim() || null,
+    system_prompt_ref: $("#k-prompt-ref").value || null,
+    prompt_variables: Object.keys(vars).length ? vars : null,
+    allowed_endpoints: $("#k-endpoints").value.trim()
+      ? $("#k-endpoints").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    allowed_ips: $("#k-ips").value.trim()
+      ? $("#k-ips").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    rpm_limit: num("k-rpm"),
+    tpm_limit: num("k-tpm"),
+    max_budget_usd: num("k-budget"),
+    daily_budget_usd: num("k-daily"),
+    monthly_budget_usd: num("k-monthly"),
+  };
+  const exp = $("#k-expires").value;
+  if (exp) body.expires_at = new Date(exp).toISOString();
+  try {
+    if (state.editing) {
+      body.is_active = $("#k-active").checked;
+      await api("/admin/keys/" + state.editing, { method: "PATCH", body: JSON.stringify(body) });
+      toast("Key updated");
+    } else {
+      if (body.allowed_models == null) delete body.allowed_models;
+      if (body.disabled_guardrails == null) delete body.disabled_guardrails;
+      if (body.model_mappings == null) delete body.model_mappings;
+      if (body.default_model == null) delete body.default_model;
+      if (body.system_prompt == null) delete body.system_prompt;
+      if (body.system_prompt_ref == null) delete body.system_prompt_ref;
+      if (body.prompt_variables == null) delete body.prompt_variables;
+      if (body.allowed_endpoints == null) delete body.allowed_endpoints;
+      if (body.allowed_ips == null) delete body.allowed_ips;
+      if (body.rpm_limit == null) delete body.rpm_limit;
+      if (body.tpm_limit == null) delete body.tpm_limit;
+      if (body.max_budget_usd == null) delete body.max_budget_usd;
+      if (body.daily_budget_usd == null) delete body.daily_budget_usd;
+      if (body.monthly_budget_usd == null) delete body.monthly_budget_usd;
+      if (!body.expires_at) delete body.expires_at;
+      const created = await api("/admin/keys", {
+        method: "POST",
+        body: JSON.stringify(Object.assign({ name: $("#k-name").value.trim() }, body)),
+      });
+      $("#rawkey").textContent = created.key;
+      $("#dlg-rawkey").showModal();
+    }
+    $("#dlg-key").close();
+    loadKeys();
+  } catch (e) {
+    $("#k-err").textContent = e.message;
+  }
+}
+
+$("#btn-newkey").addEventListener("click", () => openKeyDialog(null));
+$("#form-key").addEventListener("submit", e => {
+  e.preventDefault();
+  if (e.submitter && e.submitter.value === "cancel") {
+    state.editing = null;
+    $("#dlg-key").close();
+    return;
+  }
+  submitKeyDialog();
+});
+
+$("#btn-copykey").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("#rawkey").textContent);
+    $("#btn-copykey").textContent = "Copied";
+    setTimeout(() => { $("#btn-copykey").textContent = "Copy"; }, 1500);
+  } catch (e) {
+    $("#copy-err").textContent = "Clipboard blocked — select the text and copy manually.";
+  }
+});
+$("#btn-closeraw").addEventListener("click", () => $("#dlg-rawkey").close());
+
+// ---------- prompt library ---------------------------------------------
+
+// The key dialog's library-prompt reference: a dropdown of library names
+// (plus "none"). Populated when the dialog opens.
+function populatePromptRefSelect(selected) {
+  const sel = $("#k-prompt-ref");
+  const render = (names, activeMap) => {
+    sel.innerHTML = '<option value="">— none (inline / global) —</option>' +
+      names.map(n => `<option value="${esc(n)}">${esc(n)}${activeMap && !activeMap[n] ? " (no active version)" : ""}</option>`).join("");
+    sel.value = selected || "";
+  };
+  // Optimistic first (the key's current value must never be lost — a
+  // dropped option would silently clear the reference on save), then
+  // enrich with the library's names once known.
+  render(selected ? [selected] : [], null);
+  api("/admin/prompts").then(r => {
+    const activeMap = Object.fromEntries((r.data || []).map(p => [p.name, !!p.active]));
+    const names = Object.keys(activeMap);
+    if (selected && !names.includes(selected)) names.push(selected);
+    render(names, activeMap);
+  }).catch(() => { /* keep the optimistic list */ });
+}
+
+async function loadPrompts() {
+  const r = await api("/admin/prompts");
+  const rows = (r.data || []).map(p => {
+    const a = p.active, c = p.candidate;
+    const open = state.openPrompt === p.name;
+    const activeCell = a
+      ? `<span class="b b-green">v${a.version}</span> <span class="muted" style="font-size:12px" title="${esc(a.body)}">${esc(a.body.slice(0, 90))}${a.body.length > 90 ? "…" : ""}</span>`
+      : '<span class="b b-red">no active version</span>';
+    const candCell = c
+      ? `<span class="b b-purple">v${c.version}</span> <span class="mono" style="font-size:11px" title="Fraction of successful serving traffic mirrored to this candidate">${Math.round(c.ab_fraction * 100)}%</span>`
+      : '<span class="muted">—</span>';
+    const main = `<tr class="logrow" data-prompt="${esc(p.name)}" style="cursor:pointer">
+      <td><b>${esc(p.name)}</b></td>
+      <td>${activeCell}</td>
+      <td>${candCell}</td>
+      <td class="num">${p.versions}</td>
+    </tr>`;
+    return main + (open ? `<tr class="detail"><td colspan="4" id="promptdetail"><div class="empty">loading…</div></td></tr>` : "");
+  }).join("");
+  $("#prompts-table").innerHTML = "<thead><tr><th>Name</th><th>Active version (serves)</th><th>A/B candidate (mirrors)</th><th class=num>Versions</th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="4" class="empty">No prompts — create one (keys reference prompts by name)</td></tr>') + "</tbody>";
+  if (state.openPrompt) await loadPromptVersions(state.openPrompt);
+}
+
+async function loadPromptVersions(name) {
+  let versions;
+  try { versions = (await api("/admin/prompts/" + encodeURIComponent(name))).data; }
+  catch (e) { state.openPrompt = null; loadPrompts(); return; }
+  const el = $("#promptdetail");
+  if (!el) return;
+  el.innerHTML = `<div style="padding:6px 2px"><table>
+    <thead><tr><th>Version</th><th>Body</th><th>Notes</th><th>State</th><th></th></tr></thead><tbody>` +
+    versions.map(v => `<tr>
+      <td class="mono">v${v.version}</td>
+      <td class="mono" style="font-size:12px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.body)}">${esc(v.body)}</td>
+      <td class="muted" style="font-size:12px">${esc(v.notes || "")}</td>
+      <td>${v.is_active ? '<span class="b b-green">active</span>' : ""}${v.is_candidate ? ` <span class="b b-purple">candidate ${Math.round(v.ab_fraction * 100)}%</span>` : ""}</td>
+      <td style="white-space:nowrap">
+        ${v.is_active ? "" : `<button class="small ghost" data-activate="${v.id}">Activate</button> `}
+        <button class="small ghost" data-candidate="${v.id}" data-on="${v.is_candidate ? 1 : 0}">${v.is_candidate ? "Stop A/B" : "A/B"}</button>
+        ${v.is_active ? "" : ` <button class="small danger" data-delversion="${v.id}">Delete</button>`}
+      </td>
+    </tr>`).join("") + "</tbody></table></div>";
+}
+
+function togglePrompt(name) {
+  state.openPrompt = state.openPrompt === name ? null : name;
+  loadPrompts();
+}
+
+$("#prompts-table").addEventListener("click", async e => {
+  const act = e.target.closest("button[data-activate]");
+  if (act) {
+    try {
+      await api("/admin/prompts/" + act.dataset.activate, { method: "PATCH", body: JSON.stringify({ activate: true }) });
+      toast("Version activated — serving switched (no restart needed)");
+      loadPrompts();
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
+  const cand = e.target.closest("button[data-candidate]");
+  if (cand) {
+    const enabling = cand.dataset.on !== "1";
+    const body = { candidate: enabling };
+    if (enabling) {
+      const f = prompt("Mirror fraction for the A/B candidate (0–1 of successful traffic):", "1");
+      if (f === null) return;
+      const n = Number(f);
+      if (isNaN(n) || n < 0 || n > 1) { toast("Fraction must be a number between 0 and 1", true); return; }
+      body.ab_fraction = n;
+    }
+    try {
+      await api("/admin/prompts/" + cand.dataset.candidate, { method: "PATCH", body: JSON.stringify(body) });
+      toast(enabling ? "A/B mirroring enabled — comparison rows appear in the request log" : "A/B mirroring stopped");
+      loadPrompts();
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
+  const del = e.target.closest("button[data-delversion]");
+  if (del) {
+    if (!confirm("Delete this prompt version? (The active version of a name cannot be deleted — activate another version first.)")) return;
+    try {
+      await api("/admin/prompts/" + del.dataset.delversion, { method: "DELETE" });
+      toast("Version deleted");
+      loadPrompts();
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
+  const row = e.target.closest("tr[data-prompt]");
+  if (row) togglePrompt(row.dataset.prompt);
+});
+
+$("#btn-newprompt").addEventListener("click", () => {
+  $("#p-name").value = state.openPrompt || "";
+  $("#p-body").value = "";
+  $("#p-notes").value = "";
+  $("#p-err").textContent = "";
+  $("#dlg-prompt").showModal();
+});
+
+$("#form-prompt").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (e.submitter && e.submitter.value === "cancel") { $("#dlg-prompt").close(); return; }
+  const body = {
+    name: $("#p-name").value.trim(),
+    body: $("#p-body").value,
+    notes: $("#p-notes").value.trim() || null,
+  };
+  if (!body.name || !body.body) { $("#p-err").textContent = "Name and body are required."; return; }
+  try {
+    const created = await api("/admin/prompts", { method: "POST", body: JSON.stringify(body) });
+    toast(created.is_active
+      ? `Version ${created.version} created and activated (first version of '${created.name}')`
+      : `Version ${created.version} appended to '${created.name}' — activate it (or A/B it) below`);
+    $("#dlg-prompt").close();
+    state.openPrompt = created.name;
+    loadPrompts();
+  } catch (err) { $("#p-err").textContent = err.message; }
+});
+
+// ---------- logs -------------------------------------------------------
+
+function logFilters() {
+  const p = new URLSearchParams({ limit: state.logs.limit, offset: state.logs.offset });
+  const add = (id, name) => { const v = $("#" + id).value.trim(); if (v) p.set(name, v); };
+  add("f-key", "key_name"); add("f-model", "model"); add("f-reqid", "request_id"); add("f-trace", "trace_id");
+  if ($("#f-status").value) p.set("status", $("#f-status").value);
+  return p;
+}
+$("#btn-filter").addEventListener("click", () => { state.logs.offset = 0; loadLogs(); });
+$("#btn-clearfilter").addEventListener("click", () => {
+  ["f-key", "f-model", "f-reqid", "f-trace", "f-status"].forEach(id => $("#" + id).value = "");
+  state.logs.offset = 0; loadLogs();
+});
+
+async function loadLogs() {
+  const r = await api("/admin/logs?" + logFilters().toString());
+  state.logs.total = r.total;
+  const from = r.total === 0 ? 0 : r.offset + 1;
+  const to = r.offset + r.data.length;
+  $("#log-pager").textContent = `${from}–${to} of ${r.total}`;
+  const prev = `<button class="small ghost" ${r.offset === 0 ? "disabled" : ""} onclick="pageLogs(-1)">&larr;</button>`;
+  const next = `<button class="small ghost" ${to >= r.total ? "disabled" : ""} onclick="pageLogs(1)">&rarr;</button>`;
+  $("#log-pager").insertAdjacentHTML("afterbegin", prev + " ");
+  $("#log-pager").insertAdjacentHTML("beforeend", " " + next);
+
+  const rows = r.data.map(l => {
+    const st = l.status === "success" ? "b-green" : l.status === "blocked" ? "b-amber" : "b-red";
+    const open = state.openLog === l.id;
+    return `<tr class="logrow" onclick="toggleLog(${l.id})" style="cursor:pointer">
+      <td class="muted" style="font-size:12px;white-space:nowrap">${fmtWhen(l.created_at)}</td>
+      <td>${esc(l.key_name || "—")}</td>
+      <td class="mono">${esc(l.model || "—")}${l.cache_hit ? ' <span class="b b-blue">cached</span>' : ""}${l.stream ? ' <span class="b b-gray">stream</span>' : ""}${l.shadow ? ' <span class="b b-purple">shadow</span>' : ""}${l.prompt_variant ? ` <span class="b b-purple" title="Prompt A/B mirror — this row tested a candidate library prompt version (never client-facing, excluded from stats and spend)">${esc(l.prompt_variant)}</span>` : ""}</td>
+      <td class="mono muted" style="font-size:12px">${esc(l.deployment || l.provider || "—")}</td>
+      <td><span class="b ${st}">${esc(l.status)}</span></td>
+      <td class="num">${l.prompt_tokens == null ? "—" : fmtInt(l.prompt_tokens) + " / " + fmtInt(l.completion_tokens)}</td>
+      <td class="num">${fmtUsd(l.cost_usd)}</td>
+      <td class="num">${fmtMs(l.latency_ms)}</td>
+    </tr>` + (open ? `<tr class="detail"><td colspan="8" id="logdetail-${l.id}"><div class="empty">loading…</div></td></tr>` : "");
+  }).join("");
+  $("#logs-table").innerHTML = "<thead><tr><th>When</th><th>Key</th><th>Model</th><th>Deployment</th><th>Status</th><th class=num>Tokens</th><th class=num>Cost</th><th class=num>Latency</th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="8" class="empty">No requests match</td></tr>') + "</tbody>";
+}
+function pageLogs(dir) {
+  const next = state.logs.offset + dir * state.logs.limit;
+  if (next < 0) return;
+  state.logs.offset = next;
+  loadLogs();
+}
+
+async function toggleLog(id) {
+  state.openLog = state.openLog === id ? null : id;
+  await loadLogs();
+  if (state.openLog == null) return;
+  const cell = $("#logdetail-" + id);
+  if (!cell) return;
+  try {
+    const l = await api("/admin/logs/" + id);
+    const actions = (l.guardrail_actions || []).map(a =>
+      `<div><span class="b ${a.action === "block" ? "b-red" : a.action === "modify" ? "b-amber" : "b-green"}">${esc(a.action)}</span> ` +
+      `<b>${esc(a.guardrail)}</b> <span class="muted">(${esc(a.phase)}${a.mode ? ", " + esc(a.mode) : ""})</span>` +
+      (a.reason ? `<div class="muted" style="margin:2px 0 6px">${esc(a.reason)}</div>` : "") + "</div>"
+    ).join("") || '<span class="muted">none</span>';
+    const j = v => esc(JSON.stringify(v ?? null, null, 2));
+    cell.innerHTML = `
+      <div class="detailgrid">
+        <div>
+          <h4>Request body</h4><pre class="json">${j(l.request_body)}</pre>
+        </div>
+        <div>
+          <h4>Response body</h4><pre class="json">${j(l.response_body)}</pre>
+          <h4 style="margin-top:12px">Guardrail actions</h4>${actions}
+        </div>
+      </div>
+      <div class="kv" style="margin-top:12px">
+        <span>request id</span><span class="mono">${esc(l.request_id)}</span>
+        <span>trace / span</span><span class="mono">${esc(l.trace_id || "—")} / ${esc(l.span_id || "—")}</span>
+        <span>error</span><span>${esc(l.error_message || "—")}</span>
+      </div>`;
+  } catch (e) {
+    cell.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- routing ----------------------------------------------------
+
+const BREAKER_BADGE = { closed: "b-green", half_open: "b-amber", open: "b-red" };
+
+async function loadRouting() {
+  const r = await api("/admin/routing");
+  const cb = r.circuit_breaker || {};
+  let html = "<thead><tr><th>Deployment</th><th>Provider</th><th>Native model</th><th class=num>Priority</th><th class=num>Weight</th><th>Circuit</th><th></th></tr></thead><tbody>";
+  for (const m of r.models || []) {
+    html += `<tr class="modelgroup"><td colspan="7">${esc(m.name)}</td></tr>`;
+    for (const d of m.deployments || []) {
+      const b = d.breaker;
+      let circuit = '<span class="muted">off</span>', reset = "";
+      if (b && cb.enabled) {
+        circuit = `<span class="b ${BREAKER_BADGE[b.state] || "b-gray"}">${esc(b.state)}</span>` +
+          `<span class="muted" style="font-size:12px"> ${b.consecutive_failures} fail · ${b.opened_count} trips` +
+          (b.state === "open" ? ` · ${b.cooldown_remaining_seconds}s left` : "") + "</span>";
+        if (b.state !== "closed") {
+          reset = `<button class="small ghost" data-reset="${esc(d.name)}">Reset circuit</button>`;
+        }
+      }
+      const frac = Math.round((d.shadow_fraction ?? 1) * 100);
+      const shadowBadge = d.shadow
+        ? ` <span class="b b-purple" title="Shadow deployment: never serves clients; a mirrored copy of ${frac}% of successful requests is sent here for comparison">shadow ${frac}%</span>`
+        : "";
+      html += `<tr>
+        <td class="mono">${esc(d.name)}${shadowBadge}</td>
+        <td>${esc(d.provider)}</td>
+        <td class="mono muted">${esc(d.model)}</td>
+        <td class="num">${d.priority}</td>
+        <td class="num">${d.weight}</td>
+        <td>${circuit}</td>
+        <td>${reset}</td></tr>`;
+    }
+  }
+  $("#routing-table").innerHTML = html + "</tbody>";
+}
+$("#routing-table").addEventListener("click", async e => {
+  const btn = e.target.closest("button[data-reset]");
+  if (!btn) return;
+  const name = btn.dataset.reset;
+  if (!confirm(`Force-close the circuit for '${name}'? The next request probes the deployment again.`)) return;
+  try {
+    await api(`/admin/routing/breakers/${name}/reset`, { method: "POST" });
+    toast(`Circuit reset for ${name}`);
+    loadRouting();
+  } catch (err) { toast(err.message, true); }
+});
+
+// ---------- system -----------------------------------------------------
+
+async function loadSystem() {
+  // Health: /healthz (liveness) + /readyz (readiness). Neither requires
+  // auth; both are what orchestrators scrape.
+  let healthHtml = "Loading…";
+  try {
+    const [live, ready] = await Promise.all([
+      fetch("/healthz").then(r => r.json()),
+      fetch("/readyz").then(r => r.json().then(b => ({ status: r.status, body: b }))),
+    ]);
+    const up = fmtInt(Math.floor(live.uptime_seconds / 60));
+    healthHtml =
+      `<span class="b b-green">live</span> v${esc(live.version)} · up ${up} min · ` +
+      (ready.status === 200
+        ? `<span class="b b-green">ready</span>`
+        : `<span class="b b-red">not ready</span> (draining: ${ready.body.draining ? "yes" : "no"}, db: ${ready.body.db ? "ok" : "down"})`) +
+      ` · circuit breakers: ${fmtInt(ready.body.circuit_breakers?.open)} open / ${fmtInt(ready.body.circuit_breakers?.half_open)} half-open`;
+  } catch (e) {
+    healthHtml = `<span class="b b-red">unreachable</span>`;
+  }
+  $("#system-health").innerHTML = healthHtml;
+  $("#system-config-path").textContent = "config.yaml is re-read on reload (POST /admin/reload or SIGHUP)";
+  await refreshBackups();
+}
+
+async function refreshBackups() {
+  const r = await api("/admin/backups");
+  const rows = (r.data || []).map(b => `<tr>
+    <td class="mono">${esc(b.name)}</td>
+    <td>${fmtInt(b.size_bytes)} bytes</td>
+    <td class="muted">${esc(fmtWhen(b.created_at))}</td>
+    <td><button class="ghost small" data-del-backup="${esc(b.name)}" title="Delete this backup">delete</button></td>
+  </tr>`).join("");
+  $("#backups-table").innerHTML = "<thead><tr><th>Backup</th><th>Size</th><th>Created</th><th></th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="4" class="empty">No backups yet</td></tr>') + "</tbody>";
+}
+
+async function reloadConfig() {
+  const btn = $("#btn-reload");
+  btn.disabled = true;
+  try {
+    const summary = await api("/admin/reload", { method: "POST" });
+    const rr = $("#system-reload-result");
+    rr.innerHTML =
+      `Reloaded from <span class="mono">${esc(summary.config_path)}</span> — ` +
+      `${fmtInt(summary.models?.length)} model(s), ${fmtInt(summary.guardrails?.length)} guardrail(s)` +
+      (summary.restart_required?.length
+        ? ` · <span class="b b-amber">restart required for: ${esc(summary.restart_required.join(", "))}</span>`
+        : "");
+    toast("Configuration reloaded");
+    // Guardrails / routing tabs read the new config on their next render.
+    await loadSystem();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function createBackup() {
+  const btn = $("#btn-backup");
+  btn.disabled = true;
+  try {
+    const b = await api("/admin/backup", { method: "POST" });
+    toast(`Backup created: ${b.name} (${fmtInt(b.size_bytes)} bytes)`);
+    await refreshBackups();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------- guardrails -------------------------------------------------
+
+async function loadGuardrails() {
+  const r = await api("/admin/guardrails");
+  const rows = (r.guardrails || []).map(g => {
+    // Compact route scoping: which inbound formats this guardrail runs on
+    // (details keep the full scope JSON).
+    let routeBits = "";
+    if (g.scope && g.scope.routes) routeBits = ` ⇢ ${g.scope.routes.map(esc).join(", ")}`;
+    else if (g.scope && g.scope.exclude_routes) routeBits = ` ⇢ all except ${g.scope.exclude_routes.map(esc).join(", ")}`;
+    return `<tr>
+    <td><b>${esc(g.name)}</b></td>
+    <td><span class="b ${g.mode === "observe" ? "b-purple" : "b-blue"}">${esc(g.mode || "enforce")}</span></td>
+    <td>${g.scope ? `<details><summary class="muted" style="cursor:pointer">scoped</summary>
+        <pre class="json" style="max-height:180px">${esc(JSON.stringify(g.scope, null, 2))}</pre></details>${routeBits}`
+      : '<span class="b b-green">all keys / models</span>'}</td>
+    <td class="muted">${esc(g.description || "")}</td>
+    <td><details><summary class="muted" style="cursor:pointer">params</summary>
+        <pre class="json" style="max-height:180px">${esc(JSON.stringify(g.params ?? {}, null, 2))}</pre></details></td>
+  </tr>`;
+  }).join("");
+  $("#guardrails-table").innerHTML = "<thead><tr><th>Guardrail</th><th>Mode</th><th>Scope</th><th>Description</th><th>Params</th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="5" class="empty">No guardrails registered</td></tr>') + "</tbody>";
+}
+
+// ---------- boot -------------------------------------------------------
+
+if (state.key) {
+  $("#login").style.display = "none";
+  $("#authbox").style.display = "flex";
+  refresh();
+} else {
+  $("#login-key").focus();
+}
+</script>
+</body>
+</html>
