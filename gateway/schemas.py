@@ -84,6 +84,13 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Any | None = None
     response_format: dict[str, Any] | None = None
     seed: int | None = None
+    # Audio-output chat (gpt-4o-audio style): which output modalities the
+    # client wants, and the voice/format to synthesize with. Declared so
+    # adapters can act on them (Gemini translates to responseModalities
+    # + speechConfig; Anthropic refuses); they ride to OpenAI/Azure
+    # verbatim like every other field.
+    modalities: list[str] | None = None
+    audio: dict[str, Any] | None = None
 
     # Original Responses-API body when the request arrived via
     # POST /v1/responses (None otherwise), plus the messages snapshot at

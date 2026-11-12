@@ -291,6 +291,12 @@ def _content_blocks(message: dict) -> list[dict]:
                 url = (part.get("image_url") or {}).get("url", "")
                 mime = url[5:].split(";")[0] if url.startswith("data:") else "image/png"
                 blocks.append({"type": "text", "text": f"[generated image: {mime}]"})
+    # Audio-output chat: Anthropic assistant messages cannot carry audio,
+    # so the transcript renders as the text block — it is exactly what the
+    # model said (the sound itself has no Anthropic representation).
+    audio = message.get("audio")
+    if isinstance(audio, dict) and audio.get("transcript"):
+        blocks.append({"type": "text", "text": str(audio["transcript"])})
     for tc in message.get("tool_calls") or []:
         function = tc.get("function") or {}
         try:

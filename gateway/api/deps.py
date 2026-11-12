@@ -34,6 +34,8 @@ def required_scope(path: str) -> str | None:
     if path.startswith("/v1/audio/"):
         return "audio"
     last = path.rsplit("/", 1)[-1]
+    if last.endswith(":embedContent") or last.endswith(":batchEmbedContents"):
+        return "embeddings"  # Gemini-native embeddings (not chat, despite :method path)
     if path == "/v1/models" or (path.startswith("/v1/models/") and ":" not in last):
         return "models"  # OpenAI model objects (not Gemini's /v1/models/x:generate)
     if path.startswith("/v1/") or path.startswith("/v1beta/"):

@@ -382,6 +382,12 @@ def render_response(completion: dict, echo: dict | None = None) -> dict:
                 f"fc_{uuid.uuid4().hex[:24]}",
             )
         )
+    # Audio-output chat behind the bridge: the Responses format has no
+    # audio output item, so the transcript renders as output_text (it is
+    # exactly what the model said; the sound itself has no representation).
+    audio_transcript = (message.get("audio") or {}).get("transcript")
+    if not output and isinstance(audio_transcript, str) and audio_transcript:
+        output.append(_message_item(audio_transcript, f"msg_{uuid.uuid4().hex[:24]}"))
     if not output:
         output.append(_message_item("", f"msg_{uuid.uuid4().hex[:24]}"))
 

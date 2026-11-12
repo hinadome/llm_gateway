@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...schemas import ChatCompletionRequest
-from ...utils import content_to_text
+from ...utils import assistant_text, content_to_text
 from ..base import Guardrail, GuardrailResult
 
 DEFAULT_CATEGORIES: dict[str, list[str]] = {
@@ -57,8 +57,7 @@ class OutputModerationGuardrail(Guardrail):
         self, request: ChatCompletionRequest, response: dict[str, Any], ctx
     ) -> GuardrailResult | None:
         for choice in response.get("choices", []):
-            content = (choice.get("message") or {}).get("content")
-            hit = self._match(content_to_text(content))
+            hit = self._match(assistant_text(choice.get("message") or {}))
             if hit:
                 category, term = hit
                 return GuardrailResult.block(

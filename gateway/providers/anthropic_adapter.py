@@ -95,6 +95,24 @@ def translate_request(request: ChatCompletionRequest, native_model: str) -> dict
             fallback=True,
         )
 
+    # Anthropic has no audio output either. Silently dropping the
+    # modality would let the request "succeed" while the client waits for
+    # audio that never comes — refuse loudly (fallback=True lets the
+    # router move on to a deployment whose provider can synthesize it).
+    if request.modalities and "audio" in request.modalities:
+        raise ProviderError(
+            400,
+            "The Anthropic provider does not support audio output "
+            "(modalities: [\"audio\"]); the Messages API returns text "
+            "only. Route audio-output models to an OpenAI or Gemini "
+            "deployment.",
+            "invalid_request_error",
+            code="audio_output_not_supported",
+            param="modalities",
+            provider="anthropic",
+            fallback=True,
+        )
+
     # Anthropic has no JSON mode. Silently dropping response_format would let
     # the request "succeed" while the model is free to answer in prose, which
     # breaks structured-output consumers downstream — so refuse loudly

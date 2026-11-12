@@ -66,6 +66,10 @@ def test_required_scope_mapping():
     assert required_scope("/v1/models/test-model") == "models"
     # embeddings
     assert required_scope("/v1/embeddings") == "embeddings"
+    # Gemini-native embeddings (the :method shape is not chat)
+    assert required_scope("/v1/models/test-model:embedContent") == "embeddings"
+    assert required_scope("/v1beta/models/test-model:embedContent") == "embeddings"
+    assert required_scope("/v1/models/test-model:batchEmbedContents") == "embeddings"
     # everything else is the admin plane / metrics / docs — unscoped here
     assert required_scope("/admin/keys") is None
     assert required_scope("/metrics") is None
@@ -132,6 +136,22 @@ async def test_chat_only_scope_blocks_embeddings_and_models(tmp_path):
         )
         assert denied.status_code == 403
         assert denied.json()["error"]["code"] == "endpoint_not_allowed"
+        # The Gemini-native embeddings endpoints are embeddings-scoped too
+        # (despite the :method path shape that otherwise means chat).
+        assert (
+            await env.client.post(
+                "/v1/models/test-model:embedContent",
+                json={"content": {"parts": [{"text": "hi"}]}},
+                headers=headers,
+            )
+        ).status_code == 403
+        assert (
+            await env.client.post(
+                "/v1beta/models/test-model:batchEmbedContents",
+                json={"requests": [{"content": {"parts": [{"text": "hi"}]}}]},
+                headers=headers,
+            )
+        ).status_code == 403
         assert (
             await env.client.get("/v1/models", headers=headers)
         ).status_code == 403
@@ -148,6 +168,21 @@ async def test_embeddings_and_models_scope(tmp_path):
         assert (
             await env.client.post(
                 "/v1/embeddings", json=embeddings_body(), headers=headers
+            )
+        ).status_code == 200
+        # Gemini-native embeddings share the embeddings scope.
+        assert (
+            await env.client.post(
+                "/v1/models/test-model:embedContent",
+                json={"content": {"parts": [{"text": "hi"}]}},
+                headers=headers,
+            )
+        ).status_code == 200
+        assert (
+            await env.client.post(
+                "/v1beta/models/test-model:batchEmbedContents",
+                json={"requests": [{"content": {"parts": [{"text": "hi"}]}}]},
+                headers=headers,
             )
         ).status_code == 200
         assert (await env.client.get("/v1/models", headers=headers)).status_code == 200

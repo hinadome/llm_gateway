@@ -599,13 +599,13 @@ def test_voice_map_covers_every_openai_voice():
     """The mapping is total over OpenAI's voice set and injective — every
     OpenAI voice has a distinct Gemini counterpart; everything else
     (Gemini's full prebuilt set) passes through by name."""
-    from gateway.providers.gemini_adapter import GeminiProviderAdapter
+    from gateway.providers import gemini_adapter
 
     openai_voices = {
         "alloy", "ash", "ballad", "coral", "echo", "fable",
         "nova", "onyx", "sage", "shimmer", "verse",
     }
-    voice_map = GeminiProviderAdapter._VOICE_MAP
+    voice_map = gemini_adapter._VOICE_MAP
     assert set(voice_map) == openai_voices
     assert len(set(voice_map.values())) == len(voice_map)  # distinct targets
     # ...and the targets are real Gemini prebuilt voices.

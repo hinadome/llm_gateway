@@ -14,6 +14,7 @@ Auth follows Gemini conventions: ``x-goog-api-key: <key>`` or
 
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 from typing import Annotated, Any, AsyncIterator
@@ -25,7 +26,7 @@ from starlette.responses import Response
 
 from ..core.context import AuthContext
 from ..errors import GatewayError
-from ..schemas import ChatCompletionRequest, Message, Tool, ToolFunction
+from ..schemas import ChatCompletionRequest, EmbeddingRequest, Message, Tool, ToolFunction
 from ..utils import audio_format_for_mime as _audio_format, content_to_text
 from .anthropic_native import openai_sse_payloads, passthrough_headers
 from .deps import require_api_key
@@ -229,6 +230,22 @@ def parse_request(model: str, body: dict, stream: bool) -> ChatCompletionRequest
         else None
     )
 
+    # Native audio dialog (gemini-2.5-*-native-audio): responseModalities
+    # [.., AUDIO] + optional speechConfig -> the OpenAI audio-output shape
+    # (modalities + audio.voice), which every southbound adapter acts on.
+    modalities: list[str] | None = None
+    audio: dict[str, Any] | None = None
+    if "AUDIO" in (gen_config.get("responseModalities") or []):
+        modalities = ["text", "audio"]
+        voice_name = (
+            (
+                ((gen_config.get("speechConfig") or {}).get("voiceConfig") or {})
+                .get("prebuiltVoiceConfig") or {}
+            ).get("voiceName")
+        )
+        if voice_name:
+            audio = {"voice": str(voice_name)}
+
     try:
         return ChatCompletionRequest(
             model=model,
@@ -243,6 +260,8 @@ def parse_request(model: str, body: dict, stream: bool) -> ChatCompletionRequest
             tools=tools,
             tool_choice=tool_choice,
             response_format=response_format,
+            modalities=modalities,
+            audio=audio,
         )
     except ValidationError as exc:
         raise GatewayError(400, f"Invalid request: {exc.errors()[0]['msg']}", "invalid_request_error") from exc
@@ -272,6 +291,26 @@ def _candidate_parts(message: dict) -> list[dict]:
                     header, _, data = url.partition(",")
                     mime = header[5:].split(";")[0] or "image/png"
                     parts.append({"inlineData": {"mimeType": mime, "data": data}})
+    # Audio-output chat: the words ride in message.audio.transcript and
+    # the sound in message.audio.data (WAV, or raw pcm16). Render both —
+    # the native shape is a text part + an inlineData part. WAV is
+    # self-describing (RIFF magic); raw PCM is 24 kHz 16-bit mono.
+    audio = message.get("audio")
+    if isinstance(audio, dict):
+        if audio.get("transcript"):
+            parts.append({"text": str(audio["transcript"])})
+        if audio.get("data"):
+            data = str(audio["data"])
+            try:
+                raw = base64.b64decode(data)
+            except Exception:
+                raw = None
+            mime = (
+                "audio/wav"
+                if raw is None or raw.startswith(b"RIFF")
+                else "audio/L16;rate=24000"
+            )
+            parts.append({"inlineData": {"mimeType": mime, "data": data}})
     for tc in message.get("tool_calls") or []:
         function = tc.get("function") or {}
         try:
@@ -465,3 +504,167 @@ async def stream_generate_content(
     # The gateway always answers with SSE (what the google SDKs request via
     # alt=sse); the JSON-array streaming variant is not offered.
     return await _handle(raw_request, auth, model, stream=True)
+
+
+# --------------------------------------------------------------------------
+# Embeddings: Gemini-native inbound (:embedContent / :batchEmbedContents)
+# --------------------------------------------------------------------------
+
+
+def _embed_text(content: Any, where: str) -> str:
+    """Gemini ``content`` object -> the text to embed."""
+    parts = content.get("parts") if isinstance(content, dict) else None
+    texts = [
+        str(p["text"])
+        for p in parts or []
+        if isinstance(p, dict) and p.get("text") is not None
+    ]
+    if not texts:
+        raise GatewayError(
+            400,
+            f"Invalid {where}: must be an object with parts including text.",
+            "invalid_request_error",
+        )
+    return "\n".join(texts)
+
+
+def _reject_quality_fields(request: dict, where: str) -> None:
+    """taskType/title change how the model embeds text — refuse, not drop."""
+    for field in ("taskType", "title"):
+        if request.get(field) is not None:
+            raise GatewayError(
+                400,
+                f"Invalid {where}: '{field}' is not supported. taskType and title "
+                "change embedding quality (a RETRIEVAL_DOCUMENT embedding differs "
+                "from the default), so silently dropping them would return "
+                "wrong embeddings — call the provider directly if you need them.",
+                "invalid_request_error",
+            )
+
+
+def _dims_of(request: dict, where: str) -> int | None:
+    dims = request.get("outputDimensionality")
+    if dims is None:
+        return None
+    if not isinstance(dims, int) or isinstance(dims, bool):
+        raise GatewayError(
+            400,
+            f"Invalid {where}: outputDimensionality must be an integer.",
+            "invalid_request_error",
+        )
+    return dims
+
+
+def parse_embedding_request(model: str, body: dict, batch: bool) -> EmbeddingRequest:
+    """Gemini :embedContent / :batchEmbedContents body -> internal
+    EmbeddingRequest (the OpenAI shape all southbound adapters speak)."""
+    if not batch:
+        _reject_quality_fields(body, "request")
+        return EmbeddingRequest(
+            model=model,
+            input=_embed_text(body.get("content"), "content"),
+            dimensions=_dims_of(body, "request"),
+        )
+
+    requests = body.get("requests")
+    if not isinstance(requests, list) or not requests:
+        raise GatewayError(
+            400,
+            "Invalid request: 'requests' is required and must be a non-empty list.",
+            "invalid_request_error",
+        )
+    inputs: list[str] = []
+    first_model: str | None = None
+    first_dims: int | None = None
+    for i, sub in enumerate(requests):
+        if not isinstance(sub, dict):
+            raise GatewayError(
+                400,
+                f"Invalid request: requests[{i}] must be an object.",
+                "invalid_request_error",
+            )
+        _reject_quality_fields(sub, f"requests[{i}]")
+        inputs.append(_embed_text(sub.get("content"), f"requests[{i}].content"))
+        dims = _dims_of(sub, f"requests[{i}]")
+        if dims is not None:
+            if first_dims is None:
+                first_dims = dims
+            elif dims != first_dims:
+                raise GatewayError(
+                    400,
+                    f"Invalid request: requests[{i}].outputDimensionality ({dims}) "
+                    f"does not match the first request's ({first_dims}); the "
+                    "gateway applies one dimensionality to the whole batch.",
+                    "invalid_request_error",
+                )
+        sub_model = sub.get("model")
+        if sub_model is not None:
+            if first_model is None:
+                first_model = str(sub_model)
+            elif str(sub_model) != first_model:
+                # The gateway routes the whole batch to one deployment (the
+                # URL model's) — mixed models cannot be honored.
+                raise GatewayError(
+                    400,
+                    f"Invalid request: requests[{i}].model ({sub_model!r}) does not "
+                    f"match the first request's ({first_model!r}); the gateway "
+                    "routes the whole batch to one deployment (the URL model's).",
+                    "invalid_request_error",
+                )
+    return EmbeddingRequest(model=model, input=inputs, dimensions=first_dims)
+
+
+def render_embedding_response(response: Response, batch: bool) -> Response:
+    """Re-frame the pipeline's OpenAI embeddings response as Gemini shape
+    (:embedContent -> {embedding}, :batchEmbedContents -> {embeddings})."""
+    body = json.loads(response.body)
+    data = sorted(body.get("data") or [], key=lambda d: d.get("index") or 0)
+    if batch:
+        content = {
+            "embeddings": [{"values": item.get("embedding") or []} for item in data]
+        }
+    else:
+        first = data[0] if data else {}
+        content = {"embedding": {"values": first.get("embedding") or []}}
+    return JSONResponse(
+        content=content,
+        headers=passthrough_headers(response),
+        status_code=response.status_code,
+    )
+
+
+async def _handle_embedding(
+    raw_request: Request, auth: AuthContext, model: str, batch: bool
+) -> Response:
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        raise GatewayError(400, "Invalid request: body must be valid JSON.", "invalid_request_error")
+    if not isinstance(body, dict):
+        raise GatewayError(400, "Invalid request: expected a JSON object.", "invalid_request_error")
+
+    internal = parse_embedding_request(model, body, batch)
+    pipeline = raw_request.app.state.pipeline
+    request_id = getattr(raw_request.state, "request_id", None)
+    response = await pipeline.handle_embedding(internal, auth, request_id=request_id)
+    return render_embedding_response(response, batch)
+
+
+@router.post("/v1/models/{model}:embedContent")
+@router.post("/v1beta/models/{model}:embedContent")
+async def embed_content(
+    model: str,
+    raw_request: Request,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
+) -> Response:
+    return await _handle_embedding(raw_request, auth, model, batch=False)
+
+
+@router.post("/v1/models/{model}:batchEmbedContents")
+@router.post("/v1beta/models/{model}:batchEmbedContents")
+async def batch_embed_contents(
+    model: str,
+    raw_request: Request,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
+) -> Response:
+    return await _handle_embedding(raw_request, auth, model, batch=True)

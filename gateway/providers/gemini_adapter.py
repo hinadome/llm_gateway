@@ -88,6 +88,24 @@ def _is_image_model(native_model: str) -> bool:
     return "image" in native_model.lower()
 
 
+# OpenAI voice names -> Gemini prebuilt voices. Approximate, deterministic
+# pairing (there is no official mapping); unknown names pass through, so
+# Gemini-native voice names (Kore, Puck, ...) work directly.
+_VOICE_MAP = {
+    "alloy": "Kore",
+    "ash": "Puck",
+    "ballad": "Charon",
+    "coral": "Aoede",
+    "echo": "Fenrir",
+    "fable": "Leda",
+    "nova": "Zephyr",
+    "onyx": "Orus",
+    "sage": "Algieba",
+    "shimmer": "Enceladus",
+    "verse": "Iapetus",
+}
+
+
 def _translate_user_content(content: Any) -> list[dict]:
     if isinstance(content, str):
         return [{"text": content}]
@@ -214,8 +232,20 @@ def translate_request(request: ChatCompletionRequest, native_model: str) -> dict
 
     # Chat with an image-generating model (image-to-image): those models
     # need TEXT+IMAGE response modalities to emit inline images, which the
-    # gateway translates back to image_url content parts.
-    if _is_image_model(native_model):
+    # gateway translates back to image_url content parts. An explicit
+    # audio-output request (modalities: ["audio"] — gpt-4o-audio style)
+    # takes precedence over the heuristic.
+    if request.modalities and "audio" in request.modalities:
+        audio_out = body.setdefault("generationConfig", {})
+        audio_out["responseModalities"] = ["TEXT", "AUDIO"]
+        voice = (request.audio or {}).get("voice")
+        if voice:
+            audio_out["speechConfig"] = {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": _VOICE_MAP.get(voice, voice)}
+                }
+            }
+    elif _is_image_model(native_model):
         body.setdefault("generationConfig", {})["responseModalities"] = ["TEXT", "IMAGE"]
 
     if request.tools:
@@ -245,14 +275,20 @@ def translate_request(request: ChatCompletionRequest, native_model: str) -> dict
     return body
 
 
-def translate_response(native: dict, public_model: str) -> dict:
-    """Gemini generateContent response -> OpenAI chat.completion dict."""
+def translate_response(native: dict, public_model: str, audio_format: str = "wav") -> dict:
+    """Gemini generateContent response -> OpenAI chat.completion dict.
+
+    ``audio_format`` selects how an audio-output (native-audio-dialog)
+    response's raw PCM is served: WAV-wrapped (OpenAI's default) or raw
+    (``pcm16``).
+    """
     candidates = native.get("candidates") or [{}]
     candidate = candidates[0] or {}
     parts = (candidate.get("content") or {}).get("parts") or []
 
     text_parts: list[str] = []
     image_parts: list[dict] = []
+    audio_data: tuple[str, str] | None = None  # (mimeType, base64)
     tool_calls: list[dict] = []
     for part in parts:
         if "text" in part:
@@ -271,6 +307,8 @@ def translate_response(native: dict, public_model: str) -> dict:
                         "image_url": {"url": f"data:{mime};base64,{inline['data']}"},
                     }
                 )
+            elif mime.startswith("audio/") and audio_data is None:
+                audio_data = (mime, str(inline["data"]))
         if "functionCall" in part:
             fc = part["functionCall"]
             tool_calls.append(
@@ -285,14 +323,39 @@ def translate_response(native: dict, public_model: str) -> dict:
             )
 
     text = "".join(text_parts)
-    if image_parts:
+    if audio_data is not None:
+        # Audio-output chat (native audio dialog): the text parts ARE the
+        # spoken words, so they live in message.audio.transcript and
+        # content stays null — OpenAI's audio-response shape.
+        content_out: Any = None
+    elif image_parts:
         # Mixed text + image output (or images only) -> content-parts list.
-        content_out: Any = ([{"type": "text", "text": text}] if text else []) + image_parts
+        content_out = ([{"type": "text", "text": text}] if text else []) + image_parts
     else:
         content_out = text if text else None
     message: dict[str, Any] = {"role": "assistant", "content": content_out}
     if tool_calls:
         message["tool_calls"] = tool_calls
+    if audio_data is not None:
+        # Audio-output chat (native audio dialog): the words live in the
+        # text parts and the sound in one inlineData audio part — repackage
+        # as OpenAI's message.audio. Raw PCM is WAV-wrapped for wav (the
+        # default) and served raw for pcm16.
+        mime, data = audio_data
+        if audio_format not in ("pcm16", "pcm"):
+            try:
+                pcm = base64.b64decode(data)
+                data = base64.b64encode(
+                    _pcm_to_wav(pcm, _pcm_rate(mime) or 24000)
+                ).decode()
+            except Exception:
+                pass  # not decodable PCM — serve the bytes as they came
+        message["audio"] = {
+            "id": f"audio_{uuid.uuid4().hex[:24]}",
+            "data": data,
+            "expires_at": None,
+            "transcript": text,
+        }
 
     usage_meta = native.get("usageMetadata") or {}
     prompt_tokens = usage_meta.get("promptTokenCount", 0)
@@ -432,7 +495,8 @@ class GeminiProviderAdapter(ProviderAdapter):
             timeout,
             self.name,
         )
-        return translate_response(data, request.model)
+        audio_format = str((request.audio or {}).get("format") or "wav")
+        return translate_response(data, request.model, audio_format)
 
     async def generate_image(
         self,
@@ -528,23 +592,6 @@ class GeminiProviderAdapter(ProviderAdapter):
             )
         return images
 
-    # OpenAI voice names -> Gemini prebuilt voices. Approximate, deterministic
-    # pairing (there is no official mapping); unknown names pass through, so
-    # Gemini-native voice names (Kore, Puck, ...) work directly.
-    _VOICE_MAP = {
-        "alloy": "Kore",
-        "ash": "Puck",
-        "ballad": "Charon",
-        "coral": "Aoede",
-        "echo": "Fenrir",
-        "fable": "Leda",
-        "nova": "Zephyr",
-        "onyx": "Orus",
-        "sage": "Algieba",
-        "shimmer": "Enceladus",
-        "verse": "Iapetus",
-    }
-
     async def speak(
         self,
         deployment: DeploymentConfig,
@@ -563,7 +610,7 @@ class GeminiProviderAdapter(ProviderAdapter):
         """
         url = self._url(provider_cfg.api_base, deployment.model, stream=False)
         headers = self._headers(provider_cfg.resolve_key())
-        voice = self._VOICE_MAP.get(request.voice, request.voice)
+        voice = _VOICE_MAP.get(request.voice, request.voice)
         body = {
             "contents": [{"parts": [{"text": request.input}]}],
             "generationConfig": {
@@ -672,6 +719,23 @@ class GeminiProviderAdapter(ProviderAdapter):
         provider_cfg: ProviderConfig,
         timeout: httpx.Timeout,
     ) -> AsyncIterator[dict]:
+        # Audio-output requests: Gemini's native-audio dialog streams
+        # raw PCM inlineData, which has no OpenAI chunk-delta
+        # representation without re-framing WAV headers mid-stream —
+        # refuse rather than silently dropping the audio from the stream
+        # (retry with stream: false, where message.audio carries it).
+        if request.modalities and "audio" in request.modalities:
+            raise ProviderError(
+                400,
+                "Streaming is not supported for audio-output chat on Gemini "
+                f"deployments (deployment '{deployment.name}'); retry with "
+                "stream: false to receive the audio in message.audio.",
+                "invalid_request_error",
+                code="audio_streaming_not_supported",
+                param="stream",
+                provider=self.name,
+                fallback=True,
+            )
         # Image-generating chat models stream their text but the image
         # arrives as one opaque inlineData part that has no OpenAI
         # chunk-delta representation — refuse rather than silently

@@ -46,6 +46,16 @@ STREAM_TEXT = (
     "data: [DONE]\n\n"
 )
 
+# Audio-output chat streams (modalities: ["..", "audio"]): one delta.audio
+# chunk carrying the audio data + partial transcript, one transcript-only
+# chunk, then the finish — mirroring STREAM_TEXT's shape ("spoken words").
+AUDIO_STREAM_TEXT = (
+    'data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"model-a","choices":[{"index":0,"delta":{"role":"assistant","audio":{"id":"audio-mock","data":"QUJDREVG","expires_at":null,"transcript":"spoken "}},"finish_reason":null}]}\n\n'
+    'data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"model-a","choices":[{"index":0,"delta":{"audio":{"transcript":"words"}},"finish_reason":null}]}\n\n'
+    'data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"model-a","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    "data: [DONE]\n\n"
+)
+
 # Responses-API native streams (native_responses deployments): text and
 # tool-call variants, mirroring the chat stream's "Hel"+"lo!" deltas and
 # 5/2/7 usage so assertions stay parallel across both southbound paths.
@@ -153,6 +163,8 @@ class MockUpstream:
         # Optional override for the SSE body streamed back (tests set this
         # to exercise boundary-spanning content across chunk edges).
         self.stream_text: str | None = None
+        # Optional override for the audio-output SSE body (delta.audio).
+        self.audio_stream_text: str | None = None
 
     @staticmethod
     def _embedding_response(body: dict) -> dict:
@@ -397,7 +409,8 @@ class MockUpstream:
         if ":generateContent" in path and "AUDIO" in (
             (body.get("generationConfig") or {}).get("responseModalities") or []
         ):
-            # Gemini TTS: inline PCM audio (16-bit samples).
+            # Gemini TTS + native-audio chat: inline PCM audio (16-bit
+            # samples), with the words as a text part (the transcript).
             pcm = b"\x01\x00" * 100
             return httpx.Response(
                 200,
@@ -406,12 +419,13 @@ class MockUpstream:
                         {
                             "content": {
                                 "parts": [
+                                    {"text": "spoken reply"},
                                     {
                                         "inlineData": {
                                             "mimeType": "audio/L16;rate=24000",
                                             "data": base64.b64encode(pcm).decode(),
                                         }
-                                    }
+                                    },
                                 ]
                             }
                         }
@@ -467,8 +481,46 @@ class MockUpstream:
                     },
                 },
             )
+        wants_audio = "audio" in (body.get("modalities") or [])
         if body.get("stream"):
+            if wants_audio:
+                return httpx.Response(
+                    200, text=self.audio_stream_text or AUDIO_STREAM_TEXT
+                )
             return httpx.Response(200, text=self.stream_text or STREAM_TEXT)
+        if wants_audio:
+            # Audio-output chat (gpt-4o-audio shape): the words live in
+            # message.audio.transcript, content is null.
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-mock123",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "audio": {
+                                    "id": "audio-mock123",
+                                    "data": "QUJDREVG",
+                                    "expires_at": None,
+                                    "transcript": self._response_content(body),
+                                },
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 7,
+                        "total_tokens": 17,
+                    },
+                },
+            )
         return httpx.Response(
             200,
             json={

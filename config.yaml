@@ -80,11 +80,15 @@ models:
         provider: gemini
         model: gemini-2.5-flash
 
-  # Embeddings models serve POST /v1/embeddings. Declared like chat models;
-  # they also show up in GET /v1/models (as on OpenAI). Any OpenAI-compatible
-  # api_base works; Gemini is translated to batchEmbedContents. Anthropic has
-  # no embeddings API — its deployments return a clear 501 and routing falls
-  # through to the next deployment.
+  # Embeddings models serve POST /v1/embeddings — and, natively, the Gemini
+  # inbound form POST /v1[/beta]/models/{model}:embedContent and
+  # :batchEmbedContents (same pipeline: allowlists, rate limits, budgets,
+  # caching, retries/failover, logs; the paths carry the embeddings token
+  # scope). Declared like chat models; they also show up in GET /v1/models
+  # (as on OpenAI). Any OpenAI-compatible api_base works; Gemini is
+  # translated to batchEmbedContents. Anthropic has no embeddings API — its
+  # deployments return a clear 501 and routing falls through to the next
+  # deployment.
   - name: text-embedding-3-small
     deployments:
       - name: openai/text-embedding-3-small
@@ -107,6 +111,11 @@ models:
   # it and the routing group falls through), and Gemini image models on the
   # chat surface (gemini-2.5-flash-image etc.) do image-to-image chat —
   # images in via image_url parts, images out as image_url content parts.
+  # Audio output works the same way: modalities: ["text", "audio"] +
+  # audio: {voice, format} on the OpenAI surface, or responseModalities
+  # [TEXT, AUDIO] + speechConfig on the native Gemini surface — replies
+  # carry message.audio (transcript + WAV or raw pcm16). Anthropic refuses
+  # audio output and the routing group falls through.
   - name: gpt-image-1
     deployments:
       - name: openai/gpt-image-1

@@ -980,14 +980,21 @@ class GatewayPipeline:
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta") or {}
                 delta_text = delta.get("content") or ""
+                # Audio-output chunks carry the spoken words in
+                # delta.audio.transcript (content stays null) — guardrails
+                # must see them and the log's emitted text must include
+                # them. Rewriting still targets content only: audio
+                # bytes are never rewritten.
+                transcript = str((delta.get("audio") or {}).get("transcript") or "")
+                guardrail_text = delta_text or transcript
 
-                if delta_text:
+                if guardrail_text:
                     # Stream guardrails inspect what has been sent so far
                     # (source text — block checks see what the model said,
                     # not the rewrite).
-                    accumulated_text += delta_text
+                    accumulated_text += guardrail_text
                     await self.guardrails.run_stream_phase(
-                        request, accumulated_text, delta_text, ctx
+                        request, accumulated_text, guardrail_text, ctx
                     )
 
                 if rewrite_state is not None:
@@ -1019,6 +1026,8 @@ class GatewayPipeline:
                             yield _sse(self._delta_chunk(request.model, flushed))
                 elif delta_text:
                     emitted_text += delta_text
+                elif transcript:
+                    emitted_text += transcript
 
                 yield _sse(chunk)
 

@@ -13,7 +13,7 @@ from gateway.api.gemini_native import (
 )
 from gateway.errors import GatewayError
 
-from .conftest import auth, create_key
+from .conftest import _make_env, auth, create_key
 
 # ----------------------------------------------------------------------
 # Unit: request translation (Gemini -> internal OpenAI shape)
@@ -493,3 +493,214 @@ async def test_gemini_function_calling_e2e(env):
     assert upstream_body["messages"][0]["tool_calls"][0]["function"]["name"] == "get_weather"
     assert upstream_body["messages"][1]["tool_call_id"] == upstream_body["messages"][0]["tool_calls"][0]["id"]
     assert upstream_body["tools"][0]["function"]["name"] == "get_weather"
+
+
+# ----------------------------------------------------------------------
+# Native embeddings: :embedContent / :batchEmbedContents
+# ----------------------------------------------------------------------
+
+
+def _embed_content_body(text: str = "hello world", **extra) -> dict:
+    return {"content": {"parts": [{"text": text}]}, **extra}
+
+
+async def test_embed_content_single(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:embedContent",
+        json=_embed_content_body("hello world"),
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"embedding"}
+    values = body["embedding"]["values"]
+    assert len(values) == 8  # the mock's default dims
+    # The upstream received the internal OpenAI shape (model swapped for
+    # the deployment's native one, as on every southbound call).
+    sent = env.mock.requests[-1]["body"]
+    assert sent["input"] == "hello world"
+    assert sent["model"] == "model-a"
+    assert "dimensions" not in sent
+
+
+async def test_embed_content_output_dimensionality(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:embedContent",
+        json=_embed_content_body("hello world", outputDimensionality=4),
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["embedding"]["values"]) == 4
+    assert env.mock.requests[-1]["body"]["dimensions"] == 4
+
+
+async def test_embed_content_v1beta_alias(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1beta/models/test-model:embedContent",
+        json=_embed_content_body("via v1beta"),
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["embedding"]["values"]) == 8
+
+
+async def test_batch_embed_contents(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:batchEmbedContents",
+        json={
+            "requests": [
+                {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": "first"}]}},
+                {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": "second"}]}},
+            ]
+        },
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"embeddings"}
+    assert len(body["embeddings"]) == 2
+    assert body["embeddings"][0]["values"] != body["embeddings"][1]["values"]
+    # One internal embeddings call carried both texts, in order.
+    sent = env.mock.requests[-1]["body"]
+    assert sent["input"] == ["first", "second"]
+
+
+async def test_embed_content_rejects_task_type(env):
+    """taskType changes how text embeds — refused, not silently dropped."""
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:embedContent",
+        json=_embed_content_body("hello", taskType="RETRIEVAL_DOCUMENT"),
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 400
+    assert "taskType" in resp.json()["error"]["message"]
+    assert len(env.mock.requests) == 0
+
+
+async def test_embed_content_rejects_title(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:embedContent",
+        json=_embed_content_body("hello", title="A Title"),
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 400
+    assert "title" in resp.json()["error"]["message"]
+
+
+async def test_batch_rejects_task_type_per_request(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:batchEmbedContents",
+        json={
+            "requests": [
+                {"content": {"parts": [{"text": "a"}]}},
+                {"content": {"parts": [{"text": "b"}]}, "taskType": "CLUSTERING"},
+            ]
+        },
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 400
+    assert "requests[1]" in resp.json()["error"]["message"]
+
+
+async def test_batch_rejects_model_mismatch(env):
+    """The gateway routes the whole batch to one deployment (the URL
+    model's) — mixed sub-request models cannot be honored."""
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:batchEmbedContents",
+        json={
+            "requests": [
+                {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": "a"}]}},
+                {"model": "models/text-embedding-3-large", "content": {"parts": [{"text": "b"}]}},
+            ]
+        },
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 400
+    message = resp.json()["error"]["message"]
+    assert "requests[1].model" in message
+    assert "one deployment" in message
+
+
+async def test_batch_rejects_dimensionality_mismatch(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:batchEmbedContents",
+        json={
+            "requests": [
+                {"content": {"parts": [{"text": "a"}]}, "outputDimensionality": 4},
+                {"content": {"parts": [{"text": "b"}]}, "outputDimensionality": 8},
+            ]
+        },
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 400
+    assert "outputDimensionality" in resp.json()["error"]["message"]
+
+
+async def test_embed_content_missing_content(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:embedContent", json={}, headers={"x-goog-api-key": key}
+    )
+    assert resp.status_code == 400
+    assert "content" in resp.json()["error"]["message"]
+
+
+async def test_batch_missing_requests(env):
+    key = (await create_key(env.client, "embed-user"))["key"]
+    resp = await env.client.post(
+        "/v1/models/test-model:batchEmbedContents",
+        json={},
+        headers={"x-goog-api-key": key},
+    )
+    assert resp.status_code == 400
+    assert "requests" in resp.json()["error"]["message"]
+
+
+async def test_embed_content_gemini_southbound(tmp_path):
+    """A Gemini embeddings deployment: the internal request goes out as a
+    native batchEmbedContents call and the reply renders in Gemini shape."""
+    from gateway.config import DeploymentConfig, ModelConfig, ProviderConfig
+
+    from .conftest import make_config
+
+    config = make_config(
+        providers={"gemini": ProviderConfig(api_base="http://mockupstream.test", api_key="gk")},
+        models=[
+            ModelConfig(
+                name="embed-model",
+                deployments=[
+                    DeploymentConfig(
+                        name="gemini/gemini-embedding-001",
+                        provider="gemini",
+                        model="gemini-embedding-001",
+                    )
+                ],
+            )
+        ],
+    )
+    async for ns in _make_env(tmp_path, config=config):
+        key = (await create_key(ns.client, "embed-user"))["key"]
+        resp = await ns.client.post(
+            "/v1/models/embed-model:embedContent",
+            json=_embed_content_body("hello"),
+            headers={"x-goog-api-key": key},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["embedding"]["values"] == [0.25, 0.5, 0.75, 1.0]
+        sent = ns.mock.requests[-1]["body"]
+        assert sent["requests"] == [
+            {
+                "model": "models/gemini-embedding-001",
+                "content": {"parts": [{"text": "hello"}]},
+            }
+        ]
+        break

@@ -8,7 +8,8 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 Images, audio and multimodal chat — the non-chat modalities on the same
 policy spine (keys, routing, retries, failover, breakers, budgets, rate
-limits, logging), plus audio input and image output inside chat.
+limits, logging), plus audio input and image output inside chat, audio
+output in chat, and native Gemini embeddings inbound.
 
 ### Added
 
@@ -65,6 +66,32 @@ limits, logging), plus audio input and image output inside chat.
   `inlineData` on the native Gemini surface. Streaming is refused with a
   clear 400 (an image has no chunk-delta representation; retry with
   `stream: false`).
+- Audio output in chat: `modalities: ["text", "audio"]` + `audio:
+  {voice, format}` (gpt-4o-audio shape) return `message.audio`
+  (`transcript` + base64 WAV `data`, or raw `pcm16`), streamed as
+  `delta.audio` chunks. OpenAI/Azure pass both fields through verbatim;
+  Gemini translates to `responseModalities: [TEXT, AUDIO]` +
+  `speechConfig` (voice via the TTS voice map) and WAV-wraps the reply's
+  PCM; native Gemini inbound accepts the same request through
+  `generationConfig` and renders the reply back as text + `inlineData`
+  (RIFF-sniffed). Anthropic refuses audio output with a clear 400
+  (`audio_output_not_supported`, `fallback=True`); the Anthropic-native
+  surface renders an audio reply's transcript as its text block.
+  Audio-output chat does not stream on Gemini (`audio_streaming_not_supported`
+  — retry with `stream: false`). Guardrails see the words, never the
+  bytes: response checks flatten `message.audio.transcript`
+  (`utils.assistant_text`), streamed `delta.audio.transcript` deltas feed
+  the stream-phase checks, and the PII redactors redact transcript text
+  (audio bytes are never rewritten). The Responses bridge renders an
+  audio reply's transcript as `output_text`.
+- Native Gemini embeddings inbound: `POST /v1[/beta]/models/{model}:embedContent`
+  and `:batchEmbedContents` run the same embeddings pipeline (allowlists,
+  rate limits, budgets, caching, retries/failover, logs) and render
+  replies as `{embedding: {values}}` / `{embeddings: [{values}]}`. The
+  paths carry the `embeddings` token scope. `taskType`/`title` and
+  batch sub-requests with mixed `model`s or `outputDimensionality` are
+  refused with clear 400s (they change the result — fail loudly);
+  `outputDimensionality` maps to `dimensions`.
 
 ### Changed
 

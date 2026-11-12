@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 from ...schemas import ChatCompletionRequest
-from ...utils import content_to_text
+from ...utils import assistant_text, content_to_text
 from ..base import Guardrail, GuardrailResult
 
 
@@ -56,8 +56,7 @@ class KeywordBlocklistGuardrail(Guardrail):
         if not self.check_completion:
             return None
         for choice in response.get("choices", []):
-            content = (choice.get("message") or {}).get("content")
-            reason = self._match(content_to_text(content))
+            reason = self._match(assistant_text(choice.get("message") or {}))
             if reason:
                 return GuardrailResult.block(reason)
         return None

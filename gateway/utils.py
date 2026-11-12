@@ -27,6 +27,22 @@ def content_to_text(content: Any) -> str:
     return "".join(parts)
 
 
+def assistant_text(message: dict) -> str:
+    """Flatten an assistant message to the text guardrails should see.
+
+    Covers ``content`` (string or parts) *plus* the transcript of an audio
+    response — gpt-4o-audio replies carry the words in
+    ``message.audio.transcript`` with ``content`` null, so looking at
+    content alone would let speech bypass every text guardrail.
+    """
+    text = content_to_text(message.get("content"))
+    audio = message.get("audio") or {}
+    transcript = audio.get("transcript")
+    if transcript:
+        text = f"{text}{transcript}" if text else str(transcript)
+    return text
+
+
 def iter_message_texts(messages: list[Any]) -> Iterator[str]:
     """Yield the text of every message (system/user/assistant/tool)."""
     for message in messages:

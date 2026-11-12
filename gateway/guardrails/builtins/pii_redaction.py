@@ -189,6 +189,17 @@ class PIIRedactionGuardrail(Guardrail):
                     modified = True
                     for k, v in counts.items():
                         total[k] = total.get(k, 0) + v
+            # Audio responses carry the words in message.audio.transcript —
+            # redact that text too (the audio bytes themselves cannot be
+            # rewritten; the transcript is what clients render).
+            audio = message.get("audio")
+            if isinstance(audio, dict) and audio.get("transcript"):
+                new_transcript, counts = self._redact_text(str(audio["transcript"]))
+                if counts:
+                    message["audio"] = dict(audio, transcript=new_transcript)
+                    modified = True
+                    for k, v in counts.items():
+                        total[k] = total.get(k, 0) + v
             choice["message"] = message
             new_choices.append(choice)
         new_response["choices"] = new_choices
