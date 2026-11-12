@@ -276,3 +276,77 @@ async def test_no_budget_no_alerts(alert_env):
     assert alert_env.webhooks.attempts == 0
     row = await _key_row(alert_env.client, key["id"])
     assert row["budget_alerts_fired"] is None  # no levels crossed -> never written
+
+
+# ----------------------------------------------------------------------
+# Concurrency: evaluations racing on the same entity
+# ----------------------------------------------------------------------
+
+
+async def test_concurrent_evaluations_fire_each_level_once(tmp_path):
+    """Regression: two spend tasks can evaluate the same budget while
+    both hold a stale fired snapshot (each request's spend UPDATE ...
+    RETURNING predates the other's alert write — e.g. two keys pooling
+    onto one tenant, or two requests on one key). A lost writer must
+    re-read the winner's state, so every level delivers exactly once
+    and the persisted set never loses levels.
+    """
+    sink = WebhookSink()
+    alerts = AlertsConfig(webhook_url="http://alerts.test/hook", max_attempts=1)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(sink.handler)) as ac:
+        async for env in _make_alert_env(tmp_path, alerts, sink):
+            key = await create_key(env.client, "race", max_budget_usd=30.0)
+            manager = BudgetAlertManager(alerts, client=ac)
+            try:
+                # Both hold fired=None; the spend snapshots are $20
+                # (66.7%) and $40 (133%) — every level crosses in both
+                # views, and both would fire all of them.
+                await asyncio.gather(
+                    manager.evaluate(key["id"], "race", 20.0, 30.0, None),
+                    manager.evaluate(key["id"], "race", 40.0, 30.0, None),
+                )
+            finally:
+                await manager.aclose()
+
+            levels = sorted(p["level_percent"] for p in sink.payloads)
+            assert levels == [50, 80, 90, 100]  # each exactly once
+            row = await _key_row(env.client, key["id"])
+            assert row["budget_alerts_fired"] == [50, 80, 90, 100]
+
+
+async def test_concurrent_tenant_evaluations_fire_each_level_once(tmp_path):
+    """The same race on the tenant side (two member keys' spend tasks
+    pooling onto one tenant row) — kind="tenant" shares the guard."""
+    sink = WebhookSink()
+    alerts = AlertsConfig(webhook_url="http://alerts.test/hook", max_attempts=1)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(sink.handler)) as ac:
+        async for env in _make_alert_env(tmp_path, alerts, sink):
+            resp = await env.client.post(
+                "/admin/tenants",
+                json={"name": "race-co", "max_budget_usd": 30.0},
+                headers=auth(ADMIN_KEY),
+            )
+            assert resp.status_code == 201, resp.text
+            tenant = resp.json()
+
+            manager = BudgetAlertManager(alerts, client=ac)
+            try:
+                await asyncio.gather(
+                    manager.evaluate(
+                        tenant["id"], "race-co", 20.0, 30.0, None, kind="tenant"
+                    ),
+                    manager.evaluate(
+                        tenant["id"], "race-co", 40.0, 30.0, None, kind="tenant"
+                    ),
+                )
+            finally:
+                await manager.aclose()
+
+            levels = sorted(p["level_percent"] for p in sink.payloads)
+            assert levels == [50, 80, 90, 100]
+            assert all(p["kind"] == "tenant" for p in sink.payloads)
+            row = await env.client.get(
+                f"/admin/tenants/{tenant['id']}", headers=auth(ADMIN_KEY)
+            )
+            assert row.status_code == 200
+            assert row.json()["budget_alerts_fired"] == [50, 80, 90, 100]

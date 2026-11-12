@@ -702,6 +702,8 @@ The suite covers guardrails (including scoping, observe mode and per-key overrid
 
 Optional real-SDK checks (beyond the test suite, which needs no network): `uv run python scripts/sdk_compat_check.py` for the OpenAI SDK, `uv run --with anthropic python scripts/anthropic_sdk_check.py` / `uv run --with google-genai python scripts/gemini_sdk_check.py` for the native formats, and `uv run --with openai-agents python scripts/agents_sdk_check.py` for the Responses API bridge (raw OpenAI SDK + the OpenAI Agents SDK, streamed and non-streamed, incl. the tool-call roundtrip).
 
+CI (`.github/workflows/ci.yml`) runs the same suite on Python 3.12 and 3.13 — no services to boot, since the suite is fully self-contained. The workflow activates as soon as the repository is pushed to GitHub.
+
 ## Design notes & limitations (MVP)
 
 - **Storage** — SQLite via async SQLAlchemy; switch to PostgreSQL by changing `GATEWAY_DATABASE_URL`.

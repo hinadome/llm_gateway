@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from ..config import AlertsConfig
 from ..db import get_sessionmaker
@@ -51,6 +51,11 @@ def crossed_levels(
 
 class BudgetAlertManager:
     """Evaluates budget crossings and delivers webhook alerts."""
+
+    # Bounded retries for the fired-levels compare-and-swap: more than
+    # any realistic number of concurrent evaluations of one entity.
+    # Alerting is best-effort, so exhaustion only logs.
+    _CAS_ATTEMPTS = 5
 
     def __init__(
         self,
@@ -87,34 +92,62 @@ class BudgetAlertManager:
         (a tenant passes its id, prefixed "tenant:" for uniqueness in
         payloads that flatten both kinds).
 
-        Persists the updated fired-levels first (so a crash during
-        delivery prefers duplicate silence over duplicate noise), then
-        delivers each alert. Returns the levels fired.
+        ``fired`` is the caller's snapshot and may already be stale:
+        two requests crossing thresholds concurrently each see the
+        other's spend but not its alert write (both snapshots predate
+        the other's commit). The persisted update is therefore a
+        compare-and-swap on ``budget_alerts_fired`` — a writer whose
+        snapshot lost re-reads the winner's state and recomputes, so
+        every level delivers exactly once and the persisted set never
+        loses the winner's levels.
+
+        Levels persist first (so a crash during delivery prefers
+        duplicate silence over duplicate noise), then deliver. Returns
+        the levels fired.
         """
-        levels = crossed_levels(
-            spend_usd, budget_usd, self.config.budget_thresholds, fired
-        )
-        if not levels:
-            return []
-        new_fired = sorted(set(fired or []) | set(levels))
         table = VirtualKey if kind == "key" else Tenant
         sessionmaker = get_sessionmaker()
-        async with sessionmaker() as session:
-            await session.execute(
-                update(table)
-                .where(table.id == key_id)
-                .values(budget_alerts_fired=new_fired)
-            )
-            await session.commit()
         # The payload names the budgeted entity; tenants get a
         # "tenant:" prefix so flattened consumers can tell kinds apart
-        # (the row update above uses the raw id).
+        # (the row update below uses the raw id).
         payload_id = f"tenant:{key_id}" if kind == "tenant" else key_id
-        for level in levels:
-            await self._deliver_budget_alert(
-                payload_id, key_name, spend_usd, budget_usd, level, kind=kind
+        for _ in range(self._CAS_ATTEMPTS):
+            levels = crossed_levels(
+                spend_usd, budget_usd, self.config.budget_thresholds, fired
             )
-        return levels
+            if not levels:
+                return []
+            new_fired = sorted(set(fired or []) | set(levels))
+            async with sessionmaker() as session:
+                result = await session.execute(
+                    update(table)
+                    .where(table.id == key_id)
+                    .where(table.budget_alerts_fired == fired)
+                    .values(budget_alerts_fired=new_fired)
+                )
+                await session.commit()
+            if (result.rowcount or 0) == 1:
+                for level in levels:
+                    await self._deliver_budget_alert(
+                        payload_id, key_name, spend_usd, budget_usd, level, kind=kind
+                    )
+                return levels
+            # Lost the race: another evaluation already advanced the
+            # fired set. Retry against its state — only what it missed
+            # fires now.
+            async with sessionmaker() as session:
+                fired = (
+                    await session.execute(
+                        select(table.budget_alerts_fired).where(table.id == key_id)
+                    )
+                ).scalar_one_or_none()
+        logger.warning(
+            "budget alert state kept moving for %s %s after %d attempts",
+            kind,
+            key_id,
+            self._CAS_ATTEMPTS,
+        )
+        return []
 
     # -- delivery -----------------------------------------------------------
 

@@ -6,6 +6,25 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Budget alerts racing: two requests crossing thresholds concurrently
+  (two keys pooling onto one tenant, or two requests on one key) each
+  evaluate from a spend snapshot that predates the other's alert write,
+  so both saw the same stale fired-levels — a level could deliver
+  twice and the loser's write could clobber the winner's persisted
+  set. The fired-levels update is now a compare-and-swap on the stored
+  value; a losing writer re-reads the winner's state and fires only
+  what it missed. Regression tests pin exactly-once delivery for both
+  the key and tenant kinds.
+
+### Added
+
+- CI workflow (`.github/workflows/ci.yml`): the full test suite on
+  Python 3.12 and 3.13 via uv (cached), plus a smoke-check of the
+  shipped `config.yaml`. Dormant until the repository is pushed to
+  GitHub.
+
 ## [1.0.0] — 2026-11-12
 
 First stable release. Since 0.1.0: images, audio and multimodal chat —
