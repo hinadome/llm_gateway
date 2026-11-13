@@ -125,7 +125,8 @@ gateway/
 │   │                       to the auth chain (app.state), then enforce token
 │   │                       scoping (allowed_endpoints — chat / embeddings
 │   │                       (incl. Gemini :embedContent/:batchEmbedContents) /
-│   │                       images / audio / models — + allowed_ips, never
+│   │                       images / audio / models / batch (files +
+│   │                       batches) — + allowed_ips, never
 │   │                       on admins); require_admin gates the admin API,
 │   │                       require_platform_admin additionally excludes
 │   │                       tenant admins (the platform's own config
@@ -201,6 +202,21 @@ gateway/
 │   │                       unknown form fields ride along for provider
 │   │                       passthrough) + /v1/audio/speech (JSON in,
 │   │                       binary audio streamed out)
+│   ├── batches.py          OpenAI-style files + batches surface: POST /v1/files
+│   │                       (multipart upload, purpose='batch', capped at
+│   │                       batch.max_file_bytes — 413 beyond), GET /v1/files
+│   │                       [/{id}[/content]] (owned by the calling virtual key —
+│   │                       another key 404s), POST /v1/batches (input validated
+│   │                       synchronously: JSONL lines with custom_id + body,
+│   │                       method POST, url /v1/chat/completions, bodies parsed
+│   │                       as ChatCompletionRequest, count within
+│   │                       batch.max_requests — a created batch is always
+│   │                       runnable; no 'validating' status), GET /v1/batches
+│   │                       [/{id}], POST /v1/batches/{id}/cancel (guarded
+│   │                       update — never overwrites a terminal state).
+│   │                       Requires a virtual key (the platform admin key has
+│   │                       no key row to own files or bill) + the 'batch'
+│   │                       endpoint scope; batch.enabled: false → 404s
 │   └── admin.py            Keys CRUD (incl. per-key model_mappings / default_model,
 │                           prompt policy fields and scoping fields; tenancy —
 │                           tenant admins are forced into their own tenant on
@@ -406,6 +422,31 @@ gateway/
 │                           enqueues — a lazily started consumer performs the
 │                           writes; full queue drops (LOGS_DROPPED), stop()
 │                           drains (lifespan teardown + tests)
+│   └── batch_worker.py     Batch executor: one tick = expire in_progress
+│                           batches past their completion window, then run
+│                           one wave (batch.wave_size lines) of the oldest
+│                           runnable batch — each line a full interactive
+│                           request via handle_chat (fresh auth snapshot per
+│                           wave; request_id '<batch id>-L<line>',
+│                           auth_method 'batch'). Line failures are exactly
+│                           what the interactive request would return (error
+│                           envelope in the batch's error file); rate limits
+│                           and budget ceilings defer the batch instead
+│                           (retry_not_before, window expiry bounds it).
+│                           Results append one row per line in the same
+│                           transaction that advances the cursor (crash →
+│                           resume from the cursor, worst case re-running
+│                           the in-flight wave); 'finalizing' is the
+│                           crash-recovery checkpoint between 'all results
+│                           in' and 'output files written'. Finalization
+│                           assembles the output/error JSONL as StoredFile
+│                           rows, guarded so a racing cancel is never
+│                           overwritten. Runs on app.state.batch_worker;
+│                           the lifespan loop (skipped under pytest's
+│                           ASGITransport — tests tick manually) paces it
+│                           with batch.poll_interval_seconds and re-reads
+│                           app.state.config each iteration so hot reloads
+│                           apply live
 │
 ├── guardrails/             ── The policy plugin framework ──
 │   ├── base.py             Guardrail ABC (check_request / check_response /
@@ -918,7 +959,7 @@ erDiagram
         json disabled_guardrails "guardrail names skipped for this key (runtime override)"
         json model_mappings "per-key requested name to public model routing table"
         str default_model "this key's catch-all for unknown names"
-        json allowed_endpoints "data-plane scopes (chat/embeddings/images/audio/models), NULL = all"
+        json allowed_endpoints "data-plane scopes (chat/embeddings/images/audio/models/batch), NULL = all"
         json allowed_ips "source IPs/CIDRs calls must come from, NULL = any"
         datetime expires_at
         json metadata_json
@@ -954,11 +995,63 @@ erDiagram
         str key PK "e.g. admin_key"
         str value
     }
+    STORED_FILE {
+        str id PK "uuid hex"
+        str key_id "indexed; owning virtual key"
+        str tenant_id "indexed; the owner's tenant, NULL = platform"
+        str filename
+        str purpose "batch | batch_output | batch_errors"
+        int bytes
+        text content "the JSONL itself, inline (bounded by batch.max_file_bytes)"
+        datetime created_at
+    }
+    BATCH {
+        str id PK "uuid hex"
+        str key_id "indexed; owning virtual key"
+        str tenant_id "indexed; the owner's tenant, NULL = platform"
+        str input_file_id FK "a purpose=batch StoredFile"
+        str endpoint "always /v1/chat/completions"
+        str completion_window "always 24h"
+        json metadata "OpenAI's metadata field (column name; 'meta' in Python — DeclarativeBase reserves .metadata)"
+        str status "indexed; in_progress | finalizing | completed | failed | cancelled | expired (no validating — create validates synchronously)"
+        text error_message "why it failed"
+        int total_requests "fixed at create"
+        int completed_lines "succeeded lines so far"
+        int failed_lines "failed lines so far"
+        int next_line "cursor: 0-based input line the next wave starts at"
+        datetime retry_not_before "deferral backoff (rate limit / budget)"
+        str output_file_id "succeeded results as JSONL, written at finalization"
+        str error_file_id "failed results as JSONL, NULL when nothing failed"
+        datetime created_at
+        datetime in_progress_at
+        datetime finalizing_at "crash-recovery checkpoint: all results in, files not yet written"
+        datetime completed_at
+        datetime failed_at
+        datetime expired_at "in_progress past the completion window"
+        datetime cancelled_at
+        datetime expires_at "created_at + 24h"
+    }
+    BATCH_RESULT {
+        int id PK
+        str batch_id "indexed"
+        int line_index "0-based input position — output order comes from this, not insertion"
+        str custom_id "echoed from the input line"
+        str status "succeeded | failed"
+        json response "OpenAI batch-line shape: {status_code, request_id, body}"
+        datetime created_at
+    }
+
+    VIRTUAL_KEY ||--o{ STORED_FILE : "key_id"
+    VIRTUAL_KEY ||--o{ BATCH : "key_id"
+    STORED_FILE ||--o{ BATCH : "input_file_id"
+    BATCH ||--o{ BATCH_RESULT : "batch_id"
 ```
 
 **Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them.
 
 Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` (the `postgres` extra, asyncpg) with no code changes — only async SQLAlchemy is used. JSON columns compile to JSONB on PostgreSQL via a shared variant type (`JSONColumn` in `models.py`), which keeps the budget-alert compare-and-swap meaningful there (semantic JSONB equality; plain `json` has no `=` operator); PostgreSQL engines also pre-ping pooled connections so server-side drops recycle instead of surfacing as 500s. The whole test suite runs against either backend — `GATEWAY_TEST_DATABASE_URL` points `conftest` at a live PostgreSQL server, where each test gets its own database (created and dropped around the run; the `VACUUM INTO` backup tests skip, and a test pins the `pg_dump`-pointing 400 refusal). Online backups stay SQLite-only by construction.
+
+**Batch execution model.** A `Batch` owns its input `StoredFile` (JSONL) and produces output/error `StoredFile`s at finalization; `BATCH_RESULT` is the working set — one row per completed line, `{status_code, request_id, body}` in the OpenAI batch-line shape, appended in the same transaction that advances `next_line` (O(1) appends; a crash resumes from the cursor, at worst re-running the in-flight wave). The worker (`core/batch_worker.py`, driven by the lifespan loop) runs `wave_size` lines of the oldest runnable batch per tick, each through `handle_chat` with a fresh per-wave key snapshot — so batch traffic is ordinary traffic: guardrails, cache, routing, spend, `/admin/logs` rows (auth_method `batch`) and stats all apply, and a line's failure is exactly what the interactive request would have returned. Rate limits and budget ceilings *defer* (the batch's `retry_not_before`; window expiry bounds it into `expired`) rather than failing lines. The two tables deliberately avoid foreign-key constraints beyond the diagram's logical ones — ownership is enforced in the API layer (non-owner ids 404) to stay portable across SQLite/PostgreSQL.
 
 There is no Alembic; `init_engine` runs `create_all` preceded by a small in-place upgrade pass (`_add_missing_columns_sync` in `db.py`) that `ALTER TABLE ... ADD COLUMN`s every *nullable* model column an existing table lacks (plus single-column indexes). Databases created before a column existed (e.g. `trace_id`, `model_mappings`) are upgraded transparently on the next start; non-nullable additions are reported instead of applied.
 
@@ -1422,7 +1515,7 @@ A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, 
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 

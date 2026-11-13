@@ -8,6 +8,40 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- OpenAI-style Batch API (`/v1/files` + `/v1/batches`) for bulk chat
+  workloads: upload a JSONL of chat requests
+  (`POST /v1/files`, multipart `file` + `purpose: "batch"`, capped at
+  `batch.max_file_bytes` — 20 MB), create a batch
+  (`POST /v1/batches`) and poll `GET /v1/batches/{id}`; when completed,
+  `output_file_id` (succeeded lines) and `error_file_id` (failed lines)
+  hold OpenAI-shaped JSONL — one `{"id", "custom_id", "response":
+  {status_code, request_id, body}, "error": null}` line per input.
+  Input is validated synchronously at create (JSONL line rules,
+  bodies parsed as chat-completion requests, `max_requests` cap — no
+  "validating" status), so a created batch is always runnable.
+  Execution is a background worker: `wave_size` lines of the oldest
+  runnable batch per `poll_interval_seconds` tick, each line a full
+  interactive request through `handle_chat` — guardrails (a blocked
+  line fails with the same 400 the client would get, into the error
+  file), model allowlists, routing/retries, response cache, spend
+  accounting and a request-log row (auth_method `batch`), so batch
+  traffic lands in `/admin/logs`, `/admin/stats` and usage exports
+  like any other traffic. Rate limits and budget ceilings never fail
+  a line — the batch defers (`retry_not_before`, budgets checked per
+  wave against a fresh key snapshot) and the 24h completion window
+  bounds deferrals into expiry. Crash-safe by cursor: results append
+  one row per line in the same transaction that advances `next_line`;
+  a restart resumes from the cursor ("finalizing" is the checkpoint
+  between all-results-in and files-written). Cancellation is a
+  guarded update that never overwrites a terminal state. Files and
+  batches belong to the creating virtual key (non-owner ids 404);
+  the platform admin key cannot own them (no key row to bill), and
+  scoped keys need the new `batch` endpoint scope. `batch:` config
+  (enabled/max_file_bytes/max_requests/wave_size/poll_interval_seconds,
+  hot-reloadable — the worker re-reads it each tick); progress on
+  `gateway_batch_lines_total{status=completed|failed|deferred}`;
+  existing databases auto-upgrade (three new tables via create_all).
+  16 new tests.
 - TTFT + decode rate on streamed request-log rows: streaming latency
   was a single `latency_ms` number; rows now also record `ttft_ms` —
   milliseconds from request start to the first *content-bearing* chunk

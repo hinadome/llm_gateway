@@ -18,8 +18,10 @@ logger = logging.getLogger("gateway.auth")
 # Data-plane endpoint scopes (a virtual key's allowed_endpoints entries).
 # "chat" covers every chat-shaped surface — OpenAI chat, the Responses
 # bridge, and the native Anthropic/Gemini inbound formats — because they
-# all exercise the same underlying completions machinery.
-ENDPOINT_SCOPES = frozenset({"chat", "embeddings", "images", "audio", "models"})
+# all exercise the same underlying completions machinery. "batch" covers
+# the files/batches surfaces (their lines execute as chat anyway, but
+# the scope is granted separately so a key may chat without batching).
+ENDPOINT_SCOPES = frozenset({"chat", "embeddings", "images", "audio", "models", "batch"})
 
 
 def required_scope(path: str) -> str | None:
@@ -33,6 +35,10 @@ def required_scope(path: str) -> str | None:
         return "images"
     if path.startswith("/v1/audio/"):
         return "audio"
+    if path == "/v1/files" or path.startswith("/v1/files/"):
+        return "batch"
+    if path == "/v1/batches" or path.startswith("/v1/batches/"):
+        return "batch"
     last = path.rsplit("/", 1)[-1]
     if last.endswith(":embedContent") or last.endswith(":batchEmbedContents"):
         return "embeddings"  # Gemini-native embeddings (not chat, despite :method path)

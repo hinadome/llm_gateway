@@ -32,6 +32,7 @@ from . import __version__
 from .api import admin as admin_api
 from .api import anthropic_native
 from .api import audio as audio_api
+from .api import batches as batches_api
 from .api import chat as chat_api
 from .api import embeddings as embeddings_api
 from .api import gemini_native
@@ -43,6 +44,7 @@ from .config import GatewayConfig, Settings, get_settings
 from .core.alerts import BudgetAlertManager
 from .core.auth import AuthChain
 from .core.audit import AuditLogger
+from .core.batch_worker import BatchWorker
 from .core.cache import ResponseCache
 from .core.cost import CostCalculator
 from .core.logging_svc import LoggingService, QueuedLoggingService
@@ -292,6 +294,10 @@ def create_app(
             cache_seconds=config.prompts.library_cache_seconds
         ),
     )
+    # Batch API worker: drives /v1/batches lines in waves (app.state so
+    # tests can tick it manually; the lifespan loop is the only driver
+    # in production).
+    batch_worker = BatchWorker(pipeline, config.batch)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -316,6 +322,27 @@ def create_app(
                     await asyncio.sleep(config.logging.retention_interval_seconds)
 
             prune_task = asyncio.create_task(_retention_loop())
+
+        # Batch worker: one wave of the oldest runnable batch per tick,
+        # forever. Re-reads app.state.config each iteration so a hot
+        # reload of batch settings (wave size, enabled) applies live.
+        # Under pytest (ASGITransport skips the lifespan) this loop
+        # never starts — tests call worker.tick() directly.
+        batch_task: asyncio.Task | None = None
+        if config.batch.enabled:
+
+            async def _batch_loop() -> None:
+                while True:
+                    try:
+                        current = app.state.config.batch
+                        if current.enabled:
+                            batch_worker.config = current
+                            await batch_worker.tick()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("batch worker tick failed")
+                    await asyncio.sleep(app.state.config.batch.poll_interval_seconds)
+
+            batch_task = asyncio.create_task(_batch_loop())
         logger.info("LLM Gateway %s ready (models: %s)", __version__, config.public_models())
 
         # SIGHUP = reload config.yaml without dropping traffic (the same
@@ -347,6 +374,8 @@ def create_app(
         app.state.ready = False  # draining: readiness fails before anything closes
         if prune_task is not None:
             prune_task.cancel()
+        if batch_task is not None:
+            batch_task.cancel()
         # In-flight background work (spend accounting, shadow mirrors,
         # prompt A/B) is drained before the resources it depends on go
         # away — bounded, so a wedged upstream cannot hang shutdown.
@@ -392,6 +421,8 @@ def create_app(
 
     # ---- app state -----------------------------------------------------
     app.state.pipeline = pipeline
+    # Batch worker (tick() driven by the lifespan loop; tests call it).
+    app.state.batch_worker = batch_worker
     # Prompt library (admin-plane CRUD routes live in api/admin.py).
     app.state.prompt_library = pipeline.prompt_library
     app.state.config = config
@@ -535,6 +566,7 @@ def create_app(
     app.include_router(responses_api.router)
     app.include_router(images_api.router)
     app.include_router(audio_api.router)
+    app.include_router(batches_api.router)
     app.include_router(admin_api.router)
 
     @app.get("/health")

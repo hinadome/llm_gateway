@@ -414,6 +414,21 @@ auth:
 uploads:
   max_upload_mb: 25
 
+# OpenAI-style Batch API: POST /v1/files (JSONL upload) + POST /v1/batches,
+# executed in the background by a worker (wave_size lines of the oldest
+# runnable batch per poll_interval_seconds tick — the burst is wave-shaped,
+# not a wall of every line at once). Lines run through the full pipeline:
+# guardrails, cache, spend accounting, request logs. Rate limits and budget
+# ceilings defer a batch (retry_not_before) — a line never fails for those;
+# the completion window (24h) bounds retries. Hot-reloadable (worker picks
+# up wave_size immediately; poll interval applies from the next sleep).
+batch:
+  enabled: true
+  max_file_bytes: 20971520     # 20 MB — matches OpenAI's batch input cap
+  max_requests: 10000          # input lines per batch
+  wave_size: 16
+  poll_interval_seconds: 2.0
+
 # Per-1M-token pricing overrides (USD). Merged over built-in defaults;
 # longest model-prefix match wins. Embeddings are input-only.
 #

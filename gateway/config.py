@@ -408,6 +408,26 @@ class UploadsConfig(BaseModel):
     max_upload_mb: int = 25
 
 
+class BatchConfig(BaseModel):
+    """OpenAI-style Batch API: ``/v1/files`` upload + ``/v1/batches``
+    execution by a background worker.
+
+    ``enabled: false`` turns the surfaces off (404) and stops the
+    worker — e.g. to force callers onto interactive traffic only.
+    ``max_file_bytes``/``max_requests`` bound the buffered input
+    (OpenAI's own limits are 20 MB / 50k; requests default lower).
+    ``wave_size`` lines of the oldest runnable batch execute per
+    worker tick, ``poll_interval_seconds`` apart — the burst a batch
+    can send upstream is wave-shaped, not a wall of 10k requests.
+    """
+
+    enabled: bool = True
+    max_file_bytes: int = 20 * 1024 * 1024  # 20 MB
+    max_requests: int = 10_000  # input lines per batch
+    wave_size: int = 16
+    poll_interval_seconds: float = 2.0
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -494,6 +514,7 @@ class GatewayConfig(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     uploads: UploadsConfig = Field(default_factory=UploadsConfig)
+    batch: BatchConfig = Field(default_factory=BatchConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @classmethod

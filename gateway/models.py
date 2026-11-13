@@ -318,3 +318,123 @@ class Prompt(Base):
             "ab_fraction": self.ab_fraction,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class StoredFile(Base):
+    """A file held by the gateway: batch input JSONL uploaded via
+    ``POST /v1/files``, or batch output/error JSONL written by the
+    worker at finalization. Content is plain text (JSONL), stored
+    inline — batch payloads are bounded by ``batch.max_file_bytes``.
+    """
+
+    __tablename__ = "files"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    # Owning virtual key (files are private to it; a platform admin key
+    # has no key row and cannot own files). Copied tenant_id so tenant
+    # scoping never joins (the same denormalization as request_logs).
+    key_id: Mapped[str] = mapped_column(String(32), index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    filename: Mapped[str] = mapped_column(String(255), default="input.jsonl")
+    # "batch" (input), "batch_output", "batch_errors".
+    purpose: Mapped[str] = mapped_column(String(64), default="batch")
+    bytes: Mapped[int] = mapped_column(Integer, default=0)
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class Batch(Base):
+    """One OpenAI-style batch: a JSONL of chat requests executed in the
+    background by the worker, line by line through the full pipeline.
+
+    Execution state is a cursor (``next_line``) plus one ``BatchResult``
+    row per completed line — results append in O(1), a crash loses at
+    most the in-flight wave (its lines re-run), and finalization just
+    concatenates stored results into the output JSONL.
+
+    Status lifecycle: ``in_progress`` → ``finalizing`` → ``completed``
+    (or ``failed`` / ``cancelled`` / ``expired`` from any live state).
+    ``finalizing`` is a crash-recovery checkpoint — normally invisible,
+    it exists between "all lines have results" and "output files
+    written", so a restart resumes finalization instead of redoing
+    lines. Validation is synchronous at ``POST /v1/batches`` — there is
+    no ``validating`` state.
+    """
+
+    __tablename__ = "batches"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    key_id: Mapped[str] = mapped_column(String(32), index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    input_file_id: Mapped[str] = mapped_column(String(32))
+    # OpenAI-compatible fields (endpoint must be /v1/chat/completions;
+    # completion_window must be 24h).
+    endpoint: Mapped[str] = mapped_column(String(255), default="/v1/chat/completions")
+    completion_window: Mapped[str] = mapped_column(String(8), default="24h")
+    # Named "meta" in Python because DeclarativeBase reserves .metadata;
+    # the column itself is "metadata" (OpenAI's field name).
+    meta: Mapped[dict] = mapped_column("metadata", JSONColumn, default=dict)
+    status: Mapped[str] = mapped_column(String(16), default="in_progress", index=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Line counts (request_counts in the API): total is fixed at
+    # create; the other two advance with the cursor.
+    total_requests: Mapped[int] = mapped_column(Integer, default=0)
+    completed_lines: Mapped[int] = mapped_column(Integer, default=0)
+    failed_lines: Mapped[int] = mapped_column(Integer, default=0)
+    # Cursor: the 0-based input line the next wave starts at. Lines
+    # before it all have results.
+    next_line: Mapped[int] = mapped_column(Integer, default=0)
+    # Deferral: waves do not start before this instant (rate limits and
+    # budget ceilings back off instead of failing lines; the
+    # completion window bounds how long that can go on).
+    retry_not_before: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    output_file_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_file_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Lifecycle timestamps (unix ints in the API; NULL = not reached).
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    in_progress_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finalizing_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # When the batch must be done by (created_at + completion window).
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class BatchResult(Base):
+    """Result of one batch input line, appended as the line completes.
+
+    ``response`` is the OpenAI batch-line shape: ``{status_code,
+    request_id, body}`` where body is the chat completion (success) or
+    the error envelope (failure). ``status`` mirrors OpenAI's
+    request_counts split: "succeeded" vs "failed".
+    """
+
+    __tablename__ = "batch_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    batch_id: Mapped[str] = mapped_column(String(32), index=True)
+    # 0-based position in the input file — the output JSONL preserves
+    # input order via this, not insertion order.
+    line_index: Mapped[int] = mapped_column(Integer)
+    custom_id: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(16), default="succeeded")
+    response: Mapped[dict] = mapped_column(JSONColumn, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

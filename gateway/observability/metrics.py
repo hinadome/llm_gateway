@@ -55,6 +55,12 @@ CACHE = Counter(
     ["result"],  # hit | semantic | miss
 )
 
+BATCH_LINES = Counter(
+    "gateway_batch_lines_total",
+    "Batch input lines executed by the background worker.",
+    ["status"],  # completed | failed | deferred (rate limit / budget backoff)
+)
+
 TTFT = Histogram(
     "gateway_stream_ttft_seconds",
     "Time from request start to the first streamed chunk delivered to the client.",
