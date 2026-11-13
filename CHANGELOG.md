@@ -8,6 +8,21 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- HTTPS serving via `python -m gateway` (wrapped by `scripts/gateway.sh`):
+  three certificate modes behind flags — `--self-signed [DIR]` (development
+  pair generated on first use under `deploy/certs/` and reused after;
+  SANs cover `localhost`/`127.0.0.1`/`::1`, key written 0600),
+  `--ssl-cert`/`--ssl-key` for any PEM pair (private/organizational CA —
+  also `GATEWAY_SSL_CERT`/`GATEWAY_SSL_KEY` env vars, flags win), and
+  `--letsencrypt DOMAIN` resolving certbot's standard
+  `/etc/letsencrypt/live/DOMAIN/` layout with a certbot hint when absent.
+  Plain HTTP when no certificate is configured (unchanged behavior);
+  `--host`/`--port`/`GATEWAY_HOST`/`GATEWAY_PORT` and `--reload` for
+  development. Certificates load once at bind time, so restart after
+  certbot renews (startup logs the expiry date as a reminder); TLS
+  misconfiguration surfaces as a CLI usage error, not a stack trace.
+  Verified end-to-end by a test that serves the real app over TLS and
+  calls it with a certificate-verifying client.
 - Wire capture on request-log rows: beyond the stored request/response
   bodies, each row now records the allowlisted client request headers
   (which SDK made the call — `user-agent`, the OpenAI SDKs'

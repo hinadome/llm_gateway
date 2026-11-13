@@ -84,6 +84,25 @@ print(resp.choices[0].message.content)
 
 Streaming works exactly like OpenAI (`stream=True`, `stream_options={"include_usage": True}`).
 
+## HTTPS
+
+Serve TLS with `python -m gateway` (or its wrapper `scripts/gateway.sh`) and one of three certificate modes — plain HTTP when none is configured:
+
+```bash
+./scripts/gateway.sh --self-signed                 # dev: generates deploy/certs/gateway-dev.pem
+                                                   # (+ -key.pem) on first run, reuses after
+./scripts/gateway.sh --ssl-cert my.crt --ssl-key my.key    # any PEM pair (private/org CA)
+./scripts/gateway.sh --letsencrypt api.example.com  # certbot's /etc/letsencrypt/live/... layout
+```
+
+- **Self-signed** is for development and internal use: clients must trust the pair explicitly (or skip verification — `curl --cacert deploy/certs/gateway-dev.pem ...`, `OpenAI(http_client=httpx.Client(verify=False))`) because no public CA vouches for it. The certificate covers `localhost`, `127.0.0.1` and `::1`. Keep `deploy/certs/` gitignored — it holds a private key.
+- **Private certificate** (`--ssl-cert`/`--ssl-key`, or `GATEWAY_SSL_CERT`/`GATEWAY_SSL_KEY` env vars, read from `.env` too) is the organizational-CA / commercial-certificate path. Both must be set together.
+- **Let's Encrypt** resolves certbot's standard paths (`fullchain.pem` + `privkey.pem`); obtain one with `certbot certonly --standalone -d api.example.com`. After certbot renews, restart the gateway — the certificate is read once at bind time, not per connection (the startup log prints the expiry date as a reminder). A nonstandard location can be passed with plain `--ssl-cert`/`--ssl-key`.
+
+`--host`/`--port` (or `GATEWAY_HOST`/`GATEWAY_PORT`) set the bind address, `--reload` enables code-watch for development, and everything else passes through to the app unchanged. Prefer plain uvicorn? It serves the same app: `uv run uvicorn gateway.main:app --ssl-certfile my.crt --ssl-keyfile my.key`.
+
+To terminate TLS in front of the gateway instead (nginx, Caddy, a load balancer), leave it on HTTP — only one TLS layer is needed; clients then send `https://` to the proxy.
+
 ## API surface
 
 ### Client API (OpenAI-compatible)

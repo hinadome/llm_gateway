@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     # e.g. GATEWAY_CORS_ALLOW_ORIGINS="https://app.example.com,http://localhost:5173".
     # Empty/None (the default) keeps CORS off entirely.
     cors_allow_origins: str | None = None
+    # HTTPS, served by `python -m gateway` / scripts/gateway.sh (plain
+    # uvicorn ignores these — pass --ssl-certfile/--ssl-keyfile there
+    # instead). PEM certificate chain + matching private key; both must
+    # be set together. Any pair works: private/organizational CA-issued,
+    # Let's Encrypt (point at /etc/letsencrypt/live/<domain>/fullchain.pem
+    # + privkey.pem, or use the --letsencrypt flag), or a self-signed
+    # dev pair (--self-signed generates one). Restart after renewing.
+    ssl_cert: str | None = None  # GATEWAY_SSL_CERT
+    ssl_key: str | None = None  # GATEWAY_SSL_KEY
+    # Bind address for `python -m gateway` (plain uvicorn takes
+    # --host/--port on its own command line).
+    host: str = "127.0.0.1"  # GATEWAY_HOST
+    port: int = 8000  # GATEWAY_PORT
 
 
 @lru_cache

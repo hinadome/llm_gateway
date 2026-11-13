@@ -101,6 +101,15 @@ gateway/
 │                           SettingKV) + async engine management incl. get_engine (readiness
 │                           checks, VACUUM INTO backups)
 ├── bootstrap.py           First-boot seeding: admin key, default virtual key
+├── serve.py + __main__.py `python -m gateway` runner (wrapped by scripts/gateway.sh):
+│                           HTTP by default, HTTPS via three certificate modes —
+│                           --self-signed (dev pair generated under deploy/certs/,
+│                           reused after), --ssl-cert/--ssl-key (any PEM pair —
+│                           private/org CA; also GATEWAY_SSL_CERT/GATEWAY_SSL_KEY
+│                           env), --letsencrypt DOMAIN (certbot's live layout;
+│                           restart after renewal — certs load at bind time);
+│                           flags > env; TLS config errors surface as CLI usage
+│                           errors, never stack traces
 ├── utils.py                Content flattening (text + [image]/[audio] part
 │                           placeholders), token estimation, truncation,
 │                           audio format<->MIME mapping helpers
