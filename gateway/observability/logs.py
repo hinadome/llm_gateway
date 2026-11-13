@@ -1,13 +1,18 @@
-"""Structured logging: JSON output + an OpenTelemetry logs pipeline.
+"""Structured logging: JSON or text output + an OpenTelemetry logs pipeline.
 
 Two independent pieces, both configured from ``GATEWAY_LOG_FORMAT`` /
 ``GATEWAY_OTEL_ENABLED``:
 
-1. **JSON logs** (``GATEWAY_LOG_FORMAT=json``) — the gateway's loggers emit
-   single-line JSON records to stdout, friendly to Loki/Elastic/any JSON
-   ingester. The pipeline writes one such record per request ("chat request
-   completed") carrying request_id, trace_id, model, provider, tokens,
-   cost, status, ...
+1. **Console logs** — the gateway's loggers emit single-line records to
+   stdout. ``GATEWAY_LOG_FORMAT=json`` renders them as JSON, friendly to
+   Loki/Elastic/any JSON ingester; ``text`` (the default) renders a
+   human-readable line. The pipeline writes one such record per request
+   ("chat request completed") carrying request_id, trace_id, model,
+   provider, tokens, cost, status, ... — both formats carry all of it,
+   the JSON formatter as top-level keys and the text one as ``key=value``
+   pairs. Under plain uvicorn the text branch also installs a handler on
+   the otherwise-unconfigured root logger (``basicConfig`` semantics), so
+   INFO records actually reach the console instead of being dropped.
 2. **OTel logs pipeline** (``GATEWAY_OTEL_ENABLED=true`` + an OTLP endpoint) —
    a ``LoggerProvider`` with an OTLP log exporter, fed by ``OTelLogHandler``,
    a small ``logging.Handler`` that translates Python records to OTel log
@@ -80,6 +85,36 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
+class TextFormatter(logging.Formatter):
+    """Human-friendly single line: standard prefix + structured extras.
+
+    The text-mode mirror of :class:`JsonFormatter`: the pipeline's
+    per-request records carry their context as ``extra`` fields, and a
+    bare ``%(message)s`` console line would show none of it. The same
+    fields the JSON formatter lifts to top-level keys render as
+    ``key=value`` pairs, so the default mode stays greppable without
+    losing the structure. Values containing spaces (or quotes) are
+    JSON-quoted so the pairs stay scannable.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(fmt="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        pairs: list[str] = []
+        for key, value in vars(record).items():
+            if key in _RESERVED_ATTRS or key.startswith("_") or value is None:
+                continue
+            text = value if isinstance(value, str) else str(value)
+            if " " in text or '"' in text:
+                text = json.dumps(text, ensure_ascii=False)
+            pairs.append(f"{key}={text}")
+        if pairs:
+            line += " " + " ".join(pairs)
+        return line
+
+
 class OTelLogHandler(logging.Handler):
     """Forward Python log records into an OTel logs pipeline.
 
@@ -132,15 +167,30 @@ class OTelLogHandler(logging.Handler):
             self.handleError(record)
 
 
+def _drop_marked_handlers(owner: logging.Logger, mark: str) -> None:
+    """Remove (and close) handlers a previous ``configure_logging`` added."""
+    for handler in list(owner.handlers):
+        if getattr(handler, mark, False):
+            owner.removeHandler(handler)
+            handler.close()
+
+
 def configure_logging(settings: Settings) -> None:
     """Apply GATEWAY_LOG_FORMAT / GATEWAY_LOG_LEVEL to the gateway's loggers.
 
     - ``json``: single-line JSON to stdout (propagation off, so records are
       not double-printed by any root handlers).
-    - ``text`` (default): stdlib/uvicorn behaviour, untouched.
+    - ``text`` (default): a formatted stdout handler on the ROOT logger —
+      but only when root is otherwise unconfigured (``basicConfig``
+      semantics). Plain uvicorn never configures root, so without this the
+      gateway's per-request INFO records were silently dropped and WARNINGs
+      printed bare via the stdlib last-resort handler. Anything that DID
+      configure root — an operator script, gunicorn's logger class, a test
+      harness — keeps full control and gets no second handler.
 
     Idempotent — safe to call for every ``create_app``.
     """
+    root = logging.getLogger()
     gw = logging.getLogger("gateway")
     try:
         gw.setLevel((settings.log_level or "INFO").upper())
@@ -148,11 +198,10 @@ def configure_logging(settings: Settings) -> None:
         gw.setLevel(logging.INFO)
 
     # Remove handlers a previous create_app installed (tests create apps
-    # repeatedly in one process).
-    for handler in list(gw.handlers):
-        if getattr(handler, "_gateway_json", False):
-            gw.removeHandler(handler)
-            handler.close()
+    # repeatedly in one process) — from both loggers we may own.
+    _drop_marked_handlers(gw, "_gateway_json")
+    _drop_marked_handlers(root, "_gateway_json")
+    _drop_marked_handlers(root, "_gateway_text")
 
     if (settings.log_format or "text").lower() == "json":
         handler = logging.StreamHandler(sys.stdout)
@@ -162,6 +211,11 @@ def configure_logging(settings: Settings) -> None:
         gw.propagate = False
     else:
         gw.propagate = True
+        if not root.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(TextFormatter())
+            handler._gateway_text = True  # type: ignore[attr-defined]
+            root.addHandler(handler)
 
 
 def configure_otel_logs(

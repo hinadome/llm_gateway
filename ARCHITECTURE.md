@@ -477,9 +477,13 @@ gateway/
     ├── tracing.py          OpenTelemetry setup: resource, head-based sampler
     │                       (OTEL_TRACES_SAMPLER), BatchSpanProcessor (OTEL_BSP_*),
     │                       OTLP/console exporter selection
-    ├── logs.py             Structured logging: JSON stdout formatter
-    │                       (GATEWAY_LOG_FORMAT=json) + OTel logs pipeline
-    │                       (records stamped with the current span's trace context)
+    ├── logs.py             Structured logging: JsonFormatter / TextFormatter
+    │                       (GATEWAY_LOG_FORMAT — both carry the per-request
+    │                       record's extras; text installs a root stdout
+    │                       handler when root is unconfigured, basicConfig
+    │                       semantics, so plain uvicorn actually prints
+    │                       INFO records) + OTel logs pipeline (records
+    │                       stamped with the current span's trace context)
     └── metrics_bridge.py   Prometheus → OTel bridge: mirrors gateway.* series
                             into an OTLP metrics pipeline (observable instruments
                             reading the live prometheus_client registry)

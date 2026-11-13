@@ -8,6 +8,17 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Fixed
 
+- Default text-mode console logging showed no per-request detail: the
+  pipeline logs one `chat request completed` INFO record per request
+  (model, provider, deployment, tokens, cost, latency), but plain uvicorn
+  never configures the root logger, so those records were silently
+  dropped — only WARNINGs surfaced, bare, via the stdlib last-resort
+  handler. Text mode now installs a formatted stdout handler on the root
+  logger when nothing else has configured it (`basicConfig` semantics —
+  gunicorn's logger class or an operator script keeps full control),
+  rendering the record's structured extras as `key=value` pairs (the
+  text-mode mirror of the JSON formatter). One console line per request,
+  greppable, no config needed.
 - Authentication and authorization rejections were invisible server-side:
   uvicorn's access log shows only the bare `401`, and failed auth never
   reaches the request-log pipeline (there is no key to log against) —

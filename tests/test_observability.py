@@ -7,9 +7,13 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from contextlib import contextmanager
 
 from opentelemetry.trace import SpanKind, StatusCode
 from prometheus_client import REGISTRY
+
+from gateway.config import Settings
+from gateway.observability.logs import configure_logging
 
 from .conftest import ADMIN_KEY, auth, chat_body, create_key
 
@@ -371,6 +375,154 @@ def test_json_log_formatter():
     # reserved LogRecord attributes stay out of the payload
     assert "levelname" not in data and "module" not in data and "args" not in data
     assert "timestamp" in data
+
+
+def test_text_log_formatter():
+    from gateway.observability.logs import TextFormatter
+
+    formatter = TextFormatter()
+    record = logging.LogRecord(
+        name="gateway.pipeline",
+        level=logging.INFO,
+        pathname="pipeline.py",
+        lineno=7,
+        msg="chat request completed",
+        args=(),
+        exc_info=None,
+    )
+    record.request_id = "req-42"
+    record.model = "glm-53"
+    record.reason = "no credential presented"  # spaces -> JSON-quoted
+    record.span_id = None  # None values are dropped
+
+    line = formatter.format(record)
+    # standard prefix: timestamp, level, logger name, message
+    assert " INFO gateway.pipeline chat request completed " in line
+    assert line.split(" ")[0].count("-") == 2  # yyyy-mm-dd date
+    # extras render as key=value pairs, values with spaces get quoted
+    assert "request_id=req-42" in line
+    assert "model=glm-53" in line
+    assert 'reason="no credential presented"' in line
+    assert "span_id" not in line
+    # reserved LogRecord attributes stay out of the pairs
+    assert "levelname=" not in line and "module=" not in line
+
+
+# ----------------------------------------------------------------------
+# configure_logging: text mode must reach an actually-visible console
+# ----------------------------------------------------------------------
+
+
+@contextmanager
+def _bare_root():
+    """Run with an unconfigured root logger, as plain uvicorn leaves it.
+
+    Under pytest the logging plugin keeps a capture handler on root; the
+    text branch only installs its own handler when root is *otherwise*
+    unconfigured (basicConfig semantics), so tests must recreate that
+    state — and restore whatever was there, whatever happens.
+    """
+    root = logging.getLogger()
+    saved = root.handlers[:]
+    root.handlers = []
+    try:
+        yield root
+    finally:
+        for handler in list(root.handlers):
+            if getattr(handler, "_gateway_text", False) or getattr(
+                handler, "_gateway_json", False
+            ):
+                root.removeHandler(handler)
+                handler.close()
+        root.handlers = saved
+
+
+def test_text_mode_installs_root_stdout_handler(capfd):
+    """The bug this fixes: under plain uvicorn, root is never configured,
+    so the gateway's per-request INFO records were silently dropped (only
+    WARNINGs surfaced, bare, via the stdlib last-resort handler). Text mode
+    now installs a formatted stdout handler on root — and the record's
+    structured extras show up in the console line."""
+    with _bare_root() as root:
+        configure_logging(Settings(log_format="text"))
+        text_handlers = [h for h in root.handlers if getattr(h, "_gateway_text", False)]
+        assert len(text_handlers) == 1
+
+        logging.getLogger("gateway.pipeline").info(
+            "chat request completed",
+            extra={"request_id": "req-7", "model": "glm-53", "error": None},
+        )
+        out = capfd.readouterr().out
+        assert "INFO gateway.pipeline chat request completed" in out
+        assert "request_id=req-7" in out
+        assert "model=glm-53" in out
+        assert "error=" not in out  # None extras are dropped
+
+        # a WARNING (e.g. an auth rejection) is formatted too — no more
+        # bare last-resort lines
+        logging.getLogger("gateway.auth").warning("auth rejected: GET /v1/models")
+        out = capfd.readouterr().out
+        assert "WARNING gateway.auth auth rejected: GET /v1/models" in out
+
+
+def test_text_mode_leaves_a_configured_root_alone():
+    """basicConfig semantics: whoever configured root first keeps control —
+    the gateway never adds a second handler (gunicorn's logger class, an
+    operator script, a test harness)."""
+    with _bare_root():
+        root = logging.getLogger()
+        operator = logging.NullHandler()
+        root.addHandler(operator)
+        configure_logging(Settings(log_format="text"))
+        assert root.handlers == [operator]
+
+
+def test_configure_logging_is_idempotent(capfd):
+    """Every create_app calls configure_logging; repeated text-mode calls
+    must replace, not stack, the root handler — one line per record."""
+    with _bare_root():
+        configure_logging(Settings(log_format="text"))
+        configure_logging(Settings(log_format="text"))
+        root = logging.getLogger()
+        text_handlers = [h for h in root.handlers if getattr(h, "_gateway_text", False)]
+        assert len(text_handlers) == 1
+
+        logging.getLogger("gateway.pipeline").info(
+            "chat request completed", extra={"model": "glm-53"}
+        )
+        out = capfd.readouterr().out
+        assert out.count("chat request completed") == 1
+
+
+def test_json_mode_switch_removes_text_handler(capfd):
+    """Mode switches in both directions leave no stale handlers: text →
+    json drops the root text handler, and JSON records still carry the
+    structured extras as top-level keys."""
+    with _bare_root():
+        configure_logging(Settings(log_format="text"))
+        configure_logging(Settings(log_format="json"))
+        root = logging.getLogger()
+        assert not [h for h in root.handlers if getattr(h, "_gateway_text", False)]
+
+        gw = logging.getLogger("gateway")
+        assert gw.propagate is False
+        try:
+            logging.getLogger("gateway.pipeline").info(
+                "chat request completed",
+                extra={"request_id": "req-9", "model": "glm-53"},
+            )
+            out = capfd.readouterr().out
+            rec = json.loads(out.strip().splitlines()[-1])
+            assert rec["message"] == "chat request completed"
+            assert rec["request_id"] == "req-9"
+            assert rec["model"] == "glm-53"
+        finally:
+            # leave the logger tree as the other tests expect it
+            gw.propagate = True
+            for handler in list(gw.handlers):
+                if getattr(handler, "_gateway_json", False):
+                    gw.removeHandler(handler)
+                    handler.close()
 
 
 async def test_otel_log_handler_stamps_trace_context(tracer_provider):
