@@ -588,6 +588,14 @@ async def delete_prompt_version(
 # ----------------------------------------------------------------------
 
 
+def _decode_rate(row: RequestLog) -> float | None:
+    """Completion tokens per second AFTER the first token (the decode
+    phase — excludes the wait for the model to start)."""
+    if not row.ttft_ms or not row.completion_tokens or (row.latency_ms or 0) <= row.ttft_ms:
+        return None
+    return round(row.completion_tokens / ((row.latency_ms - row.ttft_ms) / 1000.0), 1)
+
+
 def _log_row(row: RequestLog) -> dict:
     """Log fields safe for list views (bodies excluded — they can be large)."""
     return {
@@ -606,6 +614,11 @@ def _log_row(row: RequestLog) -> dict:
         "completion_tokens": row.completion_tokens,
         "cost_usd": row.cost_usd,
         "latency_ms": row.latency_ms,
+        # Streaming detail: time-to-first-token (None on non-streaming
+        # rows) and the derived generation-phase decode rate
+        # (completion tokens per second after the first token).
+        "ttft_ms": row.ttft_ms,
+        "decode_tokens_per_sec": _decode_rate(row),
         "cache_hit": row.cache_hit,
         "shadow": bool(row.shadow),
         "prompt_variant": row.prompt_variant,
@@ -777,6 +790,20 @@ async def stats(
         )
         latencies = [row[0] for row in latency_rows if row[0] is not None]
 
+        # TTFT percentiles over streamed requests only — non-streaming
+        # rows have nothing to measure (the whole response arrives at
+        # once, so "first token" would just be the latency again).
+        ttft_rows = await session.execute(
+            select(RequestLog.ttft_ms)
+            .where(
+                *conds,
+                RequestLog.ttft_ms.isnot(None),
+            )
+            .order_by(RequestLog.ttft_ms)
+            .limit(5000)
+        )
+        ttfts = [row[0] for row in ttft_rows if row[0] is not None]
+
         tokens_row = await session.execute(
             select(
                 func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
@@ -801,6 +828,11 @@ async def stats(
             "p50": _percentile(latencies, 0.50),
             "p95": _percentile(latencies, 0.95),
             "p99": _percentile(latencies, 0.99),
+        },
+        "ttft_ms": {
+            "p50": _percentile(ttfts, 0.50),
+            "p95": _percentile(ttfts, 0.95),
+            "p99": _percentile(ttfts, 0.99),
         },
         "by_model": by_model,
         "by_key": by_key,

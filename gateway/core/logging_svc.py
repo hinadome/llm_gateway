@@ -98,6 +98,7 @@ class LoggingService:
                 ),
                 cost_usd=ctx.cost_usd,
                 latency_ms=ctx.latency_ms(),
+                ttft_ms=ctx.ttft_ms,
                 cache_hit=ctx.cache_hit,
                 shadow=ctx.shadow,
                 prompt_variant=ctx.prompt_variant,

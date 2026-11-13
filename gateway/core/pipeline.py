@@ -985,9 +985,17 @@ class GatewayPipeline:
         usage: dict | None = None
         blocked = False
         rewrite_state = self.guardrails.new_stream_rewrite_state(request, ctx)
+        # TTFT bookkeeping: the first chunk received off the wire (any
+        # chunk — role chunks arrive back-to-back with content) and
+        # the first chunk actually carrying content/audio (the token
+        # the client perceives generation starting at).
+        first_chunk_at: float | None = None
+        first_token_at: float | None = None
 
         try:
             async for chunk in chunk_iterator:
+                if first_chunk_at is None:
+                    first_chunk_at = time.monotonic()
                 if isinstance(chunk.get("usage"), dict) and not chunk.get("choices"):
                     # provider/translator usage summary chunk
                     usage = chunk["usage"]
@@ -1010,6 +1018,8 @@ class GatewayPipeline:
                 # bytes are never rewritten.
                 transcript = str((delta.get("audio") or {}).get("transcript") or "")
                 guardrail_text = delta_text or transcript
+                if guardrail_text and first_token_at is None:
+                    first_token_at = time.monotonic()
 
                 if guardrail_text:
                     # Stream guardrails inspect what has been sent so far
@@ -1088,6 +1098,14 @@ class GatewayPipeline:
             )
             yield "data: [DONE]\n\n"
         finally:
+            # TTFT: first content-bearing chunk, falling back to the
+            # first chunk at all (a stream that never carries content —
+            # blocked or errored — still measured to its first byte;
+            # streams that never yielded stay None).
+            if first_token_at is not None or first_chunk_at is not None:
+                ctx.ttft_ms = int(
+                    ((first_token_at or first_chunk_at) - ctx.started_monotonic) * 1000
+                )
             if not blocked and ctx.status != "blocked":
                 ctx.status = "success" if ctx.error_message is None else ctx.status
             # Mirror to shadow deployments once the stream has completed
@@ -1967,6 +1985,7 @@ class GatewayPipeline:
                 "completion_tokens": ctx.completion_tokens,
                 "cost_usd": round(ctx.cost_usd, 8) or None,
                 "latency_ms": ctx.latency_ms(),
+                "ttft_ms": ctx.ttft_ms,
                 "error": ctx.error_message,
             },
         )

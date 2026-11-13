@@ -111,6 +111,18 @@ class RequestContext:
     cost_usd: float = 0.0
     status: str = "success"  # success | error | blocked
     error_message: str | None = None
+    # Time-to-first-token for streamed responses: milliseconds from
+    # request start to the first content-bearing chunk off the wire
+    # (the first chunk at all when none ever carries content — role
+    # chunks arrive back-to-back with content from the provider, so
+    # this is what the client perceives as generation starting). None
+    # for non-streaming requests, cache-hit replays (nothing went on
+    # the wire — the same rule as wire capture) and streams that never
+    # yielded a chunk (blocked before dispatch, upstream error at
+    # connect). The decode rate derives from it: completion_tokens /
+    # seconds AFTER the first token (the generation phase, not the
+    # wait).
+    ttft_ms: int | None = None
     # True for shadow (mirrored) calls: not client-facing. Shadow rows are
     # excluded from /admin/stats and never add to key spend — they carry
     # their own cost/bodies for comparison (see pipeline._queue_shadow).
@@ -150,6 +162,22 @@ class RequestContext:
 
     def latency_ms(self) -> int:
         return int((time.monotonic() - self.started_monotonic) * 1000)
+
+    def decode_tokens_per_sec(self) -> float | None:
+        """Generation-phase speed for streamed responses: completion
+        tokens per second AFTER the first token (the decode phase,
+        with the time waiting for the model to start excluded). None
+        when it cannot be computed (not streamed, no tokens, or a
+        decode phase too short to be meaningful)."""
+        if (
+            self.ttft_ms is None
+            or not self.completion_tokens
+            or self.latency_ms() <= self.ttft_ms
+        ):
+            return None
+        return round(
+            self.completion_tokens / ((self.latency_ms() - self.ttft_ms) / 1000.0), 1
+        )
 
     def record_guardrail(self, entry: dict[str, Any]) -> None:
         self.guardrail_actions.append(entry)

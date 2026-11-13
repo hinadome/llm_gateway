@@ -655,6 +655,7 @@ async function loadOverview() {
     <div class="card"><div class="k">Error rate</div><div class="v">${(s.error_rate * 100).toFixed(1)}%</div><div class="sub">errors + blocked</div></div>
     <div class="card"><div class="k">Spend</div><div class="v">${fmtUsd(s.cost_usd_total)}</div><div class="sub">window total</div></div>
     <div class="card"><div class="k">Latency p95</div><div class="v">${fmtMs(s.latency_ms.p95)}</div><div class="sub">p50 ${fmtMs(s.latency_ms.p50)} · p99 ${fmtMs(s.latency_ms.p99)}</div></div>
+    <div class="card"><div class="k">TTFT p95</div><div class="v">${s.ttft_ms ? fmtMs(s.ttft_ms.p95) : "—"}</div><div class="sub">streamed · p50 ${s.ttft_ms ? fmtMs(s.ttft_ms.p50) : "—"} · p99 ${s.ttft_ms ? fmtMs(s.ttft_ms.p99) : "—"}</div></div>
     <div class="card"><div class="k">Prompt tokens</div><div class="v">${fmtInt(s.tokens.prompt)}</div></div>
     <div class="card"><div class="k">Completion tokens</div><div class="v">${fmtInt(s.tokens.completion)}</div></div>`;
   const models = s.by_model || [];
@@ -1248,7 +1249,7 @@ async function loadLogs() {
       <td><span class="b ${st}">${esc(l.status)}</span></td>
       <td class="num">${l.prompt_tokens == null ? "—" : fmtInt(l.prompt_tokens) + " / " + fmtInt(l.completion_tokens)}</td>
       <td class="num">${fmtUsd(l.cost_usd)}</td>
-      <td class="num">${fmtMs(l.latency_ms)}</td>
+      <td class="num">${fmtMs(l.latency_ms)}${l.ttft_ms != null ? `<div class="muted" style="font-size:10px">ttft ${fmtMs(l.ttft_ms)}${l.decode_tokens_per_sec != null ? " · " + l.decode_tokens_per_sec.toFixed(1) + " tok/s" : ""}</div>` : ""}</td>
     </tr>` + (open ? `<tr class="detail"><td colspan="8" id="logdetail-${l.id}"><div class="empty">loading…</div></td></tr>` : "");
   }).join("");
   $("#logs-table").innerHTML = "<thead><tr><th>When</th><th>Key</th><th>Model</th><th>Deployment</th><th>Status</th><th class=num>Tokens</th><th class=num>Cost</th><th class=num>Latency</th></tr></thead><tbody>" +
@@ -1303,6 +1304,7 @@ async function fillLogDetail(id) {
       <div class="kv" style="margin-top:12px">
         <span>request id</span><span class="mono">${esc(l.request_id)}</span>
         <span>trace / span</span><span class="mono">${esc(l.trace_id || "—")} / ${esc(l.span_id || "—")}</span>
+        <span>ttft / decode</span><span class="mono">${l.ttft_ms != null ? fmtMs(l.ttft_ms) + " · " + (l.decode_tokens_per_sec != null ? l.decode_tokens_per_sec.toFixed(1) + " tok/s" : "—") : "— (not streamed)"}</span>
         <span>error</span><span>${esc(l.error_message || "—")}</span>
       </div>`;
   } catch (e) {

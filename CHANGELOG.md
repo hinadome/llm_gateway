@@ -8,6 +8,25 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- TTFT + decode rate on streamed request-log rows: streaming latency
+  was a single `latency_ms` number; rows now also record `ttft_ms` —
+  milliseconds from request start to the first *content-bearing* chunk
+  off the wire (role chunks arrive back-to-back with content, so this
+  is when the client perceives generation starting; the first chunk at
+  all serves as fallback when none ever carries content) — and
+  `/admin/logs` rows expose the derived `decode_tokens_per_sec`
+  (completion tokens per second AFTER the first token: the generation
+  phase, with the model-start wait excluded). Provider-side by design:
+  cache-hit replays record NULL (nothing went on the wire — the same
+  rule as wire capture), non-streaming rows record NULL, and the
+  existing Prometheus `gateway_stream_ttft_seconds` histogram remains
+  the client-side counterpart (first chunk delivered, cache hits
+  included). `/admin/stats` reports `ttft_ms` p50/p95/p99 over streamed
+  rows; the per-request console record carries `ttft_ms` for streamed
+  requests; the dashboard shows a TTFT p95 overview card, a ttft/tok-s
+  line under each streamed row's latency, and ttft + decode rate in
+  the log detail. Existing databases auto-upgrade (new nullable
+  column).
 - HTTPS serving via `python -m gateway` (wrapped by `scripts/gateway.sh`):
   three certificate modes behind flags — `--self-signed [DIR]` (development
   pair generated on first use under `deploy/certs/` and reused after;

@@ -942,6 +942,7 @@ erDiagram
         int total_tokens
         float cost_usd
         int latency_ms
+        int ttft_ms "streamed: ms to first content chunk; NULL when not streamed / cache hit"
         bool cache_hit
         bool shadow "mirrored (shadow deployment) call, not client-facing; shares the primary's request_id, excluded from /admin/stats"
         str trace_id "indexed; OTel trace (32 hex), NULL when tracing off"
@@ -1414,7 +1415,7 @@ Three pillars, all wired from `create_app` and all testable in-process:
 | Pillar | Status | Where |
 |---|---|---|
 | **Metrics** | Always on — Prometheus, 24 series at `/metrics` (per-key family opt-in); optional OTLP mirror | `observability/metrics.py`, `observability/metrics_bridge.py` |
-| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`); optional JSON stdout + OTel logs pipeline; wire capture: allowlisted client request headers, the upstream request as sent to the provider and allowlisted provider response headers | `core/logging_svc.py`, `observability/logs.py`, `observability/wire.py` |
+| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`); optional JSON stdout + OTel logs pipeline; wire capture: allowlisted client request headers, the upstream request as sent to the provider and allowlisted provider response headers; streamed rows carry `ttft_ms` (time-to-first-token) and the derived decode rate | `core/logging_svc.py`, `observability/logs.py`, `observability/wire.py` |
 | **Traces** | Opt-in (`GATEWAY_OTEL_ENABLED=true`) — OpenTelemetry, W3C propagation, configurable sampling & batching | `observability/tracing.py` |
 
 A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, Prometheus with alert rules, Grafana dashboard) ships in `deploy/` — see §10.5.

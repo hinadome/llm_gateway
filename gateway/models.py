@@ -248,6 +248,11 @@ class RequestLog(Base):
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Time-to-first-token for streamed requests (ms from request start
+    # to the first content-bearing chunk; see RequestContext.ttft_ms).
+    # Nullable: NULL on non-streaming rows and on rows written before
+    # the column existed (the auto-upgrade adds it as NULL).
+    ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_hit: Mapped[bool] = mapped_column(Boolean, default=False)
     # True when this row records a *shadow* (mirrored) call rather than the
     # client-facing request. Shadow rows share the primary's request_id,
