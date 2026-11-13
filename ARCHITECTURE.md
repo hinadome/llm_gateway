@@ -484,6 +484,14 @@ gateway/
     │                       semantics, so plain uvicorn actually prints
     │                       INFO records) + OTel logs pipeline (records
     │                       stamped with the current span's trace context)
+    ├── wire.py             Wire capture for request-log rows: allowlisted
+    │                       client request headers (set by the middleware),
+    │                       the upstream request as sent to the provider
+    │                       (method/path/native body, via httpx request
+    │                       hooks) and allowlisted provider response
+    │                       headers (via response hooks) — context-local,
+    │                       snapshotted into RequestContext before the row
+    │                       is written
     └── metrics_bridge.py   Prometheus → OTel bridge: mirrors gateway.* series
                             into an OTLP metrics pipeline (observable instruments
                             reading the live prometheus_client registry)
@@ -1393,7 +1401,7 @@ Three pillars, all wired from `create_app` and all testable in-process:
 | Pillar | Status | Where |
 |---|---|---|
 | **Metrics** | Always on — Prometheus, 24 series at `/metrics` (per-key family opt-in); optional OTLP mirror | `observability/metrics.py`, `observability/metrics_bridge.py` |
-| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`); optional JSON stdout + OTel logs pipeline | `core/logging_svc.py`, `observability/logs.py` |
+| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`); optional JSON stdout + OTel logs pipeline; wire capture: allowlisted client request headers, the upstream request as sent to the provider and allowlisted provider response headers | `core/logging_svc.py`, `observability/logs.py`, `observability/wire.py` |
 | **Traces** | Opt-in (`GATEWAY_OTEL_ENABLED=true`) — OpenTelemetry, W3C propagation, configurable sampling & batching | `observability/tracing.py` |
 
 A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, Prometheus with alert rules, Grafana dashboard) ships in `deploy/` — see §10.5.

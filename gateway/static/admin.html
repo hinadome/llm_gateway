@@ -1281,13 +1281,22 @@ async function fillLogDetail(id) {
       (a.reason ? `<div class="muted" style="margin:2px 0 6px">${esc(a.reason)}</div>` : "") + "</div>"
     ).join("") || '<span class="muted">none</span>';
     const j = v => esc(JSON.stringify(v ?? null, null, 2));
+    const hdrs = h => {
+      const entries = Object.entries(h || {});
+      if (!entries.length) return '<span class="muted">—</span>';
+      return `<div class="kv" style="grid-template-columns:auto 1fr">` +
+        entries.map(([k, v]) => `<span class="mono" style="font-size:12px">${esc(k)}</span><span class="mono" style="font-size:12px;word-break:break-all">${esc(String(v))}</span>`).join("") +
+        `</div>`;
+    };
     cell.innerHTML = `
       <div class="detailgrid">
         <div>
           <h4>Request body</h4><pre class="json">${j(l.request_body)}</pre>
+          <h4 style="margin-top:12px">Client headers</h4>${hdrs(l.client_headers)}
         </div>
         <div>
-          <h4>Response body</h4><pre class="json">${j(l.response_body)}</pre>
+          ${l.upstream_request ? `<h4>Upstream request (as sent to provider)</h4><pre class="json">${j(l.upstream_request)}</pre><h4 style="margin-top:12px">Response body</h4>` : `<h4>Response body</h4>`}<pre class="json">${j(l.response_body)}</pre>
+          <h4 style="margin-top:12px">Upstream response headers</h4>${hdrs(l.upstream_headers)}
           <h4 style="margin-top:12px">Guardrail actions</h4>${actions}
         </div>
       </div>

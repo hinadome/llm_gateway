@@ -372,17 +372,23 @@ class MockUpstream:
                 self.fail_counts[fields["model"]] -= 1
                 return httpx.Response(500, json={"error": {"message": "boom"}})
             fmt = fields.get("response_format")
+            # Provider-style response headers, same as the chat branches
+            # (wire-capture assertions).
+            mock_headers = {
+                "x-request-id": "req_mock_123",
+                "x-ratelimit-remaining-requests": "41",
+            }
             if fmt in ("text", "srt", "vtt"):
                 text = (
                     "1\n00:00:00,000 --> 00:00:01,000\ntranscribed words\n"
                     if fmt == "srt"
                     else "transcribed words"
                 )
-                return httpx.Response(200, text=text)
+                return httpx.Response(200, text=text, headers=mock_headers)
             out = {"text": "transcribed words", "model": fields.get("model")}
             if fmt == "verbose_json":
                 out["duration"] = 42.0  # seconds — drives per-minute cost
-            return httpx.Response(200, json=out)
+            return httpx.Response(200, json=out, headers=mock_headers)
         if path.endswith("/audio/speech"):
             # Streamed in two chunks, proving the adapter forwards bytes as
             # they arrive rather than buffering the whole body.
@@ -489,7 +495,18 @@ class MockUpstream:
                 return httpx.Response(
                     200, text=self.audio_stream_text or AUDIO_STREAM_TEXT
                 )
-            return httpx.Response(200, text=self.stream_text or STREAM_TEXT)
+            # Same provider-style response headers as the non-streaming
+            # branch, so wire-capture tests cover streams too.
+            return httpx.Response(
+                200,
+                headers={
+                    "x-request-id": "req_mock_123",
+                    "x-ratelimit-remaining-requests": "41",
+                    "x-ratelimit-remaining-tokens": "9987",
+                    "content-type": "text/event-stream",
+                },
+                text=self.stream_text or STREAM_TEXT,
+            )
         if wants_audio:
             # Audio-output chat (gpt-4o-audio shape): the words live in
             # message.audio.transcript, content is null.
@@ -525,6 +542,15 @@ class MockUpstream:
             )
         return httpx.Response(
             200,
+            headers={
+                # Provider-style response headers, so wire-capture tests can
+                # assert the allowlisted subset lands on the log row (and
+                # that credential-bearing request headers never do).
+                "x-request-id": "req_mock_123",
+                "x-ratelimit-remaining-requests": "41",
+                "x-ratelimit-remaining-tokens": "9987",
+                "content-type": "application/json",
+            },
             json={
                 "id": "chatcmpl-mock123",
                 "object": "chat.completion",

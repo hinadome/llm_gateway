@@ -289,6 +289,17 @@ class LoggingConfig(BaseModel):
     # and shutdown drains what is pending.
     background_write: bool = False
     queue_size: int = 1000
+    # Wire capture (request-log rows): which headers to persist, as
+    # ALLOWLISTS (allow, never block — a new credential-bearing header
+    # can never leak into stored rows by default; Authorization /
+    # x-api-key / x-goog-api-key / api-key are deliberately absent).
+    # Entries are lowercase header names; a trailing "*" matches prefixes
+    # (e.g. "x-ratelimit-*"). None = the built-in defaults. The client
+    # list is read per request (reload applies live); the upstream list
+    # is bound into the provider HTTP client's capture hooks (restart to
+    # change — same rule as rotating provider credentials).
+    client_header_allowlist: list[str] | None = None
+    upstream_header_allowlist: list[str] | None = None
 
 
 class MetricsConfig(BaseModel):

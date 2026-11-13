@@ -70,6 +70,24 @@ class LoggingService:
                 response_body=(
                     self._truncate_payload(ctx.response_body) if self.store_bodies else None
                 ),
+                # Wire capture: the upstream body is traffic content, so it
+                # follows store_bodies (method/path stay — transport
+                # metadata); headers are metadata, like tokens/latency.
+                client_headers=ctx.client_headers,
+                upstream_request=(
+                    self._truncate_payload(
+                        ctx.upstream_request
+                        if self.store_bodies
+                        else {
+                            k: v
+                            for k, v in ctx.upstream_request.items()
+                            if k != "body"
+                        }
+                    )
+                    if ctx.upstream_request is not None
+                    else None
+                ),
+                upstream_headers=ctx.upstream_headers,
                 stream=ctx.stream,
                 prompt_tokens=ctx.prompt_tokens,
                 completion_tokens=ctx.completion_tokens,

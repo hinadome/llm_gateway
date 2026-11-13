@@ -505,6 +505,12 @@ logging:
                             # optimization; full queue drops rows, counted
                             # on gateway_logs_dropped_total)
   #queue_size: 1000         # bound of that background queue
+  # Wire capture on log rows (allowlists — allow, never block, so new
+  # credential headers can't leak by default; trailing "*" matches
+  # prefixes). Client list read per request (reload applies live);
+  # upstream list bound into the provider client's hooks (restart).
+  #client_header_allowlist: ["user-agent", "x-request-id"]
+  #upstream_header_allowlist: ["x-request-id", "retry-after", "x-ratelimit-*"]
 
 #metrics:
 #  per_key: true            # per-key request/token/cost series (opt-in —
@@ -598,7 +604,9 @@ Because the OpenAI adapter is a passthrough, you can point `providers.openai.api
 | `gateway_shadow_requests_total` | counter | deployment, outcome (success / error) — requests mirrored to shadow deployments (never affect the client) |
 | `gateway_shadow_latency_seconds` | histogram | deployment — latency of mirrored (shadow) upstream calls |
 
-**Request logs (always on)** — every request lands in the DB (request/response bodies, guardrail decisions, tokens, cost, latency, cache status) and is queryable via `GET /admin/logs` and `GET /admin/stats`. Two compliance knobs in `logging:`: `store_bodies: false` stops persisting request/response bodies (metadata — tokens, cost, latency, status, guardrail verdicts — still is; note `guardrail_actions` details and `error_message` may still quote traffic fragments), and `retention_days` makes a background task delete older rows (counted on `gateway_logs_pruned_total`). A third knob changes the write's timing: `background_write: true` queues the row INSERT to a background consumer instead of awaiting it in the response path — see the design notes below for the trade.
+**Request logs (always on)** — every request lands in the DB (request/response bodies, guardrail decisions, tokens, cost, latency, cache status) and is queryable via `GET /admin/logs` and `GET /admin/stats`. Three compliance knobs in `logging:`: `store_bodies: false` stops persisting request/response bodies (metadata — tokens, cost, latency, status, guardrail verdicts — still is; note `guardrail_actions` details and `error_message` may still quote traffic fragments), `retention_days` makes a background task delete older rows (counted on `gateway_logs_pruned_total`), and `background_write: true` queues the row INSERT to a background consumer instead of awaiting it in the response path — see the design notes below for the trade.
+
+**Wire capture (headers + what actually went to the provider)** — each row also stores, via strict allowlists: the inbound request headers worth keeping (which SDK made the call, client correlation ids — `user-agent`, `x-request-id`, the OpenAI SDKs' `x-stainless-*` telemetry; never credentials), the request as actually sent to the provider (method, path and provider-native body — after model mapping, prompt injection, guardrail edits and provider adaptation), and the provider's response headers worth keeping (`x-request-id`/`request-id` for support-ticket correlation, `retry-after`, `x-ratelimit-*` / `ratelimit-*` state). Allowlists are config (`logging.client_header_allowlist` / `logging.upstream_header_allowlist`; entries are lowercase names, trailing `*` matches prefixes); the upstream body follows `store_bodies`, headers are metadata and stay. Cache hits record no upstream fields (nothing went on the wire). The dashboard's log detail shows all of it: client headers next to the request body, the upstream request and upstream response headers next to the response body.
 
 **Auth & authorization rejections (always on)** — a failed auth or scoping check never reaches the request-log pipeline (there is no key to log against), so each one emits a single WARNING line on the `gateway.auth` logger instead: method, path, client address, the reason (the same message the 401/403 response body carries) and a redacted credential hint — 12 characters, the same shape as `key_prefix`, never the full key, enough to tell *which* key was tried. Scope rejections (IP allowlist, endpoint scopes) name the key. Example: `auth rejected: GET /v1/models from 127.0.0.1 — Incorrect API key provided. (credential sk-gw-6T37nE…)`. These lines and `gateway_auth_total{result="rejected"}` are the server-side traces of a rejected call; uvicorn's access log shows only the bare status code.
 

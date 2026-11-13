@@ -67,6 +67,7 @@ from .observability.logs import (
 )
 from .observability.metrics_bridge import start_metrics_bridge
 from .observability.tracing import build_resource, configure_tracing
+from .observability import wire
 from .providers import build_providers
 
 logger = logging.getLogger("gateway")
@@ -148,6 +149,32 @@ def create_app(
         meter_provider = start_metrics_bridge(resource)
 
     client = http_client or httpx.AsyncClient(timeout=httpx.Timeout(300.0))
+    # Wire capture (request-log rows): hooks on the shared provider client
+    # snapshot what goes to / comes back from the provider. Attached to
+    # whichever client ends up in use (tests inject their own transport) —
+    # idempotent, marked so a second create_app with the same client does
+    # not double them. The allowlist/body cap are bound here: rotating
+    # them takes a restart (like provider credentials — the adapters hold
+    # this client across config reloads).
+    if not any(
+        getattr(h, "_gateway_wire", False) for h in client.event_hooks["request"]
+    ):
+        upstream_allowlist = tuple(
+            config.logging.upstream_header_allowlist
+            or wire.DEFAULT_UPSTREAM_HEADER_ALLOWLIST
+        )
+        max_body_chars = config.logging.max_body_chars
+
+        async def _wire_request_hook(request: httpx.Request) -> None:
+            wire.capture_upstream_request(request, max_body_chars)
+
+        async def _wire_response_hook(response: httpx.Response) -> None:
+            wire.capture_upstream_response(response, upstream_allowlist)
+
+        _wire_request_hook._gateway_wire = True  # type: ignore[attr-defined]
+        _wire_response_hook._gateway_wire = True  # type: ignore[attr-defined]
+        client.event_hooks["request"].append(_wire_request_hook)
+        client.event_hooks["response"].append(_wire_response_hook)
     providers = build_providers(config, client)
 
     # ---- Shared-state backends (cache, rate limiter, circuit breakers) ----
@@ -396,6 +423,17 @@ def create_app(
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
         request.state.request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex}"
+        # Wire capture for the request-log row: the allowlisted inbound
+        # headers (allowlist read per request, so config reloads apply
+        # live), and a clean slate for the upstream slots — a cache hit or
+        # a failure before dispatch must record None, not whatever a
+        # previous request left in this task's context.
+        try:
+            allowlist = request.app.state.config.logging.client_header_allowlist
+        except AttributeError:
+            allowlist = None
+        wire.set_client_headers(request.headers, allowlist)
+        wire.reset_upstream()
         response = await call_next(request)
         response.headers.setdefault("X-Request-Id", request.state.request_id)
         return response

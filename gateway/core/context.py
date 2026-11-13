@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from ..observability import wire
+
 if TYPE_CHECKING:  # pragma: no cover
     from opentelemetry.trace import Span
 
@@ -129,6 +131,22 @@ class RequestContext:
     request_body: dict[str, Any] = field(default_factory=dict)
     effective_request: dict[str, Any] | None = None
     response_body: dict[str, Any] | None = None
+
+    # Wire capture (see observability/wire.py). client_headers is
+    # snapshotted here from the request's context (the middleware sets
+    # it); the upstream pair is snapshotted by the pipeline in _log,
+    # after the provider call, and stays None when nothing went on the
+    # wire (cache hit, blocked before dispatch).
+    client_headers: dict[str, str] | None = None
+    upstream_request: dict[str, Any] | None = None
+    upstream_headers: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        # Mirror contexts (shadow / A-B) inherit the parent task's copy of
+        # the client-headers slot — correct: they serve the same client
+        # request. Contexts built outside a request (tests) just get None.
+        if self.client_headers is None:
+            self.client_headers = wire.client_headers()
 
     def latency_ms(self) -> int:
         return int((time.monotonic() - self.started_monotonic) * 1000)

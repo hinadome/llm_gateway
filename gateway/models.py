@@ -229,6 +229,19 @@ class RequestLog(Base):
     guardrail_actions: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     request_body: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     response_body: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
+    # Wire capture (see observability/wire.py): the allowlisted subset of
+    # the client's request headers (user-agent, SDK telemetry, correlation
+    # ids — never credentials); the request as actually sent to the
+    # provider — method, path and provider-native body, i.e. after model
+    # mapping, prompt injection, guardrail edits and provider adaptation;
+    # and the allowlisted subset of the provider's response headers
+    # (request ids, rate-limit state). Nullable: NULL on rows written
+    # before this capture existed (the auto-upgrade adds the columns as
+    # NULL), on cache hits (no upstream call happened), and whenever the
+    # allowlist matched nothing.
+    client_headers: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
+    upstream_request: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
+    upstream_headers: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     stream: Mapped[bool] = mapped_column(Boolean, default=False)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

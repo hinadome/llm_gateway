@@ -6,6 +6,34 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Wire capture on request-log rows: beyond the stored request/response
+  bodies, each row now records the allowlisted client request headers
+  (which SDK made the call — `user-agent`, the OpenAI SDKs'
+  `x-stainless-*` telemetry — and client correlation ids; never
+  credentials), the request **as actually sent to the provider** —
+  method, path and provider-native body, i.e. after model mapping,
+  prompt injection, guardrail edits and provider adaptation — and the
+  allowlisted provider response headers (`x-request-id` / `request-id`
+  for support-ticket correlation, `retry-after`, `x-ratelimit-*` /
+  `ratelimit-*` state). Allowlists are strict (allow, never block, so a
+  new credential-bearing header can never leak into stored rows by
+  default; `Authorization`, `x-api-key`, `x-goog-api-key` and `api-key`
+  are deliberately absent) and configurable via
+  `logging.client_header_allowlist` / `logging.upstream_header_allowlist`
+  (lowercase names; trailing `*` matches prefixes, e.g. `x-ratelimit-*`).
+  The upstream URL is stored as a path only — Gemini's `?key=` lives in
+  the query string. `store_bodies: false` suppresses the upstream body
+  (traffic content) while keeping method/path and the header snapshots
+  (metadata, like tokens/latency). Cache hits record no upstream fields
+  (nothing went on the wire); shadow/prompt-A-B mirror rows capture
+  their own calls' wire data. Existing databases auto-upgrade: the three
+  new nullable columns are added on startup, old rows simply have them
+  NULL. Visible in the dashboard's log detail (client headers next to
+  the request body; upstream request + upstream response headers next to
+  the response body).
+
 ### Fixed
 
 - Admin dashboard (Logs tab): an expanded request's detail (request/response

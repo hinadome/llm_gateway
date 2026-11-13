@@ -673,6 +673,14 @@ async def get_log(
         row = _log_row(log)
     row["request_body"] = log.request_body
     row["response_body"] = log.response_body
+    # Wire capture (see observability/wire.py): allowlisted client request
+    # headers, the request as actually sent to the provider, and the
+    # allowlisted provider response headers. NULL on rows written before
+    # the capture existed, on cache hits, and when the allowlists matched
+    # nothing.
+    row["client_headers"] = log.client_headers
+    row["upstream_request"] = log.upstream_request
+    row["upstream_headers"] = log.upstream_headers
     return row
 
 

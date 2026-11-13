@@ -319,6 +319,19 @@ routing:
 
 logging:
   max_body_chars: 20000
+  # Wire capture (request-log rows): which headers to persist, as
+  # ALLOWLISTS — allow, never block, so a new credential-bearing header
+  # can never leak into stored rows by default (Authorization, x-api-key,
+  # x-goog-api-key and api-key are deliberately absent). Entries are
+  # lowercase header names; a trailing "*" matches prefixes. Defaults
+  # (unset): client side = user-agent, x-request-id and the x-stainless-*
+  # SDK telemetry; upstream side = x-request-id, request-id, retry-after,
+  # openai-processing-ms/version, x-ratelimit-*, ratelimit-*.
+  # The client list is read per request (config reload applies live);
+  # the upstream list is bound into the provider HTTP client's capture
+  # hooks — restart to change it.
+  #client_header_allowlist: ["user-agent", "x-request-id"]
+  #upstream_header_allowlist: ["x-request-id", "retry-after", "x-ratelimit-*"]
   # Background queued log writes (opt-in hot-path optimization): instead
   # of awaiting the row INSERT in the response path, request-log writes
   # are handed to a bounded queue drained by a background consumer.

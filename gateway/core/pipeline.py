@@ -45,7 +45,7 @@ from ..errors import (
 )
 from .prompt_library import CandidatePrompt, PromptLibrary, ResolvedPrompt
 from ..guardrails.manager import GuardrailManager
-from ..observability import metrics
+from ..observability import metrics, wire
 from ..observability.metrics import KeyLabeler
 from .prompts import apply_prompt_policy, substitute
 from ..schemas import (
@@ -1583,6 +1583,11 @@ class GatewayPipeline:
         mirror_request = request.model_copy(
             update={"stream": False, "stream_options": None}
         )
+        # This task inherited a copy of the primary's context — clear the
+        # upstream wire slots so the shadow row records THIS call's wire
+        # data (or None if it never reached the provider), never the
+        # primary's.
+        wire.reset_upstream()
         outcome = "success"
         error_message: str | None = None
         response: dict | None = None
@@ -1642,6 +1647,10 @@ class GatewayPipeline:
             error_message=error_message,
             shadow=True,
         )
+        # Snapshot this mirror's own wire capture (its task context, not
+        # the primary's — see the reset above).
+        shadow_ctx.upstream_request = wire.upstream_request()
+        shadow_ctx.upstream_headers = wire.upstream_headers()
         try:
             await self.logging_service.write_request_log(shadow_ctx)
         except Exception:  # noqa: BLE001
@@ -1730,6 +1739,9 @@ class GatewayPipeline:
         )
 
         started = time.monotonic()
+        # Inherited the primary's context — record THIS call's wire data
+        # (or None), never the primary's.
+        wire.reset_upstream()
         outcome = "success"
         error_message: str | None = None
         response: dict | None = None
@@ -1789,6 +1801,9 @@ class GatewayPipeline:
             shadow=True,  # excluded from /admin/stats and key spend
             prompt_variant=f"{library_prompt.name} v{candidate.version}",
         )
+        # Snapshot this mirror's own wire capture (its task context).
+        variant_ctx.upstream_request = wire.upstream_request()
+        variant_ctx.upstream_headers = wire.upstream_headers()
         try:
             await self.logging_service.write_request_log(variant_ctx)
         except Exception:  # noqa: BLE001
@@ -1925,6 +1940,13 @@ class GatewayPipeline:
             ).inc()
 
     async def _log(self, ctx: RequestContext, event: str = "chat request completed") -> None:
+        # Snapshot the wire capture into ctx here, in the request's own
+        # task: the background queued writer (logging.background_write)
+        # would otherwise read the contextvars from the consumer task's
+        # own — empty — context. Both slots stay None when nothing went
+        # on the wire (cache hit; blocked before dispatch).
+        ctx.upstream_request = wire.upstream_request()
+        ctx.upstream_headers = wire.upstream_headers()
         # One structured record per request — feeds JSON stdout logging and
         # the OTel logs pipeline (with the current span's trace context).
         logger.info(
