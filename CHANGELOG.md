@@ -8,6 +8,19 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Fixed
 
+- Provider credentials (and `OTEL_*` endpoints) in `.env` were silently
+  ignored: pydantic-settings reads the file into the `Settings` model
+  only (the `GATEWAY_*` fields), while provider keys are resolved from
+  the process environment (`api_key_env`, e.g. `OPENAI_API_KEY`) — so
+  the documented quick start sent empty credentials to providers.
+  `get_settings()` now exports the dotenv file into the environment
+  first (real environment variables win; empty values count as unset;
+  a missing file is a no-op). Tests construct `Settings(...)`
+  directly and stay hermetic.
+- `config.yaml`: the `glm-53` model's Parasail deployment sent
+  `model: glm-53`, which that API does not serve (every request fell
+  through to the Anthropic fallback). The provider-native id is
+  `parasail-glm-53`.
 - Budget alerts racing: two requests crossing thresholds concurrently
   (two keys pooling onto one tenant, or two requests on one key) each
   evaluate from a spend snapshot that predates the other's alert write,

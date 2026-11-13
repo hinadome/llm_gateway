@@ -55,7 +55,50 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    # Provider credentials (each provider's api_key_env, e.g.
+    # OPENAI_API_KEY) and the OTEL_* endpoints are read from
+    # os.environ, which pydantic-settings does not populate from the
+    # dotenv file — make the file visible to them first (real
+    # environment variables still win).
+    load_dotenv_exports(Settings.model_config.get("env_file") or ".env")
     return Settings()
+
+
+def load_dotenv_exports(env_file: str | Path = ".env") -> None:
+    """Export dotenv values into the process environment.
+
+    pydantic-settings reads ``.env`` into the ``Settings`` model only —
+    the ``GATEWAY_*`` fields. Two other groups are resolved straight
+    from ``os.environ`` at runtime: provider credentials (each
+    provider's ``api_key_env``, e.g. ``OPENAI_API_KEY`` — see
+    ``ProviderConfig.resolve_key``) and the ``OTEL_*`` endpoints the
+    observability stack reads itself. Without this pass neither group
+    ever sees the file: the documented quick start (copy
+    ``.env.example``, fill in the keys, run) would silently send empty
+    provider credentials.
+
+    Real environment variables win (``setdefault`` semantics, the
+    dotenv convention), so a container or compose file that injects
+    them directly is never shadowed. Empty values are treated as
+    unset — the placeholder lines in ``.env.example`` must not shadow
+    anything either. A missing or unreadable file is a no-op.
+    """
+    try:
+        content = Path(env_file).read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        # One pair of matching surrounding quotes, either style.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key and value and key not in os.environ:
+            os.environ[key] = value
 
 
 # --------------------------------------------------------------------------

@@ -8,7 +8,7 @@
 
 providers:
   openai:
-    api_base: https://api.openai.com/v1
+    api_base: https://api.parasail.io/v1
     api_key_env: OPENAI_API_KEY
   anthropic:
     api_base: https://api.anthropic.com
@@ -79,6 +79,29 @@ models:
       - name: gemini/gemini-2.5-flash
         provider: gemini
         model: gemini-2.5-flash
+
+  - name: glm-53
+    deployments:
+      - name: openai/parasail-glm-53
+        provider: openai
+        model: parasail-glm-53
+      # Fallback: if OpenAI fails after retries, route to Anthropic
+      - name: anthropic/claude-sonnet-4-5
+        provider: anthropic
+        model: claude-sonnet-4-5
+        priority: 200
+      # Shadow deployment: never serves clients — instead a mirrored copy
+      # of `shadow_fraction` (default all) of successful requests is sent
+      # to it in the background, for latency/status/content comparison
+      # before promotion (own log rows + gateway_shadow_* metrics; the
+      # client never sees an effect). Canary rollouts need no separate
+      # flag: raise `weight` gradually within a priority tier instead.
+      # - name: azure/gpt-4o-shadow
+      #   provider: azure
+      #   model: gpt-4o-prod            # Azure deployment name
+      #   shadow: true
+      #   shadow_fraction: 0.1
+
 
   # Embeddings models serve POST /v1/embeddings — and, natively, the Gemini
   # inbound form POST /v1[/beta]/models/{model}:embedContent and
