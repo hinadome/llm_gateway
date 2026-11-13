@@ -8,6 +8,15 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Fixed
 
+- Authentication and authorization rejections were invisible server-side:
+  uvicorn's access log shows only the bare `401`, and failed auth never
+  reaches the request-log pipeline (there is no key to log against) —
+  only the aggregate `gateway_auth_total{result="rejected"}` counter
+  recorded them. Every rejection now logs one WARNING line on
+  `gateway.auth`: method, path, client address, the client-facing
+  reason (the same message the 401/403 body carries) and a redacted
+  12-character credential hint (`key_prefix` shape — never the full
+  key). Scope rejections (IP allowlist, endpoint scopes) name the key.
 - Provider credentials (and `OTEL_*` endpoints) in `.env` were silently
   ignored: pydantic-settings reads the file into the `Settings` model
   only (the `GATEWAY_*` fields), while provider keys are resolved from

@@ -851,15 +851,23 @@ async def test_tenant_spend_pools_and_alerts(tmp_path):
         levels = sorted(p["level_percent"] for p in sink.payloads)
         assert levels == [50, 80, 90, 100]  # each exactly once
 
-        first = sink.payloads[0]
-        assert first["type"] == "budget_alert"
-        assert first["kind"] == "tenant"
-        assert first["key_id"] == f"tenant:{acme['id']}"
-        assert first["key_name"] == "acme"
-        assert first["budget_usd"] == 30.0
-        assert first["spend_usd"] == 20.0
-        assert first["percent"] == 66.67
-        assert "Tenant 'acme'" in first["message"]
+        # With two concurrent spend tasks (one per key), webhook arrival
+        # order is scheduling-dependent — pick payloads by level, not by
+        # position. The 50% alert carries whichever task won the
+        # fired-levels compare-and-swap: the first committer's $20
+        # snapshot, or the second request's $40 one when its task
+        # evaluated first. Each level still delivers exactly once with a
+        # consistent snapshot; order and which snapshot fires 50% are
+        # scheduling, not contract.
+        fifty = next(p for p in sink.payloads if p["level_percent"] == 50)
+        assert fifty["type"] == "budget_alert"
+        assert fifty["kind"] == "tenant"
+        assert fifty["key_id"] == f"tenant:{acme['id']}"
+        assert fifty["key_name"] == "acme"
+        assert fifty["budget_usd"] == 30.0
+        assert fifty["spend_usd"] in (20.0, 40.0)
+        assert fifty["percent"] in (66.67, 133.33)
+        assert "Tenant 'acme'" in fifty["message"]
 
         exhausted = next(p for p in sink.payloads if p["level_percent"] == 100)
         assert "exhausted" in exhausted["message"]

@@ -117,7 +117,14 @@ gateway/
 │   │                       require_platform_admin additionally excludes
 │   │                       tenant admins (the platform's own config
 │   │                       endpoints: tenants, prompts, routing, guardrails,
-│   │                       reload, backups)
+│   │                       reload, backups). Every rejection — missing
+│   │                       credential, chain 401, IP/endpoint-scope 403 —
+│   │                       also logs one WARNING line on gateway.auth
+│   │                       (method, path, client, reason, 12-char
+│   │                       credential hint; failed auth never reaches
+│   │                       the request-log pipeline, so this is its
+│   │                       only server-side trace besides the
+│   │                       gateway_auth_total counter)
 │   ├── chat.py             POST /v1/chat/completions → pipeline.handle_chat
 │   ├── embeddings.py       POST /v1/embeddings → pipeline.handle_embedding
 │   ├── models.py           GET /v1/models (per-key filtered, incl. the key's mapping

@@ -85,6 +85,21 @@ def _extract_raw_key(
     return None
 
 
+def _client_host(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _credential_hint(credential: str) -> str:
+    """A short, non-sensitive credential hint for rejection logs.
+
+    The same shape as the ``key_prefix`` column (never the full
+    secret): enough to tell *which* credential was tried — an old
+    revoked key vs. a typo vs. a different client — without exposing
+    it. 12 chars cover the whole ``sk-gw-`` namespace plus a few.
+    """
+    return credential[:12] + ("…" if len(credential) > 12 else "")
+
+
 async def require_api_key(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
@@ -101,12 +116,24 @@ async def require_api_key(
     The chain (``app.state.auth_chain``, built by ``create_app``) decides
     what that credential is: admin key, virtual key, JWT/OAuth token, or a
     custom authenticator.
+
+    Every rejection is logged (WARNING, one line) with the method, path,
+    client address, the client-facing reason and a redacted credential
+    hint: the response body tells the caller why, this tells whoever is
+    watching the service — uvicorn's access log shows only the bare
+    status code, and failed auth never reaches the request-log pipeline.
     """
     raw = _extract_raw_key(authorization, x_api_key, x_goog_api_key, api_key)
     if not raw:
         # Gemini SDKs may pass the key as a query parameter instead
         raw = (request.query_params.get("key") or "").strip() or None
     if not raw:
+        logger.warning(
+            "auth rejected: %s %s from %s — no credential presented",
+            request.method,
+            request.url.path,
+            _client_host(request),
+        )
         raise AuthError(
             "Missing API key. Send 'Authorization: Bearer <key>', 'x-api-key: <key>', "
             "'x-goog-api-key: <key>' or 'api-key: <key>'."
@@ -117,7 +144,18 @@ async def require_api_key(
         raise GatewayError(
             500, "Auth chain is not configured on this app.", "api_error"
         )
-    auth = await chain.authenticate(raw)
+    try:
+        auth = await chain.authenticate(raw)
+    except AuthError as exc:
+        logger.warning(
+            "auth rejected: %s %s from %s — %s (credential %s)",
+            request.method,
+            request.url.path,
+            _client_host(request),
+            exc.message,
+            _credential_hint(raw),
+        )
+        raise
 
     # Token scoping (never applied to admin contexts): where the call may
     # come from, and which parts of the data plane the key may touch.
@@ -125,6 +163,15 @@ async def require_api_key(
         if auth.allowed_ips is not None and not _ip_allowed(
             (request.client.host if request.client else None), auth.allowed_ips
         ):
+            logger.warning(
+                "authz rejected: %s %s from %s — key '%s' is not allowed "
+                "to call from this IP address (allowed_ips: %s)",
+                request.method,
+                request.url.path,
+                _client_host(request),
+                auth.key_name,
+                ", ".join(auth.allowed_ips),
+            )
             raise GatewayError(
                 403,
                 "This API key is not allowed to call from this IP address.",
@@ -134,6 +181,16 @@ async def require_api_key(
         if auth.allowed_endpoints is not None:
             scope = required_scope(request.url.path)
             if scope is not None and scope not in auth.allowed_endpoints:
+                logger.warning(
+                    "authz rejected: %s %s from %s — key '%s' lacks the "
+                    "'%s' endpoint scope (allowed: %s)",
+                    request.method,
+                    request.url.path,
+                    _client_host(request),
+                    auth.key_name,
+                    scope,
+                    ", ".join(auth.allowed_endpoints) or "none",
+                )
                 raise GatewayError(
                     403,
                     f"This API key does not have access to the '{scope}' endpoint "

@@ -11,6 +11,7 @@ a JWKS (cached, refreshed on unknown ``kid``).
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 import httpx
@@ -528,3 +529,70 @@ def test_invalid_chain_entries_fail_at_construction():
         AuthChain.from_config(
             AuthConfig(chain=["os.path:join"]), admin_key_provider=lambda: None
         )
+
+
+# ----------------------------------------------------------------------
+# Rejection visibility: every auth/authz failure is logged server-side
+# ----------------------------------------------------------------------
+
+
+def _auth_log(caplog) -> list[str]:
+    """Formatted lines from the gateway.auth logger."""
+    return [r.getMessage() for r in caplog.records if r.name == "gateway.auth"]
+
+
+async def test_auth_rejections_are_logged(tmp_path, caplog):
+    """Every 401 is visible where the service runs: uvicorn's access log
+    shows only the bare status code, and failed auth never reaches the
+    request-log pipeline. The line carries the method, path, client
+    address, the client-facing reason and a redacted credential hint —
+    never the full credential."""
+    async for env in _make_env(tmp_path):
+        with caplog.at_level(logging.WARNING, logger="gateway.auth"):
+            missing = await env.client.get("/v1/models")
+            assert missing.status_code == 401
+            bogus = await env.client.get(
+                "/v1/models",
+                headers={"Authorization": "Bearer sk-gw-bogus-key-not-in-db-xyz"},
+            )
+            assert bogus.status_code == 401
+
+        lines = _auth_log(caplog)
+
+        missing_line = next(m for m in lines if "no credential presented" in m)
+        assert "GET /v1/models" in missing_line
+        assert "from 127.0.0.1" in missing_line
+
+        bogus_line = next(m for m in lines if "Incorrect API key provided" in m)
+        assert "GET /v1/models" in bogus_line
+        assert "credential sk-gw-bogus-" in bogus_line  # 12-char hint + ellipsis
+        assert "key-not-in-db" not in bogus_line  # the full key is never logged
+        break
+
+
+async def test_scoping_rejections_are_logged(tmp_path, caplog):
+    """The two authorization 403s (IP allowlist, endpoint scope) are
+    logged the same way, naming the key that was rejected."""
+    async for env in _make_env(tmp_path):
+        scoped = await create_key(env.client, "scoped", allowed_endpoints=["chat"])
+        jailed = await create_key(env.client, "jailed", allowed_ips=["10.0.0.0/8"])
+        with caplog.at_level(logging.WARNING, logger="gateway.auth"):
+            scope_resp = await env.client.get("/v1/models", headers=auth(scoped["key"]))
+            ip_resp = await env.client.post(
+                "/v1/chat/completions",
+                json=chat_body(content="hi"),
+                headers=auth(jailed["key"]),
+            )
+        assert scope_resp.status_code == 403
+        assert ip_resp.status_code == 403
+
+        lines = _auth_log(caplog)
+        scope_line = next(m for m in lines if "endpoint scope" in m)
+        assert "GET /v1/models" in scope_line
+        assert "key 'scoped'" in scope_line
+        assert "allowed: chat" in scope_line
+        ip_line = next(m for m in lines if "this IP address" in m)
+        assert "POST /v1/chat/completions" in ip_line
+        assert "key 'jailed'" in ip_line
+        assert "from 127.0.0.1" in ip_line
+        break
