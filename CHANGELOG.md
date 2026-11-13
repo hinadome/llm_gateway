@@ -21,6 +21,12 @@ All notable changes to the LLM Gateway are documented here. Format follows
   development. Certificates load once at bind time, so restart after
   certbot renews (startup logs the expiry date as a reminder); TLS
   misconfiguration surfaces as a CLI usage error, not a stack trace.
+  With HTTPS on, `--redirect-http [PORT]` (default 80) adds a plain-HTTP
+  listener that answers every request with a 308 Permanent Redirect to
+  the same URL on HTTPS — method-preserving (POST bodies survive),
+  Host-header aware (works for every served domain), IPv6-safe, and
+  refusing to start without a certificate mode (a redirect to plain
+  HTTP would loop).
   Verified end-to-end by a test that serves the real app over TLS and
   calls it with a certificate-verifying client.
 - Wire capture on request-log rows: beyond the stored request/response

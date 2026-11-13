@@ -30,9 +30,11 @@ from gateway.main import create_app
 from gateway.serve import (
     TlsConfigError,
     build_parser,
+    build_redirect_app,
     ensure_self_signed,
     generate_self_signed_cert,
     letsencrypt_paths,
+    parse_redirect_port,
     resolve_ssl,
 )
 
@@ -167,6 +169,67 @@ def test_resolve_ssl_conflicting_modes(tmp_path):
 def test_flag_modes_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--self-signed", "--letsencrypt", "x.example.com"])
+
+
+# ----------------------------------------------------------------------
+# HTTP → HTTPS redirect
+# ----------------------------------------------------------------------
+
+
+async def test_redirect_app_points_at_https(tmp_path):
+    """Every path + query is answered with a 308 to the same URL on
+    HTTPS — method-preserving, Host-header aware, port appended unless
+    it is 443."""
+    app = build_redirect_app(8443)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gateway.test"
+    ) as client:
+        resp = await client.get(
+            "/v1/chat/completions?a=1&b=2", headers={"Host": "api.example.com:80"}
+        )
+        assert resp.status_code == 308
+        assert (
+            resp.headers["location"]
+            == "https://api.example.com:8443/v1/chat/completions?a=1&b=2"
+        )
+
+        # POST is preserved (308, not 301/302) — bodies survive the hop
+        # for clients that follow redirects.
+        resp = await client.post("/v1/chat/completions", headers={"Host": "example.com"})
+        assert resp.status_code == 308
+        assert resp.headers["location"] == "https://example.com:8443/v1/chat/completions"
+
+
+async def test_redirect_app_omits_default_https_port(tmp_path):
+    app = build_redirect_app(443)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gateway.test"
+    ) as client:
+        resp = await client.get("/readyz", headers={"Host": "api.example.com:8080"})
+        assert resp.headers["location"] == "https://api.example.com/readyz"
+
+
+async def test_redirect_app_handles_ipv6_host():
+    app = build_redirect_app(8443)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gateway.test"
+    ) as client:
+        resp = await client.get("/x", headers={"Host": "[::1]:8080"})
+        assert resp.headers["location"] == "https://[::1]:8443/x"
+
+
+def test_redirect_port_requires_https():
+    # No redirect requested → None.
+    assert parse_redirect_port(_args([]), None) is None
+    # Requested with HTTPS → the port (bare flag defaults to 80).
+    assert parse_redirect_port(_args(["--redirect-http"]), object()) == 80
+    assert parse_redirect_port(_args(["--redirect-http", "8080"]), object()) == 8080
+    # Requested without a certificate → usage error, not a redirect loop.
+    with pytest.raises(TlsConfigError, match="only makes sense with HTTPS"):
+        parse_redirect_port(_args(["--redirect-http"]), None)
 
 
 # ----------------------------------------------------------------------

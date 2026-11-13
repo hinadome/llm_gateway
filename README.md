@@ -101,6 +101,8 @@ Serve TLS with `python -m gateway` (or its wrapper `scripts/gateway.sh`) and one
 
 `--host`/`--port` (or `GATEWAY_HOST`/`GATEWAY_PORT`) set the bind address, `--reload` enables code-watch for development, and everything else passes through to the app unchanged. Prefer plain uvicorn? It serves the same app: `uv run uvicorn gateway.main:app --ssl-certfile my.crt --ssl-keyfile my.key`.
 
+With HTTPS on, add `--redirect-http [PORT]` to also listen on plain HTTP (default port 80 — may need `sudo`/`CAP_NET_BIND_SERVICE`) and answer every request there with a **308 Permanent Redirect** to the same URL on HTTPS — browsers and SDKs that default to `http://` get bounced to the encrypted listener instead of a connection error, and POST bodies survive the hop (308 preserves the method).
+
 To terminate TLS in front of the gateway instead (nginx, Caddy, a load balancer), leave it on HTTP — only one TLS layer is needed; clients then send `https://` to the proxy.
 
 ## API surface

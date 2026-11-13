@@ -108,6 +108,10 @@ gateway/
 │                           private/org CA; also GATEWAY_SSL_CERT/GATEWAY_SSL_KEY
 │                           env), --letsencrypt DOMAIN (certbot's live layout;
 │                           restart after renewal — certs load at bind time);
+│                           --redirect-http [PORT] adds a plain-HTTP listener
+│                           308-redirecting every request to the HTTPS URL
+│                           (method-preserving, Host-header aware, own daemon
+│                           thread — uvicorn skips signals off the main thread);
 │                           flags > env; TLS config errors surface as CLI usage
 │                           errors, never stack traces
 ├── utils.py                Content flattening (text + [image]/[audio] part

@@ -12,6 +12,8 @@
 #                                                       #  gitignored)
 #   ./scripts/gateway.sh --ssl-cert my.crt --ssl-key my.key   # private CA pair
 #   ./scripts/gateway.sh --letsencrypt api.example.com  # certbot's live certs
+#   ./scripts/gateway.sh --self-signed --redirect-http   # + 308 plain-HTTP → HTTPS
+#                                                       # (default redirect port 80)
 #
 # Env equivalents (also read from .env via GATEWAY_* settings):
 #   GATEWAY_HOST, GATEWAY_PORT, GATEWAY_SSL_CERT, GATEWAY_SSL_KEY

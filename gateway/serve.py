@@ -16,6 +16,12 @@ certificate stories:
   ``privkey.pem``). After certbot renews, restart the gateway — the
   certificate is read once at bind time, not per connection.
 
+With HTTPS on, ``--redirect-http [PORT]`` additionally listens on
+plain HTTP (default port 80) and answers every request with a 308
+Permanent Redirect to the same URL on HTTPS — browsers and SDKs that
+default to ``http://`` are bounced to the encrypted listener instead
+of a connection error.
+
 Plain HTTP when no certificate is configured (today's behavior).
 Precedence: CLI flags > ``GATEWAY_SSL_CERT``/``GATEWAY_SSL_KEY`` env
 vars. The same env vars also work without this module for operators
@@ -230,6 +236,92 @@ def resolve_ssl(
 
 
 # ----------------------------------------------------------------------
+# HTTP → HTTPS redirect listener
+# ----------------------------------------------------------------------
+
+# Enough drain to let well-formed clients finish sending before the
+# redirect is read; beyond this the connection is simply closed.
+_REDIRECT_DRAIN_CAP = 1 << 20  # 1 MiB
+
+
+def _host_without_port(host: str) -> str:
+    """The Host header's hostname (port stripped), IPv6-aware
+    (``[::1]:8080`` → ``[::1]``, ``example.com:80`` → ``example.com``)."""
+    if host.startswith("["):  # IPv6 literal
+        end = host.find("]")
+        return host[: end + 1] if end != -1 else host
+    return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+def build_redirect_app(https_port: int):
+    """A minimal ASGI app answering every request on plain HTTP with a
+    ``308 Permanent Redirect`` to the same path + query on HTTPS.
+
+    308 (not 301/302) so POST bodies are preserved when clients follow
+    it. The target host comes from the request's own Host header, so
+    the same listener works for every domain the gateway serves; the
+    HTTPS port is appended unless it is 443.
+    """
+    async def redirect_app(scope, receive, send):
+        if scope["type"] != "http":  # pragma: no cover — lifespan is off
+            raise RuntimeError(f"unsupported scope type {scope['type']!r}")
+        # Drain the request body (bounded) so the client can finish
+        # sending before the redirect is read.
+        drained = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            drained += len(message.get("body", b""))
+            if drained > _REDIRECT_DRAIN_CAP or not message.get("more_body"):
+                break
+
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
+        host = headers.get("host") or scope.get("server", ("", 0))[0] or "localhost"
+        target = _host_without_port(host)
+        if https_port != 443:
+            target = f"{target}:{https_port}"
+        location = f"https://{target}{scope.get('path', '/')}"
+        if scope.get("query_string"):
+            location += "?" + scope["query_string"].decode("latin-1")
+
+        body = b"Redirecting to HTTPS\n"
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 308,
+                "headers": [
+                    (b"location", location.encode("latin-1")),
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    return redirect_app
+
+
+def parse_redirect_port(
+    args: argparse.Namespace, ssl_pair: tuple[Path, Path] | None
+) -> int | None:
+    """The redirect port, or None when not requested. Requires HTTPS —
+    a redirect to plain HTTP would loop the client back to itself."""
+    if getattr(args, "redirect_http", None) is None:
+        return None
+    if ssl_pair is None:
+        raise TlsConfigError(
+            "--redirect-http only makes sense with HTTPS on — pick a "
+            "certificate mode (--self-signed / --letsencrypt / "
+            "--ssl-cert/--ssl-key)"
+        )
+    return int(args.redirect_http)
+
+
+# ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
 
@@ -291,6 +383,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="PEM private key matching --ssl-cert (env: GATEWAY_SSL_KEY)",
     )
+    g.add_argument(
+        "--redirect-http",
+        nargs="?",
+        const=80,
+        type=int,
+        default=None,
+        metavar="PORT",
+        help=(
+            "also listen on plain HTTP (default port: %(const)s — may need "
+            "sudo / CAP_NET_BIND_SERVICE) and answer every request with a "
+            "308 redirect to the same URL on HTTPS. Requires a certificate "
+            "mode above."
+        ),
+    )
     return p
 
 
@@ -317,6 +423,7 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         ssl_pair = resolve_ssl(args, settings)
+        redirect_port = parse_redirect_port(args, ssl_pair)
     except TlsConfigError as exc:
         parser.error(str(exc))
         return  # pragma: no cover — parser.error exits
@@ -332,29 +439,71 @@ def main(argv: list[str] | None = None) -> None:
     # instead of from inside uvicorn's import phase.
     import gateway.main  # noqa: F401 — builds and configures the app
 
-    if ssl_pair is not None:
-        cert, key = ssl_pair
-        logger.info("serving HTTPS on https://%s:%d (certificate: %s)", host, port, cert)
-        _log_cert_expiry(cert)
-        uvicorn.run(
-            "gateway.main:app",
-            host=host,
-            port=port,
-            reload=args.reload,
-            log_level=settings.log_level.lower(),
-            ssl_certfile=str(cert),
-            ssl_keyfile=str(key),
+    # The plain-HTTP redirect listener: a second, tiny ASGI app on its
+    # own port, run in a daemon thread alongside the main server
+    # (uvicorn skips signal handling off the main thread; we stop it
+    # when the main server exits).
+    redirect_server: uvicorn.Server | None = None
+    redirect_thread: threading.Thread | None = None
+    if redirect_port is not None:
+        redirect_server = uvicorn.Server(
+            uvicorn.Config(
+                build_redirect_app(port),
+                host=host,
+                port=redirect_port,
+                log_level="warning",
+                lifespan="off",  # raw ASGI app with no lifespan of its own
+            )
         )
-    else:
-        logger.info("serving HTTP on http://%s:%d (no certificate configured; "
-                    "see --self-signed / --letsencrypt / --ssl-cert)", host, port)
-        uvicorn.run(
-            "gateway.main:app",
-            host=host,
-            port=port,
-            reload=args.reload,
-            log_level=settings.log_level.lower(),
+        redirect_thread = threading.Thread(
+            target=redirect_server.run,
+            name="gateway-http-redirect",
+            daemon=True,
         )
+        redirect_thread.start()
+        logger.info(
+            "redirecting HTTP on http://%s:%d → https://%s:%d",
+            host,
+            redirect_port,
+            host,
+            port,
+        )
+
+    try:
+        if ssl_pair is not None:
+            cert, key = ssl_pair
+            logger.info(
+                "serving HTTPS on https://%s:%d (certificate: %s)", host, port, cert
+            )
+            _log_cert_expiry(cert)
+            uvicorn.run(
+                "gateway.main:app",
+                host=host,
+                port=port,
+                reload=args.reload,
+                log_level=settings.log_level.lower(),
+                ssl_certfile=str(cert),
+                ssl_keyfile=str(key),
+            )
+        else:
+            logger.info(
+                "serving HTTP on http://%s:%d (no certificate configured; "
+                "see --self-signed / --letsencrypt / --ssl-cert)",
+                host,
+                port,
+            )
+            uvicorn.run(
+                "gateway.main:app",
+                host=host,
+                port=port,
+                reload=args.reload,
+                log_level=settings.log_level.lower(),
+            )
+    finally:
+        if redirect_server is not None:
+            redirect_server.should_exit = True
+            assert redirect_thread is not None
+            redirect_thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":  # pragma: no cover
