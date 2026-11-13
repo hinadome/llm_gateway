@@ -8,6 +8,13 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Fixed
 
+- Admin dashboard (Logs tab): an expanded request's detail (request/response
+  bodies, guardrail actions) collapsed back to a "loading…" placeholder and
+  never recovered — the 5-second auto-refresh re-renders the table, which
+  recreates the detail cell, but only the row-click handler ever filled it.
+  The fill now lives in `fillLogDetail`, called from `loadLogs` after every
+  render (the same pattern the Prompts tab already used), so an expanded
+  row survives auto-refreshes, filter changes and pagination.
 - Default text-mode console logging showed no per-request detail: the
   pipeline logs one `chat request completed` INFO record per request
   (model, provider, deployment, tokens, cost, latency), but plain uvicorn

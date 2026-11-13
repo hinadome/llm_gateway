@@ -1253,6 +1253,10 @@ async function loadLogs() {
   }).join("");
   $("#logs-table").innerHTML = "<thead><tr><th>When</th><th>Key</th><th>Model</th><th>Deployment</th><th>Status</th><th class=num>Tokens</th><th class=num>Cost</th><th class=num>Latency</th></tr></thead><tbody>" +
     (rows || '<tr><td colspan="8" class="empty">No requests match</td></tr>') + "</tbody>";
+  // Re-fill the expanded row's detail: every render (auto-refresh every
+  // 5s, filter change, pagination) recreates the placeholder cell —
+  // same pattern as the prompts tab's loadPromptVersions call.
+  if (state.openLog != null) fillLogDetail(state.openLog);
 }
 function pageLogs(dir) {
   const next = state.logs.offset + dir * state.logs.limit;
@@ -1261,10 +1265,12 @@ function pageLogs(dir) {
   loadLogs();
 }
 
-async function toggleLog(id) {
+function toggleLog(id) {
   state.openLog = state.openLog === id ? null : id;
-  await loadLogs();
-  if (state.openLog == null) return;
+  loadLogs();
+}
+
+async function fillLogDetail(id) {
   const cell = $("#logdetail-" + id);
   if (!cell) return;
   try {
