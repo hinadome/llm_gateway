@@ -32,6 +32,7 @@ from ..observability import metrics
 
 if TYPE_CHECKING:  # pragma: no cover
     from .context import AuthContext
+    from .events import EventBus
 
 logger = logging.getLogger("gateway.audit")
 
@@ -55,8 +56,13 @@ class AuditLogger:
         self,
         config: AuditConfig,
         client: httpx.AsyncClient | None = None,
+        events: EventBus | None = None,
     ) -> None:
         self.config = config
+        # Lifecycle-event bus (optional — tests may construct without
+        # one): admin actions surface as events under their audit names
+        # (key.created, tenant.updated, ...) in addition to the webhook.
+        self.events = events
         self._owns_client = client is None
         # Dedicated client (not the instrumented app one): audit POSTs
         # should not appear as spans in request traces.
@@ -86,6 +92,11 @@ class AuditLogger:
         # fail if it is down). All failures are contained in _deliver.
         task = asyncio.create_task(self._deliver(payload))
         task.add_done_callback(_log_task_failure)
+        # Same record as a lifecycle event (observer-only — admin events
+        # are never interceptable; a webhook subscriber and an event
+        # handler see the same payload).
+        if self.events is not None:
+            self.events.emit_background(event, None, **payload)
 
     def _payload(
         self,

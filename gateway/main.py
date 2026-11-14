@@ -46,6 +46,7 @@ from .core.auth import AuthChain
 from .core.audit import AuditLogger
 from .core.batch_worker import BatchWorker
 from .core.cache import ResponseCache
+from .core.events import EventBus
 from .core.cost import CostCalculator
 from .core.logging_svc import LoggingService, QueuedLoggingService
 from .core.prompt_library import PromptLibrary
@@ -197,6 +198,10 @@ def create_app(
         )
     router = Router(config, providers, breakers=breakers)
     guardrails = GuardrailManager.from_config(config.guardrails, tracer=tracer)
+    # Lifecycle events: the stage-boundary pub/sub layer (see
+    # core/events.py). Inert until handlers are configured — emission
+    # is a no-op lookup with an empty registry.
+    events_bus = EventBus.from_config(config.events)
 
     if config.cache.backend == "redis":
         cache = RedisResponseCache(
@@ -216,9 +221,9 @@ def create_app(
     cost_calculator = CostCalculator(config.pricing)
     # Budget alerts: own (non-instrumented) HTTP client; disabled unless a
     # webhook URL resolves. An explicitly injected client wins (tests).
-    alerts = BudgetAlertManager(config.alerts, client=alert_http_client)
+    alerts = BudgetAlertManager(config.alerts, client=alert_http_client, events=events_bus)
     # Audit webhooks: same delivery story as alerts, for admin actions.
-    audit = AuditLogger(config.audit, client=audit_http_client)
+    audit = AuditLogger(config.audit, client=audit_http_client, events=events_bus)
     # Request logging: synchronous by default (a returned response
     # implies its log row is queryable). logging.background_write moves
     # the row INSERT behind a bounded queue — the response path stops
@@ -293,6 +298,7 @@ def create_app(
         prompt_library=PromptLibrary(
             cache_seconds=config.prompts.library_cache_seconds
         ),
+        events=events_bus,
     )
     # Batch API worker: drives /v1/batches lines in waves (app.state so
     # tests can tick it manually; the lifespan loop is the only driver
@@ -370,6 +376,10 @@ def create_app(
         # (engine up, admin key ensured), and flips back off the moment
         # shutdown begins so load balancers stop routing here first.
         app.state.ready = True
+        # Event dispatcher (observer deliveries). Lazily started on
+        # first emit too; starting here covers emit_background calls
+        # that arrive before any request.
+        await events_bus.start()
         yield
         app.state.ready = False  # draining: readiness fails before anything closes
         if prune_task is not None:
@@ -400,6 +410,8 @@ def create_app(
         logging_stop = getattr(logging_service, "stop", None)
         if logging_stop is not None:
             await logging_stop()
+        # Pending observer deliveries go the same way — stop() drains.
+        await events_bus.stop()
         if owns_tracing:
             if meter_provider is not None:
                 meter_provider.shutdown()
@@ -421,6 +433,8 @@ def create_app(
 
     # ---- app state -----------------------------------------------------
     app.state.pipeline = pipeline
+    # Lifecycle events (bus shared with audit/alerts/pipeline).
+    app.state.events = events_bus
     # Batch worker (tick() driven by the lifespan loop; tests call it).
     app.state.batch_worker = batch_worker
     # Prompt library (admin-plane CRUD routes live in api/admin.py).

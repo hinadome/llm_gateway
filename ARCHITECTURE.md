@@ -422,31 +422,60 @@ gateway/
 │                           enqueues — a lazily started consumer performs the
 │                           writes; full queue drops (LOGS_DROPPED), stop()
 │                           drains (lifespan teardown + tests)
-│   └── batch_worker.py     Batch executor: one tick = expire in_progress
-│                           batches past their completion window, then run
-│                           one wave (batch.wave_size lines) of the oldest
-│                           runnable batch — each line a full interactive
-│                           request via handle_chat (fresh auth snapshot per
-│                           wave; request_id '<batch id>-L<line>',
-│                           auth_method 'batch'). Line failures are exactly
-│                           what the interactive request would return (error
-│                           envelope in the batch's error file); rate limits
-│                           and budget ceilings defer the batch instead
-│                           (retry_not_before, window expiry bounds it).
-│                           Results append one row per line in the same
-│                           transaction that advances the cursor (crash →
-│                           resume from the cursor, worst case re-running
-│                           the in-flight wave); 'finalizing' is the
-│                           crash-recovery checkpoint between 'all results
-│                           in' and 'output files written'. Finalization
-│                           assembles the output/error JSONL as StoredFile
-│                           rows, guarded so a racing cancel is never
-│                           overwritten. Runs on app.state.batch_worker;
-│                           the lifespan loop (skipped under pytest's
-│                           ASGITransport — tests tick manually) paces it
-│                           with batch.poll_interval_seconds and re-reads
-│                           app.state.config each iteration so hot reloads
-│                           apply live
+│   ├── batch_worker.py     Batch executor: one tick = expire in_progress
+│   │                       batches past their completion window, then run
+│   │                       one wave (batch.wave_size lines) of the oldest
+│   │                       runnable batch — each line a full interactive
+│   │                       request via handle_chat (fresh auth snapshot per
+│   │                       wave; request_id '<batch id>-L<line>',
+│   │                       auth_method 'batch'). Line failures are exactly
+│   │                       what the interactive request would return (error
+│   │                       envelope in the batch's error file); rate limits
+│   │                       and budget ceilings defer the batch instead
+│   │                       (retry_not_before, window expiry bounds it).
+│   │                       Results append one row per line in the same
+│   │                       transaction that advances the cursor (crash →
+│   │                       resume from the cursor, worst case re-running
+│   │                       the in-flight wave); 'finalizing' is the
+│   │                       crash-recovery checkpoint between 'all results
+│   │                       in' and 'output files written'. Finalization
+│   │                       assembles the output/error JSONL as StoredFile
+│   │                       rows, guarded so a racing cancel is never
+│   │                       overwritten. Runs on app.state.batch_worker;
+│   │                       the lifespan loop (skipped under pytest's
+│   │                       ASGITransport — tests tick manually) paces it
+│   │                       with batch.poll_interval_seconds and re-reads
+│   │                       app.state.config each iteration so hot reloads
+│   │                       apply live
+│   └── events.py           Lifecycle events (pub/sub over the request
+│                           stages): EventBus + EventHandler ABC +
+│                           GatewayEvent. Two handler kinds — observer
+│                           (fire-and-forget: enqueued for a background
+│                           dispatcher, crashes logged+counted, full
+│                           queue drops, never affects a request) and
+│                           interceptor (awaited in-band at the two
+│                           pre-irreversible events, may raise
+│                           GatewayError to abort through the normal
+│                           error path; other exceptions swallowed —
+│                           a buggy handler never 500s traffic; explicit
+│                           names only, validated at registration so
+│                           hot reload refuses a bad subscription).
+│                           INTERCEPTABLE_EVENTS = request.received +
+│                           response.completed (everything else is
+│                           observer-only by construction). Handlers see
+│                           the event (inspect + veto) but never mutate
+│                           content — mutation is guardrails' job. With
+│                           no handlers, emit() is a no-op lookup (the
+│                           bus is inert by design). Pattern
+│                           subscriptions (fnmatch) per handler; a
+│                           match cache keyed by event name clears on
+│                           every registration change. Dispatcher task
+│                           starts lazily on first enqueue (and at
+│                           lifespan startup), stop() drains; drain()
+│                           is the deterministic barrier tests use.
+│                           app.state.events; wired into the pipeline,
+│                           auth edge, audit choke point, budget alerts
+│                           and the batch API/worker.
 │
 ├── guardrails/             ── The policy plugin framework ──
 │   ├── base.py             Guardrail ABC (check_request / check_response /
@@ -594,7 +623,7 @@ flowchart TD
 
 ---
 
-## 4. The two extension frameworks
+## 4. The extension frameworks
 
 ### 4.1 Guardrails — the primary extension point
 
@@ -771,6 +800,20 @@ Two cross-cutting behaviors:
 
 **Native Gemini embeddings inbound** — `POST /v1[/beta]/models/{model}:embedContent` and `:batchEmbedContents` close the last inbound-format gap: they parse to the internal `EmbeddingRequest` and run the exact embeddings pipeline (§4.3 — allowlists, rate limits, budgets, caching, retries/failover, logs), rendering replies in Gemini's `{embedding: {values}}` / `{embeddings: [{values}]}` shape. The `:method` paths map to the `embeddings` token scope (a chat-only key gets 403). Two Gemini-only fields are refused with 400s rather than silently dropped, because both change the result: `taskType`/`title` (a RETRIEVAL_DOCUMENT embedding differs from the default) and mixed per-sub-request `model`/`outputDimensionality` in a batch (the gateway routes the whole batch to one deployment). `outputDimensionality` maps to `dimensions`; the body's `model` fields (native names) are ignored — the URL model routes, as everywhere.
 
+### 4.6 Lifecycle events — the side-channel extension point
+
+Guardrails are the extension point for *policy over content*; events are the extension point for *reacting to the lifecycle*. The pipeline's stages are already explicit boundaries — `core/events.py` makes those boundaries subscribable: the pipeline (plus the auth edge, the audit choke point, budget alerts, and the batch API/worker) emits named events, configured handlers run at them.
+
+One ABC and two kinds, deliberately mirroring the guardrail loading story (`pkg.module:ClassName`, params from YAML, hot-reloadable, build-first so a bad registration is refused with the old set live):
+
+- **Observers** (default) — fire-and-forget. The event is enqueued for a background dispatcher, so a slow or crashing handler can never add latency to (or fail) a request: crashes are logged and counted (`gateway_events_total{handler,event,outcome=error}`), a full queue drops (`outcome=dropped`) instead of blocking, shutdown drains. This is the right kind for almost everything — Slack pings, SIEM feeds, metrics fan-out, usage meters.
+- **Interceptors** — in-band. Awaited inline at the emission point, on the request path (their latency *is* request latency — the trade you opt into). May raise `GatewayError` to abort the request, which flows through the normal error path (log row, metrics, span, client envelope); any other exception is swallowed, logged and counted. Restricted to `INTERCEPTABLE_EVENTS = {request.received, response.completed}` — the two points before anything irreversible (client bytes sent, a provider call inside retry machinery) — and must list events explicitly (no patterns), validated at registration.
+
+The content line: **interceptors inspect and veto, they never modify** — mutation of requests/responses is guardrails' job, and one source of truth for content means two systems can never fight over the same payload. Per-chunk stream events are likewise absent on purpose: streams emit the two coarse lifecycle events (`stream.started` / `stream.completed`) and nothing per-delta — the hot path stays hot.
+
+With an empty registry, `emit()` is a dict lookup that finds no subscribers and returns — the bus is inert (enable the machinery, pay nothing until you subscribe; the full suite runs with events enabled and no handlers, pinning that). Handlers receive a `GatewayEvent`: `payload` is an emission-time snapshot (safe to hold), `ctx` is the *live* `RequestContext` — by the time a queued observer is delivered it may have advanced (status, usage, cost filled in), which is a feature: one object, final state.
+
+The catalog and the emission points along the lifecycle: §5.4 below and the "Lifecycle events" section of the README.
 
 ---
 
@@ -907,6 +950,20 @@ flowchart TD
     FB -->|yes| TRIP["breaker.record_failure<br/>(N consecutive trips the circuit)"] --> NEXT["drop to next priority tier"] --> PICK
     FB -->|"none left"| RAISE
 ```
+
+### 5.4 Lifecycle-event emission points
+
+Every stage boundary below is also an event emission (the full catalog with payloads lives in the README's "Lifecycle events" section). Each emission is a no-op until a handler subscribes:
+
+- **`request.received`** — at the top of `_handle` (and `_serve_simple`, which covers embeddings/images/audio): authenticated and parsed, before any policy check. *Interceptable* — the one in-band veto point before the request starts.
+- **`request.rejected` / `request.failed`** — from `handle_chat`'s and `_serve_simple`'s error paths: rejected = GuardrailBlocked or any 4xx (policy, guardrail, rate limit, budget, interceptor veto); failed = 5xx / upstream exhaustion / internal error.
+- **`request.cache_hit`** — exact or semantic replay, with `kind`.
+- **`request.routed`** — after deployment selection, on both the stream and non-stream paths (observer-only: the router's retry machinery has the provider call in flight — an in-band veto there would be unsafe, so routing is notification, not a checkpoint).
+- **`response.completed`** — the final non-streaming response, post-guardrails, pre-client, with usage and cost (and `surface` for the non-chat modalities). *Interceptable* — the last in-band veto point; an interceptor raising here fails the request instead of returning the body.
+- **`stream.started` / `stream.completed`** — first chunk / end of the streamed body, emitted from the stream wrapper's iteration and `finally` (any outcome; `ctx.status` says which). Coarse by design; never per-chunk.
+- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired).
+
+Emits enqueue observers *before* an interceptor's abort propagates — subscribers always see the event that was vetoed.
 
 ---
 
@@ -1126,9 +1183,9 @@ Every constructor parameter is an injection point: tests (and any alternative de
 
 ### Re-composition at runtime (hot-reload)
 
-`create_app` composes once, but the config-derived half of the tree can be **swapped in place**. `reload_gateway(app)` — the one path behind both `POST /admin/reload` and SIGHUP — re-reads `config.yaml` and calls `pipeline.apply_config(config)` → `router.apply_config(config)`, which build the new guardrails, model groups, routing policy, pricing, aliases and prompt knobs *before* anything is assigned: an invalid config raises with the old one still live, and a reload that changed infra-bound sections (`providers`, `auth`, `cache`/`rate_limit`/breaker *backends*, `redis`, `semantic_cache`, `logging`/`alerts`/`audit` delivery, `metrics`) reports them in `restart_required` rather than pretending to apply them. Circuit breakers and provider adapters survive the swap by design (`breaker.register()` is idempotent — a reload is not a health event; the adapters own the HTTP client).
+`create_app` composes once, but the config-derived half of the tree can be **swapped in place**. `reload_gateway(app)` — the one path behind both `POST /admin/reload` and SIGHUP — re-reads `config.yaml` and calls `pipeline.apply_config(config)` → `router.apply_config(config)`, which build the new guardrails, model groups, routing policy, pricing, aliases, prompt knobs and event handlers *before* anything is assigned: an invalid config raises with the old one still live, and a reload that changed infra-bound sections (`providers`, `auth`, `cache`/`rate_limit`/breaker *backends*, `redis`, `semantic_cache`, `logging`/`alerts`/`audit` delivery, `metrics`) reports them in `restart_required` rather than pretending to apply them. Circuit breakers and provider adapters survive the swap by design (`breaker.register()` is idempotent — a reload is not a health event; the adapters own the HTTP client). The event bus likewise survives: its queue and dispatcher keep running while the handler set swaps (`queue_size` applies at restart).
 
-Shutdown is the mirror image of composition, in reverse dependency order: `/readyz` flips to 503 first (load balancers route elsewhere), in-flight requests finish (uvicorn's graceful window), tracked background work — `pipeline._spawn`'d spend accounting, shadow mirrors, prompt A/B — drains (bounded at 10s), then the log queue, telemetry, HTTP clients and finally the engine close. Liveness (`/healthz`) deliberately checks nothing but the process, so a wedged dependency fails readiness without also getting the pod killed.
+Shutdown is the mirror image of composition, in reverse dependency order: `/readyz` flips to 503 first (load balancers route elsewhere), in-flight requests finish (uvicorn's graceful window), tracked background work — `pipeline._spawn`'d spend accounting, shadow mirrors, prompt A/B — drains (bounded at 10s), then the log queue and the event dispatcher's pending observer deliveries (both drain, never drop), telemetry, HTTP clients and finally the engine close. Liveness (`/healthz`) deliberately checks nothing but the process, so a wedged dependency fails readiness without also getting the pod killed.
 
 ---
 
@@ -1139,6 +1196,7 @@ Shutdown is the mirror image of composition, in reverse dependency order: `/read
 | Area | Mechanism | Effort to extend |
 |---|---|---|
 | **Request/response policies** | Guardrail ABC, 4 phases (request/response/stream-block/stream-rewrite), config registration, dynamic class loading, observe mode, per-key/model/route scoping, reject-and-redirect, chained modifications | New guardrail = 1 file + 3 lines YAML. No core edits. |
+| **Lifecycle reactions** | `EventHandler` ABC (`on_event`), observer/interceptor kinds, pattern subscriptions, config registration + dynamic class loading (same loader convention as guardrails), hot-reload, deliveries counted | New side channel (Slack/SIEM/meter) = 1 file + 4 lines YAML. No core edits. |
 | **Upstream providers** | ProviderAdapter ABC + registry; OpenAI-compat passthrough for free (URL/header construction is hook-based — Azure OpenAI is a subclass overriding exactly those three hooks) | New provider = 1 adapter file + registry entry. |
 | **Provider topology** | YAML models/deployments with priorities & weights; `model_aliases`/`default_model` remap client-facing names | Pure config; cross-provider fallback and name remapping without code. |
 | **Stateful-service backends** | Rate limiter, cache and circuit-breaker registry each have in-memory and Redis implementations behind one async interface; selected in YAML | Multi-replica correctness = 3 lines of config; custom backends = one class implementing the interface. |
@@ -1515,7 +1573,7 @@ A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, 
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 

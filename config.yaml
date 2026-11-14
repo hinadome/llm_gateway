@@ -429,6 +429,22 @@ batch:
   wave_size: 16
   poll_interval_seconds: 2.0
 
+# Lifecycle events: subscribe handlers to the request-stage boundaries
+# (request.received / request.routed / response.completed / stream.* /
+# auth.rejected / key.* / budget.threshold / batch.* ...). Two kinds:
+# observer (fire-and-forget, background queue — cannot affect the
+# request) and interceptor (in-band, may abort by raising GatewayError;
+# only request.received and response.completed, listed explicitly).
+# With no handlers, emission is a no-op. Hot-reloadable.
+events:
+  enabled: true
+  queue_size: 10000
+  handlers: []
+  #  - class_path: "my_pkg.events:SlackNotifier"  # pkg.module:ClassName
+  #    kind: observer                             # observer | interceptor
+  #    events: ["request.*", "batch.completed"]   # names or patterns; null = all
+  #    params: {webhook_url: "https://hooks.slack.com/..."}
+
 # Per-1M-token pricing overrides (USD). Merged over built-in defaults;
 # longest model-prefix match wins. Embeddings are input-only.
 #

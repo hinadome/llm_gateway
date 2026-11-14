@@ -432,6 +432,14 @@ async def create_batch(
         )
         session.add(batch)
         await session.commit()
+    request.app.state.events.emit_background(
+        "batch.created",
+        None,
+        batch_id=batch.id,
+        key_id=batch.key_id,
+        input_file_id=batch.input_file_id,
+        total_requests=batch.total_requests,
+    )
     return _batch_payload(batch)
 
 
@@ -482,7 +490,9 @@ async def retrieve_batch(
 
 @router.post("/v1/batches/{batch_id}/cancel")
 async def cancel_batch(
-    batch_id: str, auth: Annotated[AuthContext, Depends(_batch_auth)]
+    batch_id: str,
+    request: Request,
+    auth: Annotated[AuthContext, Depends(_batch_auth)],
 ):
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -507,4 +517,13 @@ async def cancel_batch(
             )
         await session.commit()
         await session.refresh(b)
+    request.app.state.events.emit_background(
+        "batch.cancelled",
+        None,
+        batch_id=b.id,
+        key_id=b.key_id,
+        completed=b.completed_lines,
+        failed=b.failed_lines,
+        total=b.total_requests,
+    )
     return _batch_payload(b)

@@ -63,6 +63,7 @@ from .cache import ResponseCache, cache_key_for
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
 from .cost import CostCalculator
+from .events import EventBus
 from .logging_svc import LoggingService
 from .router import Router
 
@@ -158,6 +159,7 @@ class GatewayPipeline:
         tracer: trace.Tracer | None = None,
         semantic: SemanticCache | None = None,
         prompt_library: PromptLibrary | None = None,
+        events: EventBus | None = None,
     ) -> None:
         self.config = config
         # Per-key metric series (metrics.per_key — opt-in; the labeler's
@@ -177,6 +179,11 @@ class GatewayPipeline:
         # Versioned prompt library (prompt ops): resolves key
         # system_prompt_ref values and drives prompt A/B mirroring.
         self.prompt_library = prompt_library
+        # Lifecycle events (see core/events.py): None = this pipeline
+        # emits nothing (standalone constructions); create_app always
+        # passes the app-wide bus, where no handlers configured means
+        # emit() is an inert lookup.
+        self.events = events
         # OTel API is a no-op until a provider is installed (spans are then
         # invalid and cost ~nothing), so this is safe unconditionally.
         self._tracer = tracer or trace.get_tracer("gateway")
@@ -187,6 +194,15 @@ class GatewayPipeline:
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
+
+    async def _emit(
+        self, name: str, ctx: RequestContext | None = None, **payload
+    ) -> None:
+        """Emit a lifecycle event (no-op without a bus — standalone
+        pipelines; create_app always wires one). Interceptor aborts
+        (GatewayError) propagate to the caller's error handling."""
+        if self.events is not None:
+            await self.events.emit(name, ctx, **payload)
 
     async def handle_chat(
         self,
@@ -234,6 +250,14 @@ class GatewayPipeline:
                 self._request_metric(ctx)
                 await self._log(ctx)
                 self._finish_span(ctx, exc)
+                await self._emit(
+                    "request.rejected"
+                    if (isinstance(exc, GuardrailBlocked) or exc.status_code < 500)
+                    else "request.failed",
+                    ctx,
+                    error=exc.message,
+                    status_code=exc.status_code,
+                )
                 raise
             except Exception as exc:  # noqa: BLE001
                 ctx.status = "error"
@@ -241,6 +265,7 @@ class GatewayPipeline:
                 self._request_metric(ctx)
                 await self._log(ctx)
                 self._finish_span(ctx, exc)
+                await self._emit("request.failed", ctx, error=ctx.error_message)
                 raise
             if isinstance(response, StreamingResponse):
                 # The span and the in-flight gauge are finished by the stream
@@ -250,6 +275,16 @@ class GatewayPipeline:
             return response
 
     async def _handle(self, request: ChatCompletionRequest, ctx: RequestContext) -> Response:
+        # Lifecycle event: authenticated + parsed, before any policy. The
+        # one in-band veto point before the request starts — an
+        # interceptor raising here aborts through the normal error path.
+        await self._emit(
+            "request.received",
+            ctx,
+            model=request.model,
+            stream=request.stream,
+            key_name=ctx.auth.key_name,
+        )
         # 0. Model aliases / default routing. Resolved before every check
         # so permissions, rate limits, guardrail model scopes, cache
         # identity, logs and the echoed response "model" all see one
@@ -364,6 +399,7 @@ class GatewayPipeline:
         if hit_kind is not None:
             metrics.CACHE.labels(hit_kind).inc()
             ctx.cache_hit = True
+            await self._emit("request.cache_hit", ctx, kind=hit_kind)
             usage = cached.get("usage") or {}
             ctx.prompt_tokens = usage.get("prompt_tokens")
             ctx.completion_tokens = usage.get("completion_tokens")
@@ -386,6 +422,14 @@ class GatewayPipeline:
             ctx.provider = deployment.provider
             ctx.deployment = deployment.name
             ctx.native_model = deployment.model
+            await self._emit(
+                "request.routed",
+                ctx,
+                deployment=deployment.name,
+                provider=deployment.provider,
+                native_model=deployment.model,
+                stream=True,
+            )
             headers = self._headers(ctx, "MISS")
             return self._streaming_response(
                 self._stream_with_guardrails(
@@ -404,6 +448,14 @@ class GatewayPipeline:
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
+        await self._emit(
+            "request.routed",
+            ctx,
+            deployment=deployment.name,
+            provider=deployment.provider,
+            native_model=deployment.model,
+            stream=False,
+        )
 
         # 8. Guardrails: response phase
         try:
@@ -443,6 +495,16 @@ class GatewayPipeline:
             ctx.latency_ms() / 1000
         )
         await self._log(ctx)
+        # Lifecycle event: the response is final (guardrails applied,
+        # usage accounted). The last in-band veto point — an interceptor
+        # raising here fails the request instead of returning this body.
+        await self._emit(
+            "response.completed",
+            ctx,
+            response=response,
+            usage=usage,
+            cost_usd=ctx.cost_usd,
+        )
         return JSONResponse(content=response, headers=self._headers(ctx, "MISS"))
 
     # ------------------------------------------------------------------
@@ -486,6 +548,14 @@ class GatewayPipeline:
             set_status_on_exception=False,
         ):
             try:
+                # Lifecycle event: same contract as chat — the one
+                # in-band veto point before the request starts.
+                await self._emit(
+                    "request.received",
+                    ctx,
+                    model=model,
+                    key_name=ctx.auth.key_name,
+                )
                 response = await inner(ctx)
             except GatewayError as exc:
                 ctx.status = "error"
@@ -493,6 +563,12 @@ class GatewayPipeline:
                 self._request_metric(ctx)
                 await self._log(ctx, event=event)
                 self._finish_span(ctx, exc)
+                await self._emit(
+                    "request.rejected" if exc.status_code < 500 else "request.failed",
+                    ctx,
+                    error=exc.message,
+                    status_code=exc.status_code,
+                )
                 raise
             except Exception as exc:  # noqa: BLE001
                 ctx.status = "error"
@@ -500,6 +576,7 @@ class GatewayPipeline:
                 self._request_metric(ctx)
                 await self._log(ctx, event=event)
                 self._finish_span(ctx, exc)
+                await self._emit("request.failed", ctx, error=ctx.error_message)
                 raise
             if isinstance(response, StreamingResponse):
                 # The span and the in-flight gauge are finished by the
@@ -596,6 +673,14 @@ class GatewayPipeline:
             ctx.latency_ms() / 1000
         )
         await self._log(ctx, event="embedding request completed")
+        await self._emit(
+            "response.completed",
+            ctx,
+            response=response,
+            usage=usage,
+            cost_usd=ctx.cost_usd,
+            surface="embedding",
+        )
         return JSONResponse(
             content=self._embedding_out(request, response),
             headers=self._headers(ctx, "MISS"),
@@ -730,6 +815,13 @@ class GatewayPipeline:
             ctx.latency_ms() / 1000
         )
         await self._log(ctx, event=event)
+        await self._emit(
+            "response.completed",
+            ctx,
+            response=response,
+            cost_usd=ctx.cost_usd,
+            surface="images",
+        )
         return JSONResponse(content=response, headers=self._headers(ctx, "NONE"))
 
     async def handle_transcription(
@@ -803,6 +895,13 @@ class GatewayPipeline:
             ctx.latency_ms() / 1000
         )
         await self._log(ctx, event="audio transcription completed")
+        await self._emit(
+            "response.completed",
+            ctx,
+            response=ctx.response_body,
+            cost_usd=ctx.cost_usd,
+            surface="transcription",
+        )
         if isinstance(content, dict):
             return JSONResponse(content=content, headers=self._headers(ctx, "NONE"))
         return Response(content=content, media_type=media_type, headers=self._headers(ctx, "NONE"))
@@ -1173,6 +1272,7 @@ class GatewayPipeline:
                     async for chunk in body:
                         if first:
                             first = False
+                            await self._emit("stream.started", ctx, model=ctx.model)
                             metrics.TTFT.labels(model=ctx.model).observe(
                                 time.monotonic() - ctx.started_monotonic
                             )
@@ -1187,6 +1287,10 @@ class GatewayPipeline:
                             )
                         else:
                             span.set_status(Status(StatusCode.OK))
+                    # Observer-only by design: bytes may already be with
+                    # the client, so there is nothing left to veto —
+                    # ctx.status says how the stream ended.
+                    await self._emit("stream.completed", ctx, status=ctx.status)
 
         return StreamingResponse(
             stream_body(),
@@ -1504,6 +1608,11 @@ class GatewayPipeline:
             restart_required = []
         self.config = config
         self.guardrails = guardrails
+        # Lifecycle-event handlers reload too (same build-first pattern;
+        # a bad handler class/subscription raises with the old set live).
+        # Queue size changes apply at restart — the queue survives.
+        if self.events is not None:
+            self.events.apply_config(config.events)
         # The router keeps its breakers (shared state, incl. Redis) and
         # its provider adapters (they hold the HTTP client); the groups,
         # routing policy and pricing are swapped in place.

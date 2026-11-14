@@ -140,6 +140,14 @@ async def require_api_key(
             request.url.path,
             _client_host(request),
         )
+        events = getattr(request.app.state, "events", None)
+        if events is not None:
+            await events.emit(
+                "auth.rejected",
+                None,
+                path=request.url.path,
+                reason="no credential presented",
+            )
         raise AuthError(
             "Missing API key. Send 'Authorization: Bearer <key>', 'x-api-key: <key>', "
             "'x-goog-api-key: <key>' or 'api-key: <key>'."
@@ -161,6 +169,14 @@ async def require_api_key(
             exc.message,
             _credential_hint(raw),
         )
+        events = getattr(request.app.state, "events", None)
+        if events is not None:
+            await events.emit(
+                "auth.rejected",
+                None,
+                path=request.url.path,
+                reason=exc.message,
+            )
         raise
 
     # Token scoping (never applied to admin contexts): where the call may

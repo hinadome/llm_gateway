@@ -41,6 +41,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Routing** | Weighted load balancing, retries with exponential backoff, cross-provider fallbacks, per-deployment circuit breakers (failing deployments are skipped, probed after a cooldown; state visible in `/admin/routing` and on `gateway_circuit_state`; per-process by default, or **shared across replicas via Redis** with `routing.breaker.backend: redis`). **Canary** = a deployment's `weight` within a tier (raise it gradually to shift traffic); **shadow** = mirror a fraction of successful requests to a non-serving deployment for comparison |
 | **Usage export** | `GET /admin/usage/export` (CSV or JSON): billing / chargeback extract of request rows with cost/tokens/latency, time-window + key/model/status filters, and per-key / per-model / per-status aggregates; mirrored shadow calls excluded by default |
 | **Batch API** | OpenAI-style `/v1/files` + `/v1/batches`: upload a JSONL of chat requests, execute them in the background — each line through the *full* pipeline (guardrails, cache, routing, spend, request logs) — then fetch per-line results as output/error JSONL. Rate limits and budgets defer a batch instead of failing lines; the 24h completion window bounds retries (see [Batch API](#batch-api)) |
+| **Lifecycle events** | Subscribe your own handlers to the request-stage boundaries (`request.received` / `routed` / `cache_hit` / `rejected` / `failed`, `response.completed`, `stream.started` / `completed`, `auth.rejected`, `key.*`, `budget.threshold`, `batch.*`) — **observers** are fire-and-forget on a background queue (a slow or crashing handler can never affect a request), **interceptors** run in-band with veto power at the two pre-irreversible events; with no handlers the bus is inert (see [Lifecycle events](#lifecycle-events)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model |
@@ -289,6 +290,59 @@ Semantics worth knowing:
 - **Crash safety.** Results append one row per line (in the same transaction that advances the cursor); a restart resumes from the cursor — at worst the in-flight wave re-runs its lines (duplicate log rows, never lost results). Output files are assembled once all lines have results.
 - **Ownership & scoping.** Files and batches belong to the virtual key that created them (another key gets 404s, not 403s) and require the `batch` endpoint scope for scoped keys (`allowed_endpoints`). The platform admin key cannot own files — there is no key row to bill.
 - **Config** (`batch:` in config.yaml, hot-reloadable): `enabled` (false = the surfaces 404 and the worker stops), `max_file_bytes` (20 MB), `max_requests` (10k lines), `wave_size`, `poll_interval_seconds`. Progress also flows to `gateway_batch_lines_total{status=completed|failed|deferred}`.
+
+## Lifecycle events
+
+A publish/subscribe layer over the request stages — for side channels (Slack pings, metrics fan-out, custom SIEM feeds, usage meters) without touching gateway code. Configure handlers in `config.yaml`:
+
+```yaml
+events:
+  enabled: true
+  queue_size: 10000
+  handlers:
+    - class_path: "my_pkg.events:SlackNotifier"  # pkg.module:ClassName
+      kind: observer                            # observer | interceptor
+      events: ["request.*", "batch.completed"]  # names or patterns; null = all
+      params: {webhook_url: "https://hooks.slack.com/..."}
+```
+
+```python
+from gateway.core.events import EventHandler
+
+class SlackNotifier(EventHandler):
+    name = "slack"                            # identifies the handler in
+                                              # logs and metrics labels
+
+    def __init__(self, params):
+        super().__init__(params)               # params arrive from config.yaml
+
+    async def on_event(self, event):
+        # event.name / event.ts / event.payload — an emission-time snapshot
+        # event.ctx — the live RequestContext (final state by delivery time)
+        await post_to_slack(event.payload)
+```
+
+- **Observers** (default) are fire-and-forget: events queue for a background dispatcher, so a slow or crashing handler can never add latency to (or fail) a request. Handler crashes are logged and counted (`gateway_events_total{...,outcome=error}`); a full queue drops (`outcome=dropped`) rather than blocking; shutdown drains everything pending.
+- **Interceptors** run in-band — their latency *is* request latency, that is the trade — and may `raise GatewayError(...)` to abort the request through the normal error path (log row, metrics, client envelope; any other exception is swallowed, logged, counted). They may only subscribe, explicitly by name, to the two events emitted before the request becomes irreversible: `request.received` (after auth+parse, before any policy) and `response.completed` (final body, pre-client). Interception is inspect + veto: handlers see the event but never mutate content — mutation stays guardrails' job (one source of truth).
+- **With no handlers configured the bus is inert** — every emission is a no-op lookup. Enable the machinery, pay nothing until you subscribe.
+
+Event catalog:
+
+| Event | Fired | Payload highlights |
+|---|---|---|
+| `request.received` | after auth+parse, before any policy check — *interceptable* | `model`, `stream`, `key_name` |
+| `request.rejected` | blocked — 4xx (policy, guardrail, rate limit, budget, interceptor veto) | `error`, `status_code` |
+| `request.failed` | errored — 5xx / upstream exhaustion | `error`, `status_code` |
+| `request.cache_hit` | exact or semantic cache replay | `kind` (`hit` / `semantic`) |
+| `request.routed` | deployment selected (stream and non-stream) | `deployment`, `provider`, `native_model`, `stream` |
+| `response.completed` | final non-streaming response, post-guardrails, pre-client — *interceptable* | `response`, `usage`, `cost_usd`, `surface` (embedding / images / transcription) |
+| `stream.started` / `stream.completed` | first chunk / end of a streamed body (any outcome) | `model` / `status` |
+| `auth.rejected` | credential rejected at the edge | `path`, `reason` |
+| `key.created` / `key.updated` / `key.revoked`, `tenant.*`, `breaker.reset` | admin actions — the audit choke point, same names and payload as the audit webhook | `event`, `actor`, `details` |
+| `budget.threshold` | budget alert fired (per crossed level) | `key`, `key_name`, `level`, `spend_usd`, `budget_usd` |
+| `batch.created` / `cancelled` / `completed` / `failed` / `deferred` / `expired` | batch lifecycle | `batch_id`, `key_id`, line counts, output/error file ids |
+
+Per-chunk stream events are deliberately absent — the hot path only ever carries the two coarse stream events. Deliveries count on `gateway_events_total{handler,event,outcome}` (delivered / dropped / error / aborted). The `events:` config is hot-reloadable (handlers swap live; `queue_size` applies at restart). 20 tests pin the contract (`tests/test_events.py`).
 
 ## Architecture
 
@@ -654,6 +708,17 @@ batch:
   max_requests: 10000        # input lines per batch
   wave_size: 16
   poll_interval_seconds: 2.0
+# Lifecycle events: subscribe handlers to the request-stage boundaries
+# (request.received, response.completed, stream.*, auth.rejected, key.*,
+# budget.threshold, batch.* ...). kind: observer = fire-and-forget on a
+# background queue (cannot affect requests); interceptor = in-band, may
+# abort the request (GatewayError) — only request.received and
+# response.completed, listed explicitly. With no handlers, emission is
+# a no-op. Hot-reloadable (queue_size applies at restart).
+events:
+  enabled: true
+  queue_size: 10000
+  handlers: []
 pricing:
   gpt-4o: {input: 2.5, output: 10.0}      # USD per 1M tokens
   text-embedding-3-small: {input: 0.02}   # embeddings: input-only pricing

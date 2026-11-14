@@ -408,6 +408,41 @@ class UploadsConfig(BaseModel):
     max_upload_mb: int = 25
 
 
+class EventHandlerConfig(BaseModel):
+    """One event handler registration.
+
+    ``class_path`` uses the guardrails convention: ``pkg.module:ClassName``
+    (the class subclasses ``gateway.core.events.EventHandler``). ``kind``:
+    ``observer`` (default — background delivery, cannot affect the
+    request) or ``interceptor`` (in-band, may abort — restricted to
+    explicitly-listed interceptable events, no patterns). ``events``:
+    names or shell patterns (``"request.*"``); None = all events.
+    """
+
+    class_path: str
+    kind: Literal["observer", "interceptor"] = "observer"
+    events: list[str] | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class EventsConfig(BaseModel):
+    """Lifecycle events: named events at the request-stage boundaries
+    (see ``core/events.py`` for the catalog), delivered to configured
+    handlers.
+
+    Two kinds: ``observer`` (fire-and-forget, background queue — the
+    default) and ``interceptor`` (awaited in-band, may abort the
+    request by raising ``GatewayError``; restricted to events emitted
+    before the request becomes irreversible). With no handlers, the
+    bus is inert — emission is a no-op lookup.
+    """
+
+    enabled: bool = True
+    # Bound on queued observer deliveries (full queue drops, counted).
+    queue_size: int = 10_000
+    handlers: list[EventHandlerConfig] = Field(default_factory=list)
+
+
 class BatchConfig(BaseModel):
     """OpenAI-style Batch API: ``/v1/files`` upload + ``/v1/batches``
     execution by a background worker.
@@ -515,6 +550,7 @@ class GatewayConfig(BaseModel):
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     uploads: UploadsConfig = Field(default_factory=UploadsConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
+    events: EventsConfig = Field(default_factory=EventsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @classmethod

@@ -22,6 +22,7 @@ from gateway.config import (
     BatchConfig,
     CacheConfig,
     DeploymentConfig,
+    EventsConfig,
     GatewayConfig,
     GuardrailConfig,
     JWTAuthConfig,
@@ -97,6 +98,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     metrics_cfg = cache_overrides.pop("metrics", None) or MetricsConfig()
     prompts = cache_overrides.pop("prompts", None) or PromptsConfig()
     batch = cache_overrides.pop("batch", None) or BatchConfig()
+    events = cache_overrides.pop("events", None) or EventsConfig()
     guardrails = cache_overrides.pop("guardrails", None) or [
         GuardrailConfig(
             name="pii_redaction", enabled=True, params={"mask_in_response": True}
@@ -152,6 +154,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         semantic_cache=semantic_cache,
         pricing=pricing,
         batch=batch,
+        events=events,
     )
     if redis_backends:
         config.cache.backend = "redis"

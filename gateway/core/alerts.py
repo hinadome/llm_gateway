@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import httpx
 from sqlalchemy import select, update
@@ -24,6 +25,9 @@ from ..config import AlertsConfig
 from ..db import get_sessionmaker
 from ..models import Tenant, VirtualKey
 from ..observability import metrics
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .events import EventBus
 
 logger = logging.getLogger("gateway.alerts")
 
@@ -61,8 +65,13 @@ class BudgetAlertManager:
         self,
         config: AlertsConfig,
         client: httpx.AsyncClient | None = None,
+        events: EventBus | None = None,
     ) -> None:
         self.config = config
+        # Lifecycle-event bus (optional — tests may construct without
+        # one): threshold crossings surface as `budget.threshold` events
+        # in addition to the webhook delivery.
+        self.events = events
         self._owns_client = client is None
         # Dedicated client (not the instrumented app one): alert POSTs
         # should not appear as spans in request traces.
@@ -131,6 +140,17 @@ class BudgetAlertManager:
                     await self._deliver_budget_alert(
                         payload_id, key_name, spend_usd, budget_usd, level, kind=kind
                     )
+                    if self.events is not None:
+                        await self.events.emit(
+                            "budget.threshold",
+                            None,
+                            key=payload_id,
+                            key_name=key_name,
+                            level=level,
+                            spend_usd=spend_usd,
+                            budget_usd=budget_usd,
+                            kind=kind,
+                        )
                 return levels
             # Lost the race: another evaluation already advanced the
             # fired set. Retry against its state — only what it missed

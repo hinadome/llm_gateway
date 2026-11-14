@@ -61,6 +61,12 @@ BATCH_LINES = Counter(
     ["status"],  # completed | failed | deferred (rate limit / budget backoff)
 )
 
+EVENTS = Counter(
+    "gateway_events_total",
+    "Lifecycle-event deliveries to configured handlers.",
+    ["handler", "event", "outcome"],  # delivered | dropped | error | aborted
+)
+
 TTFT = Histogram(
     "gateway_stream_ttft_seconds",
     "Time from request start to the first streamed chunk delivered to the client.",

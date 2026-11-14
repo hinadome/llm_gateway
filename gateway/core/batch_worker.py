@@ -98,7 +98,7 @@ class BatchWorker:
             if expired:
                 logger.info(
                     "batch: expired %d batch(es) past their completion window",
-                    expired,
+                    len(expired),
                 )
             batch = (
                 (
@@ -121,10 +121,12 @@ class BatchWorker:
                 .scalars()
                 .first()
             )
+        for batch_id in expired:
+            await self._emit("batch.expired", batch_id=batch_id)
         if batch is not None:
             await self._run_wave(batch)
 
-    async def _expire_stale(self, session) -> int:
+    async def _expire_stale(self, session) -> list[str]:
         """in_progress batches past their completion window → expired.
         (finalizing ones are excluded: their results are complete —
         the next tick finalizes them regardless of the window.)"""
@@ -136,9 +138,10 @@ class BatchWorker:
                 Batch.expires_at <= _now(),
             )
             .values(status="expired", expired_at=_now())
+            .returning(Batch.id)
         )
         await session.commit()
-        return result.rowcount or 0
+        return list(result.scalars())
 
     # -- wave execution -------------------------------------------------
 
@@ -160,6 +163,12 @@ class BatchWorker:
                 await self._finalize(session, batch)
                 return
             await self._execute_wave(session, batch)
+
+    async def _emit(self, name: str, **payload) -> None:
+        """Observer-only lifecycle events (batches are background work —
+        nothing to veto; subscribers get notified)."""
+        if self.pipeline.events is not None:
+            await self.pipeline.events.emit(name, None, **payload)
 
     async def _auth_for(self, session, batch: Batch) -> AuthContext | None:
         """Snapshot the owning key (and its tenant) as of NOW — key
@@ -191,6 +200,11 @@ class BatchWorker:
                 )
             )
             await session.commit()
+            await self._emit(
+                "batch.failed",
+                batch_id=batch.id,
+                reason="owning key missing/inactive",
+            )
             logger.warning("batch %s failed: owning key missing/inactive", batch.id)
             return
 
@@ -370,6 +384,13 @@ class BatchWorker:
 
         if defer_seconds is not None:
             metrics.BATCH_LINES.labels(status="deferred").inc()
+            await self._emit(
+                "batch.deferred",
+                batch_id=batch.id,
+                retry_seconds=defer_seconds,
+                lines_done=stop_at,
+                lines_total=batch.total_requests,
+            )
             logger.info(
                 "batch %s deferred %.0fs (rate limit / budget); %d/%d lines done",
                 batch.id,
@@ -471,4 +492,14 @@ class BatchWorker:
             batch.id,
             len(output_lines),
             len(error_lines),
+        )
+        await self._emit(
+            "batch.completed",
+            batch_id=batch.id,
+            key_id=batch.key_id,
+            succeeded=len(output_lines),
+            failed=len(error_lines),
+            total=batch.total_requests,
+            output_file_id=output_file.id,
+            error_file_id=error_file.id if error_file is not None else None,
         )

@@ -8,6 +8,44 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Lifecycle events: a publish/subscribe layer over the request stages
+  (`core/events.py`). The pipeline and the surfaces around it (auth
+  edge, audit choke point, budget alerts, batch API/worker) emit
+  named events; configured handlers run at them — with no handlers,
+  every emission is a no-op lookup (the bus is inert by design, and
+  the full suite runs in that mode). Two handler kinds, registered in
+  `events.handlers` config (same `pkg.module:ClassName` convention as
+  custom guardrails, params from YAML, hot-reloadable, build-first so
+  a bad registration is refused with the old set live): **observers**
+  (default) fire-and-forget on a bounded background queue — a slow or
+  crashing handler can never add latency to (or fail) a request,
+  crashes are logged and counted, a full queue drops (counted) rather
+  than blocking, shutdown drains — and **interceptors**, awaited
+  in-band at the two pre-irreversible events only
+  (`request.received`, `response.completed`, explicit names,
+  validated at registration), which may raise `GatewayError` to abort
+  the request through the normal error path (log row, metrics,
+  client envelope; any other exception is swallowed, logged and
+  counted — a buggy handler never 500s traffic). Interceptors inspect
+  and veto but never modify content — mutation stays guardrails' job.
+  Catalog: `request.received` / `routed` / `cache_hit` / `rejected` /
+  `failed`, `response.completed` (with `surface` for
+  embedding/images/transcription), `stream.started` / `completed`
+  (coarse only — never per-chunk), `auth.rejected`, admin actions
+  under their audit names (`key.*`, `tenant.*`, `breaker.reset` —
+  same payload as the audit webhook), `budget.threshold` (per crossed
+  level), and `batch.created` / `cancelled` / `completed` / `failed` /
+  `deferred` / `expired`. Handler classes subclass
+  `gateway.core.events.EventHandler` and receive a `GatewayEvent`
+  (payload = emission-time snapshot; `ctx` = the live RequestContext,
+  final state by delivery time). Pattern subscriptions (`request.*`)
+  supported; `emit()` enqueues observers before an interceptor's abort
+  propagates so subscribers see the vetoed event. Deliveries count on
+  `gateway_events_total{handler,event,outcome}` (delivered / dropped /
+  error / aborted). Config: `events:` section (`enabled`,
+  `queue_size`, `handlers[]` with `class` / `kind` / `events` /
+  `params`) — hot-reloadable (queue_size applies at restart).
+  20 new tests.
 - OpenAI-style Batch API (`/v1/files` + `/v1/batches`) for bulk chat
   workloads: upload a JSONL of chat requests
   (`POST /v1/files`, multipart `file` + `purpose: "batch"`, capped at
