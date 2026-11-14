@@ -147,10 +147,15 @@ def ensure_self_signed(
     """Generate the pair unless both files already exist.
 
     Returns True when a fresh pair was written, False when reusing.
-    A half pair (one file missing) is regenerated whole — a dev cert
-    costs nothing and self-heals; a deployed pair never lives in the
-    dev directory anyway. Existing files are never overwritten, which
-    is also what makes Let's Encrypt paths safe to point at.
+    A complete existing pair is never touched — reuse is byte-for-byte,
+    so a pair you placed there yourself (own CA, copied-in internal
+    certificate, under the expected filenames) is served as-is rather
+    than clobbered, and an expired dev pair is reused too (the startup
+    log prints the expiry date; regeneration is deleting the pair and
+    rerunning — key material is never silently overwritten). A half
+    pair (one file missing) is regenerated whole — a dev cert costs
+    nothing and self-heals; a deployed pair never lives in the dev
+    directory anyway.
     """
     cert_file, key_file = Path(cert_path), Path(key_path)
     if cert_file.is_file() and key_file.is_file():
