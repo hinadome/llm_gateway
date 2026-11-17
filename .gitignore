@@ -21,3 +21,7 @@ nohup.out
 .idea/
 .vscode/
 .DS_Store
+.rocketride/
+
+# Generated TLS dev certificates (scripts/gateway.sh --self-signed)
+deploy/certs/
