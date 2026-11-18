@@ -544,6 +544,36 @@ auth:
   #   issuer: https://idp.example.com      # enforced when set (exp always is)
   #   audience: llm-gateway
   #   leeway_seconds: 30                   # clock-skew tolerance
+  # Dashboard single sign-on (OIDC, authorization-code + PKCE). When
+  # enabled, /admin/ui shows a "Sign in with <label>" button: the
+  # browser holds only a short-lived gateway-minted session (never the
+  # raw admin key), and the signed-in human becomes a platform-admin
+  # principal — audit records name the email (auth_method sso). The
+  # sso_session chain step is added automatically; the raw-key login
+  # keeps working alongside. Who may sign in is an explicit allowlist:
+  # exact allowed_emails or allowed_domains suffixes (either matches).
+  # Secrets live in the ENVIRONMENT, never here (the house rule):
+  #   * client_secret_env names the OIDC client secret (unset = a
+  #     public client; PKCE carries the proof — S256 always).
+  #   * session_secret_env names the HS256 session-signing secret.
+  # Both must be set when required, or startup fails honestly.
+  # sso:
+  #   enabled: true
+  #   issuer: https://idp.example.com      # discovery base (GET
+  #   #                                      {issuer}/.well-known/...)
+  #   client_id: llm-gateway-admin
+  #   client_secret_env: SSO_CLIENT_SECRET
+  #   redirect_uri: https://gw.example.com/admin/ui/sso/callback
+  #   # Explicit endpoint overrides skip discovery (any one unset
+  #   # falls back to discovery for it):
+  #   # authorization_endpoint: https://idp.example.com/authorize
+  #   # token_endpoint: https://idp.example.com/token
+  #   # jwks_url: https://idp.example.com/.well-known/jwks.json
+  #   allowed_emails: [ops@example.com]
+  #   allowed_domains: [example.com]
+  #   session_ttl_seconds: 900             # the minted session's life
+  #   session_secret_env: GATEWAY_SSO_SESSION_SECRET
+  #   label: "Example Corp SSO"            # the dashboard button text
 
 # Multipart upload policy (/v1/audio/transcriptions|translations file,
 # /v1/images/edits|variations images + mask). The gateway buffers uploads

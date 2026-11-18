@@ -1242,18 +1242,80 @@ class JWTAuthConfig(BaseModel):
     jwks_cache_seconds: float = 300.0
 
 
+class SSOConfig(BaseModel):
+    """OIDC single sign-on for the admin dashboard (``auth.sso``).
+
+    The dashboard's default login is the raw admin key pasted into the
+    browser — a long-lived root credential in sessionStorage, shared by
+    every human who opens the tab. Enabling this replaces that with the
+    corporate identity: an authorization-code + PKCE login against an
+    OIDC provider, and the browser only ever holds a short-lived,
+    gateway-minted session token (the session ``ttl``). ``sub`` of the
+    minted session is the caller's email; sessions authenticate as
+    *platform admins* via the chain step ``sso_session`` (auto-inserted
+    when enabled — before ``jwt`` so gateway sessions never depend on
+    external-token config), and audit events record the human
+    (``actor`` = the email, ``auth_method`` = ``sso``) instead of a
+    shared key.
+
+    Who may sign in is an explicit allowlist: exact ``allowed_emails``
+    or ``allowed_domains`` suffixes (case-insensitive). Everything
+    else is refused at the callback with an honest reason. The raw-key
+    login keeps working alongside — SSO is additive, for operators.
+
+    Secrets never live in config.yaml (the house rule): the client
+    secret and the session-signing secret are environment variables
+    (``client_secret_env`` / ``session_secret_env`` — absent client
+    secret = a public client, PKCE mandatory, which it is anyway).
+    Requires PyJWT (the ``auth`` extra).
+    """
+
+    enabled: bool = False
+    # Discovery base — GET {issuer}/.well-known/openid-configuration
+    # (explicit endpoint overrides below skip the fetch).
+    issuer: str = ""
+    client_id: str = ""
+    # Env var holding the OIDC client secret (confidential clients).
+    # None = public client: PKCE carries the proof instead.
+    client_secret_env: str | None = None
+    # The full callback URL as registered with the IdP. Explicit on
+    # purpose — deriving from request hosts behind proxies is how
+    # open-redirect bugs are born.
+    redirect_uri: str = ""
+    # Explicit endpoint overrides — skip discovery (unusual IdPs, or
+    # pinned endpoints). Any one unset falls back to discovery for it.
+    authorization_endpoint: str | None = None
+    token_endpoint: str | None = None
+    jwks_url: str | None = None
+    # Who may sign in (either match → platform admin).
+    allowed_emails: list[str] = Field(default_factory=list)
+    allowed_domains: list[str] = Field(default_factory=list)
+    # Lifetime of the minted session token — the browser-held
+    # credential's blast radius. Short by design: refresh is one click
+    # (the cookie re-issues while it lives).
+    session_ttl_seconds: float = 900.0
+    session_secret_env: str = "GATEWAY_SSO_SESSION_SECRET"
+    # The dashboard button text ("Sign in with Google" &c).
+    label: str = "Single sign-on"
+    discovery_cache_seconds: float = 3600.0
+
+
 class AuthConfig(BaseModel):
     """The authentication chain: which strategies may authenticate a
     caller, in order. Built-in steps: ``admin_key``, ``virtual_key``,
     ``jwt``; a ``"pkg.module:ClassName"`` entry loads a custom
     ``Authenticator`` subclass (instantiated with this config). The first
     step that returns a principal wins; a step that positively rejects
-    the credential fails the request immediately."""
+    the credential fails the request immediately. ``sso_session`` is
+    added automatically when ``sso.enabled`` (before ``jwt``), so the
+    dashboard's minted sessions authenticate without touching
+    external-token config."""
 
     chain: list[str] = Field(
         default_factory=lambda: ["admin_key", "virtual_key"]
     )
     jwt: JWTAuthConfig = Field(default_factory=JWTAuthConfig)
+    sso: SSOConfig = Field(default_factory=SSOConfig)
 
 
 class MCPServerConfig(BaseModel):

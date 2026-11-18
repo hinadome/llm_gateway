@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 93 Python files, ~35,800 lines, 1383 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 95 Python files, ~36,600 lines, 1402 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -102,7 +102,9 @@ gateway/
 ├── config.py               Two-layer config: env Settings (secrets/DB) + YAML GatewayConfig (providers,
 │                           models — incl. shadow deployments/canary weights — model_aliases/default_model,
 │                           guardrails + their scopes (key/tenant/model/route fnmatch globs), cache, routing incl. breaker backend, auth chain
-│                           (admin_key/virtual_key/jwt/custom + JWT verification), audit + alerts webhooks,
+│                           (admin_key/virtual_key/jwt/sso_session/custom + JWT verification,
+│                           dashboard OIDC SSO — issuer/allowlist/env-only secrets),
+│                           audit + alerts webhooks,
 │                           pricing (per-1M-token + modality unit prices), logging incl.
 │                           store_bodies/retention_days/
 │                           background_write, metrics incl. per_key,
@@ -313,6 +315,32 @@ gateway/
 │   │                       (corrections). Counted on FEEDBACK{rating};
 │   │                       feedback.recorded lifecycle event; the admin
 │   │                       list/stats live in admin.py
+│   ├── sso.py              Dashboard SSO routes, all under /admin/ui/sso/ (tier
+│   │                       60): GET config (the login overlay's probe — is SSO
+│   │                       on, what the button says; honest {enabled: false}
+│   │                       when off), GET login (302 to the IdP's authorization
+│   │                       endpoint, state + PKCE verifier in a 5-min HttpOnly
+│   │                       SameSite=Lax cookie — the flat "state:verifier"
+│   │                       pair, both URL-safe tokens; JSON in a Set-Cookie
+│   │                       value gets mangled by cookie-jar quoting), GET
+│   │                       callback (state validated against the cookie before
+│   │                       the code is exchanged — a mismatch never redeems
+│   │                       a stolen authorization code; the allowlist applied;
+│   │                       success mints the session cookie, failure lands on
+│   │                       /admin/ui?sso=error&reason=… — an honest message,
+│   │                       never a stack trace), POST session (the one-time
+│   │                       cookie→Bearer exchange the dashboard's api() uses —
+│   │                       SameSite=Lax + no CORS means a cross-site POST may
+│   │                       mint a token it can never read; the admin API stays
+│   │                       Bearer-only, zero CSRF surface) and POST logout
+│   │                       (drops the cookie — the TTL is the real bound on a
+│   │                       stateless session, the documented trade). All
+│   │                       deliberately public: these routes ARE the login —
+│   │                       their anti-abuse story is the OAuth machinery
+│   │                       (state binding, PKCE, the allowlist), not a
+│   │                       dashboard credential; 404 sso_disabled when SSO is
+│   │                       off. Cookie paths are scoped (/admin/ui[/sso]) so no
+│   │                       cookie ever rides an /admin/* API call
 │   └── admin.py            Keys CRUD (incl. per-key model_mappings / default_model,
 │                           prompt policy fields and scoping fields; POST
 │                           /admin/keys/{id}/rotate — tier 51: replaces the
@@ -1273,7 +1301,15 @@ gateway/
 │   │                       and expiry refuse both credentials) and jwt
 │   │                       (HS256 secret or JWKS with kid-rotation refresh; the
 │   │                       token's key_claim names the virtual key whose row
-│   │                       supplies all policy) steps + "pkg.module:ClassName"
+│   │                       supplies all policy) steps, sso_session (the
+│   │                       dashboard's gateway-minted sessions: claims only
+│   │                       tokens whose unverified iss says ours — a foreign
+│   │                       JWT falls through to jwt untouched — then proves
+│   │                       the claim with full HS256 verification; the
+│   │                       principal is the signed-in human as a platform
+│   │                       admin, auth_method "sso" for the audit trail;
+│   │                       auto-inserted before jwt when auth.sso.enabled,
+│   │                       explicit chain entry also valid) + "pkg.module:ClassName"
 │   │                       custom loading, unknown names failing at startup;
 │   │                       auth_context_from_key snapshots a row (incl. scoping
 │   │                       + routing overrides, the tier-54 cache policy
@@ -1305,6 +1341,26 @@ gateway/
 │   │                       dangling tenant_id (corrupt state) and a disabled
 │   │                       tenant (the kill switch), so a member key is
 │   │                       never served as an unrestricted platform key
+│   ├── sso.py               SsoService — the dashboard's OIDC login (tier 60):
+│   │                       authorization-code + PKCE S256 redirect build
+│   │                       (prepare_login — state + verifier for the caller's
+│   │                       HttpOnly cookie), code exchange (the client secret
+│   │                       rides the POST body, never the URL; public clients
+│   │                       send none — PKCE carries the proof), ID-token
+│   │                       verification against the provider's JWKS (iss/aud/
+│   │                       exp, one kid-rotation refresh, email_verified
+│   │                       required), the email allowlist (exact allowed_emails
+│   │                       or allowed_domains suffix, case-insensitive), and
+│   │                       the gateway-minted sessions themselves: mint/
+│   │                       verify_session (HS256, iss llm-gateway:sso, aud admin,
+│   │                       sub the email, exp the TTL) + is_session_token (an
+│   │                       unverified iss peek — cheap, claims nothing; the
+│   │                       chain step's "is this ours?" test). Discovery cached
+│   │                       per discovery_cache_seconds with explicit
+│   │                       endpoint overrides winning field-by-field (any unset
+│   │                       falls back to discovery); IdP traffic rides a lazily
+│   │                       owned non-instrumented client (injected wins,
+│   │                       closed in lifespan teardown — the JWKS-fetch pattern)
 │   ├── audit.py             AuditLogger: one JSON record per security-relevant
 │   │                       admin action (key create/update/rotate/revoke,
 │   │                       breaker reset), delivered best-effort by a
@@ -2322,9 +2378,17 @@ gateway/
                             (inline CSS + vanilla JS, zero external resources —
                             no CDN, no build step, works air-gapped). Served at
                             /admin/ui without auth (the shell holds no data);
-                            talks to the JSON admin API above with the admin key
-                            pasted into a login overlay (kept in sessionStorage,
-                            sent as Bearer). 12 tabs: overview stats (+ usage CSV
+                            talks to the JSON admin API above with a credential
+                            entered in the login overlay: the admin key (kept
+                            in sessionStorage, sent as Bearer), or — tier 60,
+                            when auth.sso is enabled — the single sign-on
+                            button the config probe reveals: the IdP round
+                            trip lands back on /admin/ui?sso=ok and the page
+                            POSTs /admin/ui/sso/session to exchange the
+                            HttpOnly cookie for the Bearer it sends (the
+                            browser never holds the raw admin key; an ?sso=
+                            error renders the reason in the overlay; logout
+                            drops the server-side cookie too). 12 tabs: overview stats (+ usage CSV
                             export for the selected window, by-tenant breakdown
                             when tenants have traffic; tier 42 adds the SLO
                             panel above the traffic tables — one row per
@@ -2781,7 +2845,7 @@ sequenceDiagram
     participant DB as Database
 
     C->>A: POST /v1/chat/completions (Bearer sk-gw-... / token)
-    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ jwt → custom steps, first match wins<br/>(a key with a tenant loads its row —<br/>dangling tenant_id or disabled tenant<br/>fails closed, 401 — and a rotated key<br/>accepts its previous credential inside<br/>the grace window as the same identity,<br/>past it an explicit rotated 401.<br/>Each virtual-key use stamps the row's<br/>last_used_at — tier 55, throttled<br/>~60s, best-effort)
+    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ sso_session → jwt → custom steps,<br/>first match wins<br/>(sso_session — auto-inserted before jwt<br/>when auth.sso.enabled — claims only<br/>tokens whose unverified iss says ours,<br/>then proves them with full HS256:<br/>the signed-in human as a platform admin —<br/>foreign JWTs fall through to jwt.<br/>A key with a tenant loads its row —<br/>dangling tenant_id or disabled tenant<br/>fails closed, 401 — and a rotated key<br/>accepts its previous credential inside<br/>the grace window as the same identity,<br/>past it an explicit rotated 401.<br/>Each virtual-key use stamps the row's<br/>last_used_at — tier 55, throttled<br/>~60s, best-effort)
     A-->>A: token scoping (allowed_endpoints / allowed_ips)
     A->>P: handle_chat(request, auth)
 
@@ -3197,10 +3261,20 @@ create_app(settings, config, http_client, tracer_provider, redis_client, alert_h
       └── attached to app.state.pipeline (and the library to
           app.state.prompt_library for the admin routes); routes access
           them via request.app.state
+  ├── SsoService (auth.sso.enabled) — built from config.auth.sso + the env-
+  │   resolved session secret (session_secret_env); client_secret_env resolves
+  │   onto app.state.sso_client_secret (None = public client — PKCE carries
+  │   the proof). Fail-fast at startup when enabled-but-incomplete or a
+  │   required secret is unset (the error names the missing field/variable).
+  │   On app.state.sso; lazily owns a non-instrumented IdP client (an
+  │   injected sso_http_client wins), closed in the lifespan teardown
   └── AuthChain.from_config(config.auth, admin_key_provider,
-  │   jwks_http_client) — on app.state.auth_chain (admin_key step reads
-  │   app.state.admin_key, seeded by the lifespan; JWT step lazily owns
-  │   a JWKS client, closed in the lifespan teardown)
+  │   jwks_http_client, sso_service) — on app.state.auth_chain (admin_key
+  │   step reads app.state.admin_key, seeded by the lifespan; JWT step
+  │   lazily owns a JWKS client; the sso_session step — auto-inserted
+  │   before jwt when SSO is enabled, explicit chain entry also valid —
+  │   holds the SsoService, never a client of its own; both clients
+  │   closed in the lifespan teardown)
 ```
 
 Every constructor parameter is an injection point: tests (and any alternative deployment) can substitute any of them without touching the pipeline.
@@ -3239,7 +3313,7 @@ Being honest about the seams — these are the current trade-offs (all are local
 3. ~~Request-phase guardrails can only modify `messages`~~ **Solved:** `GuardrailResult` now carries `modified_model` (reject-and-redirect — "serve this on the small model" instead of blocking, with the pipeline re-checking the key's allowlist after the guardrail phase, fail closed) and `modified_request_fields` (arbitrary `ChatCompletionRequest` fields: `temperature`, `tools`, ...). All three compose and chain across guardrails (one `model_copy` per guardrail, each seeing the previous one's output).
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
 5. **Service selection beyond the built-ins is code.** The rate limiter, response cache and circuit-breaker registry have two built-in backends each (in-memory, Redis) selectable from `config.yaml`, but swapping in something else (e.g., a DynamoDB cache) still means calling `create_app` differently — the selection switch covers the shipped implementations only.
-6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. The same choice is why rotation never touches tokens: a JWT names the *key*, not its credential, so every token naming a key keeps working across its rotations (tier 51) — only raw-credential holders need the new secret. ~~Per-key cache overrides don't exist~~ **Solved (tier 54):** the key row now carries `cache_enabled` (NULL = inherit; `false` = bypass both response caches, exact + semantic, chat and embeddings, lookup and store — narrowing only, global-off stays off) and `cache_ttl_seconds` (NULL = the global window; otherwise the key's own, honored read-side as a freshness bound and write-side as the entry's lifetime), snapshotted at auth like every other key ceiling. Not covered: mTLS client certificates.
+6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. The same choice is why rotation never touches tokens: a JWT names the *key*, not its credential, so every token naming a key keeps working across its rotations (tier 51) — only raw-credential holders need the new secret. Tier 60 adds the one deliberate exception, the `sso_session` step (auto-inserted before `jwt` when `auth.sso.enabled`): the dashboard's OIDC login mints short-lived gateway sessions whose principal is the *signed-in human* as a platform admin — the one principal that names no key row, because the dashboard is an operator's surface and its audit records must say *who* (`auth_method` sso, the email) where the shared raw key could not. The session is stateless HS256 (the TTL is the revocation bound — logout drops the cookie, refresh is one click, replicas sharing the session secret verify each other's sessions), and the step claims only tokens whose unverified `iss` says ours — a foreign JWT still falls through to `jwt` untouched. ~~Per-key cache overrides don't exist~~ **Solved (tier 54):** the key row now carries `cache_enabled` (NULL = inherit; `false` = bypass both response caches, exact + semantic, chat and embeddings, lookup and store — narrowing only, global-off stays off) and `cache_ttl_seconds` (NULL = the global window; otherwise the key's own, honored read-side as a freshness bound and write-side as the entry's lifetime), snapshotted at auth like every other key ceiling. Not covered: mTLS client certificates.
 7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching (exact *and* semantic — `semantic_cache.backend: redis`, tier 59: a near-duplicate one replica embedded and stored is a hit for every replica, `RedisSemanticCache` keeping the same cosine/threshold/TTL/LRU semantics over shared entries) and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
 9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
@@ -3364,6 +3438,26 @@ tests/
 │                        RS256 via JWKS (caching, kid-rotation refresh, 503 when
 │                        the IdP is down), custom Authenticator steps, invalid
 │                        chain entries failing at construction
+├── test_sso.py          Dashboard SSO (tier 60): a mock OIDC IdP (RSA keys,
+│                        discovery/JWKS/token over an injectable transport,
+│                        path + token-form recorders) behind the full
+│                        authorization-code + PKCE flow — the login 302's
+│                        every moving part (S256 challenge; state + verifier
+│                        in the HttpOnly cookie, never the URL), the
+│                        callback's state-cookie binding (a mismatch never
+│                        exchanges the code), the token-exchange form
+│                        (verifier, grant, secret in the body; none for a
+│                        public client), the email allowlist (domains,
+│                        exact emails case-insensitive, unverified-email
+│                        refusal), the cookie→Bearer session exchange,
+│                        expired/forged sessions rejected honestly, the
+│                        foreign-JWT fall-through composition (SSO enabled
+│                        + jwt in the chain: an IdP token still authenticates
+│                        via jwt — 403 vs the session's 200), explicit-
+│                        endpoint discovery skip, logout dropping the cookie,
+│                        the principal (platform admin; audit records naming
+│                        the human — auth_method sso), raw-key additivity,
+│                        and the three fail-fast startup refusals
 ├── test_key_cache_policy.py  Per-key cache policy (tier 54, the §8.2 item-6
 │                        close): bypass opts out of BOTH caches for
 │                        lookup AND store (chat, stream, semantic
@@ -3447,6 +3541,11 @@ tests/
 │                        honest-disabled 404 branch, the config-echo
 │                        quarantine/purge badges, the summary cards
 │                        and both tables),
+│                        SSO-login markers (tier 60: the SSO button +
+│                        or-divider, the probe/login/session/logout
+│                        URLs, ssoFinish/finishLogin, the ?sso=
+│                        landing with history.replaceState, the
+│                        gw-admin-sso flag),
 │                        /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,

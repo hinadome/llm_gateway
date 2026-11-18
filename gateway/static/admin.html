@@ -169,6 +169,8 @@
     <input type="password" id="login-key" placeholder="sk-gw-..." autocomplete="off">
     <div class="err" id="login-err"></div>
     <button class="primary" id="btn-login">Sign in</button>
+    <div id="sso-or" class="muted" style="display:none;text-align:center;font-size:12px;margin:10px 0">or</div>
+    <button class="ghost" id="btn-sso" style="display:none">Single sign-on</button>
   </div>
 </div>
 
@@ -736,6 +738,9 @@
 const $ = s => document.querySelector(s);
 const state = {
   key: sessionStorage.getItem("gw-admin-key") || "",
+  // Did this tab's credential come from SSO? Governs logout: the
+  // session cookie should be dropped server-side too.
+  sso: sessionStorage.getItem("gw-admin-sso") === "1",
   tab: "overview",
   hours: 24,
   auto: true,
@@ -822,27 +827,86 @@ async function api(path, opts = {}) {
 
 function showLogin() {
   state.key = "";
+  state.sso = false;
   sessionStorage.removeItem("gw-admin-key");
+  sessionStorage.removeItem("gw-admin-sso");
   $("#login").style.display = "flex";
   $("#authbox").style.display = "none";
 }
+
+// Shared success path of both logins: stash the credential, show the
+// dashboard, and start the first load.
+async function finishLogin(key) {
+  state.key = key;
+  sessionStorage.setItem("gw-admin-key", key);
+  if (state.sso) sessionStorage.setItem("gw-admin-sso", "1");
+  $("#login").style.display = "none";
+  $("#authbox").style.display = "flex";
+  $("#login-err").textContent = "";
+  setConn(true, "connected");
+  await bootstrapAdminInfo();
+  refresh();
+}
+
 async function tryLogin() {
   const k = $("#login-key").value.trim();
   if (!k) return;
   state.key = k;
   try {
     await api("/admin/keys");
-    sessionStorage.setItem("gw-admin-key", k);
-    $("#login").style.display = "none";
-    $("#authbox").style.display = "flex";
-    $("#login-err").textContent = "";
-    setConn(true, "connected");
-    await bootstrapAdminInfo();
-    refresh();
+    state.sso = false;
+    await finishLogin(k);
   } catch (e) {
     $("#login-err").textContent = e.message || "Sign-in failed";
   }
 }
+
+// ---------- SSO (single sign-on) ----------------------------------------
+// The OIDC callback redirects back to /admin/ui?sso=ok|error. The ok
+// leg exchanges the HttpOnly session cookie for the Bearer the admin
+// API speaks — the browser never holds the raw admin key.
+
+async function ssoFinish() {
+  try {
+    const res = await fetch("/admin/ui/sso/session", { method: "POST" });
+    if (!res.ok) throw new Error("Sign-in session expired or invalid — sign in again.");
+    const body = await res.json();
+    state.sso = true;
+    await finishLogin(body.token);
+  } catch (e) {
+    showLogin();
+    $("#login-err").textContent = e.message || "Sign-in failed";
+  }
+}
+
+(async () => {
+  // Probe once: is SSO configured? Best-effort — a failed probe just
+  // leaves the raw-key login (e.g. an air-gapped setup).
+  try {
+    const r = await fetch("/admin/ui/sso/config");
+    if (r.ok) {
+      const cfg = await r.json();
+      if (cfg.enabled) {
+        $("#btn-sso").textContent = cfg.label || "Single sign-on";
+        $("#btn-sso").style.display = "block";
+        $("#sso-or").style.display = "block";
+      }
+    }
+  } catch (e) { /* probe is best-effort */ }
+  // The SSO callback lands here with ?sso=ok|error&reason&message.
+  const params = new URLSearchParams(location.search);
+  const result = params.get("sso");
+  if (!result) return;
+  history.replaceState(null, "", location.pathname);
+  if (result === "ok") {
+    await ssoFinish();
+  } else {
+    showLogin();
+    $("#login-err").textContent =
+      params.get("message") ||
+      ("Sign-in failed (" + (params.get("reason") || "unknown error") + ").");
+  }
+})();
 
 // Which kind of administrator signed in: only platform admins may
 // manage tenants (tenant admins get 403 there). Probing once drives
@@ -860,7 +924,18 @@ async function bootstrapAdminInfo() {
 }
 $("#btn-login").addEventListener("click", tryLogin);
 $("#login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryLogin(); });
-$("#btn-logout").addEventListener("click", () => { showLogin(); $("#login-key").focus(); });
+$("#btn-sso").addEventListener("click", () => {
+  // The IdP round trip is top-level navigation — the callback comes
+  // back to /admin/ui?sso=ok and the handler above takes over.
+  location.href = "/admin/ui/sso/login";
+});
+$("#btn-logout").addEventListener("click", () => {
+  // SSO logins drop the server-side session cookie too. Fire-and-
+  // forget: the page's own credential is cleared either way, and the
+  // cookie's own short TTL is the bound.
+  if (state.sso) fetch("/admin/ui/sso/logout", { method: "POST" }).catch(() => {});
+  showLogin(); $("#login-key").focus();
+});
 
 // ---------- tabs + refresh --------------------------------------------
 
@@ -3034,7 +3109,9 @@ if (state.key) {
   $("#login").style.display = "none";
   $("#authbox").style.display = "flex";
   bootstrapAdminInfo().finally(() => refresh());
-} else {
+} else if (!location.search.includes("sso=")) {
+  // An SSO landing (?sso=...) is about to resolve itself — leave the
+  // login overlay alone until it does.
   $("#login-key").focus();
 }
 </script>

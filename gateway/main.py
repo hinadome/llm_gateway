@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import time
 import uuid
@@ -42,6 +43,7 @@ from .api import mcp as mcp_api
 from .api import models as models_api
 from .api import openai_responses as responses_api
 from .api import realtime as realtime_api
+from .api import sso as sso_api
 from .bootstrap import ensure_admin_key, ensure_default_key
 from .config import GatewayConfig, Settings, get_settings
 from .core.alerts import BudgetAlertManager
@@ -77,6 +79,7 @@ from .core.redis_backends import (
 )
 from .core.router import Router, embed_fn_for
 from .core.semantic_cache import SemanticCache
+from .core.sso import SsoService
 from .db import dispose_engine, get_sessionmaker, init_engine
 from .errors import GatewayError, ModelNotFoundError, ProviderError
 from .guardrails.manager import GuardrailManager
@@ -136,6 +139,7 @@ def create_app(
     semantic_embedder: Callable[[str], Awaitable[list[float]]] | None = None,
     jwks_http_client: httpx.AsyncClient | None = None,
     audit_http_client: httpx.AsyncClient | None = None,
+    sso_http_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     config = config or GatewayConfig.load(settings.config_path)
@@ -761,6 +765,10 @@ def create_app(
             step_aclose = getattr(step, "aclose", None)
             if step_aclose is not None:
                 await step_aclose()
+        # The dashboard SSO service (owns its identity-provider HTTP
+        # client when none was injected).
+        if app.state.sso is not None:
+            await app.state.sso.aclose()
         if redis_client is not None:
             await redis_client.aclose()
         # Background log writes (logging.background_write): drain every
@@ -839,12 +847,60 @@ def create_app(
     app.state.http_client = client
     app.state.alerts = alerts
     app.state.audit = audit
+    # Dashboard SSO (tier 60): auth.sso.enabled builds the OIDC login
+    # service — fail-fast on incomplete config or unset secrets, so a
+    # broken SSO setup says so at startup, not at the first sign-in.
+    # The client secret and the session-signing secret resolve from
+    # the environment here, once (the house rule: secrets never live
+    # in config.yaml). The service's IdP traffic rides a dedicated
+    # non-instrumented client — an injected one wins (tests) — like
+    # the JWKS fetch and alert webhooks.
+    sso_service: SsoService | None = None
+    sso_client_secret: str | None = None
+    if config.auth.sso.enabled:
+        sso_cfg = config.auth.sso
+        missing = [
+            field
+            for field in ("issuer", "client_id", "redirect_uri")
+            if not getattr(sso_cfg, field)
+        ]
+        if missing:
+            raise ValueError(
+                f"auth.sso is enabled but incomplete: missing {', '.join(missing)}. "
+                "Set them in the auth.sso block (see config.yaml)."
+            )
+        session_secret = os.environ.get(sso_cfg.session_secret_env)
+        if not session_secret:
+            raise ValueError(
+                f"auth.sso is enabled but the session-signing secret is not "
+                f"set: export {sso_cfg.session_secret_env} (a long random "
+                f"string) and restart."
+            )
+        if sso_cfg.client_secret_env:
+            sso_client_secret = os.environ.get(sso_cfg.client_secret_env)
+            if not sso_client_secret:
+                raise ValueError(
+                    f"auth.sso.client_secret_env names {sso_cfg.client_secret_env} "
+                    "but it is not set. Export the OIDC client secret, or "
+                    "remove client_secret_env for a public client (PKCE "
+                    "carries the proof)."
+                )
+        sso_service = SsoService(
+            sso_cfg,
+            session_secret,
+            http_client=sso_http_client,
+        )
+    app.state.sso = sso_service
+    # None for public clients — complete_login only sends it when set.
+    app.state.sso_client_secret = sso_client_secret
     # Authentication chain (auth.chain): admin key / virtual keys / JWT /
     # custom steps. Built after the app exists — the admin-key step reads
     # app.state.admin_key, which the lifespan seeds. The JWKS fetch uses a
     # dedicated non-instrumented client (like alert webhooks) so identity-
     # provider traffic stays out of request traces; an injected one wins
-    # (tests).
+    # (tests). SSO-enabled gateways get the sso_session step (auto-inserted
+    # before jwt) — its sessions are platform-admin principals named by
+    # the signed-in email.
     app.state.auth_chain = AuthChain.from_config(
         config.auth,
         admin_key_provider=lambda: getattr(app.state, "admin_key", None),
@@ -854,6 +910,7 @@ def create_app(
             and "jwt" in config.auth.chain
             else None
         ),
+        sso_service=sso_service,
     )
 
     # ---- middleware ------------------------------------------------------
@@ -978,6 +1035,9 @@ def create_app(
     app.include_router(batches_api.router)
     app.include_router(feedback_api.router)
     app.include_router(admin_api.router)
+    # Dashboard SSO (auth.sso): the login routes sit beside the page —
+    # public by design (they ARE the login).
+    app.include_router(sso_api.router)
 
     @app.get("/health")
     async def health():

@@ -45,7 +45,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 from sqlalchemy import select, update
@@ -58,6 +58,9 @@ from ..models import Tenant, VirtualKey
 from ..observability import metrics
 from .context import AuthContext
 from .logging_svc import get_key_by_hash, get_tenant_by_id
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .sso import SsoService
 
 logger = logging.getLogger("gateway.auth")
 
@@ -482,6 +485,51 @@ class JWTAuthenticator(Authenticator):
         self._fetched_at = time.monotonic()
 
 
+class SsoSessionAuthenticator(Authenticator):
+    """The credential is a gateway-minted SSO session token (tier 60).
+
+    The dashboard's OIDC login (core/sso.py) mints these: HS256,
+    ``iss`` fixed to ``llm-gateway:sso``, ``sub`` the caller's email,
+    a short ``exp``. The token names no key row — the principal is the
+    *human* as a platform admin (no tenant, no key-level ceilings: an
+    operator session, like the env admin key but identified). Audit
+    events record the email as the actor with ``auth_method`` ``sso``,
+    which is the point: the shared raw admin key could not tell
+    humans apart; this can.
+
+    Only gateway-minted tokens are claimed — the ``iss`` peek decides,
+    the signature check proves: a Bearer claiming our issuer that
+    fails session verification is a positive rejection, and any other
+    credential (including a foreign JWT bound for the ``jwt`` step)
+    falls through to later chain steps untouched.
+    """
+
+    name = "sso_session"
+
+    def __init__(self, service: "SsoService") -> None:
+        self._service = service
+
+    async def authenticate(self, credential: str) -> AuthContext | None:
+        # Claim only tokens that *say* they are gateway sessions (the
+        # unverified ``iss`` peek in SsoService.is_session_token): a
+        # foreign JWT bound for the ``jwt`` step later in the chain has
+        # a different issuer and falls through untouched. Claiming
+        # authenticates nothing — a claimed token still goes through
+        # full HS256 verification, which raises AuthError honestly on
+        # expiry, forgery or a missing subject.
+        if not self._service.is_session_token(credential):
+            return None
+        email = self._service.verify_session(credential)
+        return AuthContext(
+            is_admin=True,
+            key_name=email,
+            # The audit/log vocabulary is "sso" (the human-facing
+            # method), deliberately not this step's chain identifier
+            # "sso_session" — audit records read "signed in via SSO".
+            auth_method="sso",
+        )
+
+
 def _load_class(class_path: str) -> type[Authenticator]:
     """Load a custom authenticator from a 'pkg.module:ClassName' path."""
     module_path, _, class_name = class_path.partition(":")
@@ -527,6 +575,7 @@ class AuthChain:
         config: AuthConfig,
         admin_key_provider: Callable[[], str | None],
         jwks_http_client: httpx.AsyncClient | None = None,
+        sso_service: "SsoService | None" = None,
     ) -> "AuthChain":
         """Build the configured chain. Unknown entries fail here — at
         startup, not at the first request."""
@@ -538,14 +587,39 @@ class AuthChain:
                 steps.append(VirtualKeyAuthenticator())
             elif spec == "jwt":
                 steps.append(JWTAuthenticator(config.jwt, jwks_http_client))
+            elif spec == "sso_session":
+                if sso_service is None:
+                    raise ValueError(
+                        "auth.chain includes 'sso_session' but SSO is not "
+                        "enabled (set auth.sso.enabled: true)."
+                    )
+                steps.append(SsoSessionAuthenticator(sso_service))
             elif ":" in spec:
                 steps.append(_load_class(spec)(config))
             else:
                 raise ValueError(
                     f"Unknown authenticator '{spec}'. Use a built-in name "
-                    f"(admin_key, virtual_key, jwt) or a "
+                    f"(admin_key, virtual_key, jwt, sso_session) or a "
                     f"'pkg.module:ClassName' path to your own Authenticator."
                 )
+        if config.sso.enabled and "sso_session" not in config.chain:
+            # Enabled implies the step: the dashboard login mints
+            # sessions that must authenticate, and requiring a second
+            # knob (the chain entry) for one decision is bookkeeping.
+            # Inserted BEFORE 'jwt' when it exists — a gateway-minted
+            # session is not an external token, and the jwt step's
+            # key-claim resolution must never see it first (and our iss
+            # peek means the reverse holds too: foreign tokens fall
+            # past this step to jwt untouched).
+            if sso_service is None:
+                raise ValueError(
+                    "auth.sso is enabled but no SSO service was wired."
+                )
+            step = SsoSessionAuthenticator(sso_service)
+            if "jwt" in config.chain:
+                steps.insert(config.chain.index("jwt"), step)
+            else:
+                steps.append(step)
         if not steps:
             raise ValueError("auth.chain must list at least one authenticator.")
         return cls(steps)

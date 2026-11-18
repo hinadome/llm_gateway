@@ -492,6 +492,30 @@ async def test_admin_ui_quiet_key_badge_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_sso_login_surface(env):
+    # Tier 60: the dashboard's SSO login — the probe that reveals the
+    # button, the redirect that starts the flow, the ?sso= landing
+    # handler with its cookie→Bearer exchange, and the SSO-aware
+    # logout. Static-shell assertions only (the flow lives in
+    # test_sso.py).
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="btn-sso"',
+        'id="sso-or"',
+        'id="login-err"',
+        "/admin/ui/sso/config",
+        "/admin/ui/sso/login",
+        "/admin/ui/sso/session",
+        "/admin/ui/sso/logout",
+        "async function ssoFinish(",
+        "async function finishLogin(",
+        "history.replaceState",
+        'params.get("message")',
+        "gw-admin-sso",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_ui_pii_panel_surface(env):
     # Tier 57: the tier-53 teeth get their dashboard surface — a PII
     # scan tab (loading it IS the on-demand scan), the config-echo

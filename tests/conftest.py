@@ -694,6 +694,7 @@ async def _make_env(
     cors_allow_origins=None,
     jwks_client=None,
     audit_client=None,
+    sso_http_client=None,
     vault_master_key=None,
     mcp_mock=None,
     config_path=None,
@@ -754,6 +755,7 @@ async def _make_env(
         semantic_embedder=semantic_embedder,
         jwks_http_client=jwks_client,
         audit_http_client=audit_client,
+        sso_http_client=sso_http_client,
     )
     app.state.admin_key = ADMIN_KEY  # ASGITransport does not run the lifespan
 

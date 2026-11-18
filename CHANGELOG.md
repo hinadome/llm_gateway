@@ -8,6 +8,61 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Dashboard single sign-on (tier 60) — `auth.sso` replaces the
+  dashboard's raw-admin-key-in-sessionStorage login with the corporate
+  identity: an **OIDC authorization-code + PKCE (S256)** flow against
+  your provider, ending in a short-lived **gateway-minted session**.
+  The browser holds that and only that; the raw-key login keeps
+  working alongside (SSO is additive).
+  - **The flow** (`core/sso.py` + `api/sso.py`, routes under
+    `/admin/ui/sso/`): the login overlay probes
+    `GET /admin/ui/sso/config` and shows the SSO button when enabled;
+    the 302 to the provider carries `state` + the PKCE verifier in a
+    5-minute HttpOnly `SameSite=Lax` cookie (the flat
+    `state:verifier` pair — JSON in a Set-Cookie value gets mangled by
+    cookie-jar quoting; the verifier never rides the URL); the
+    callback validates state against the cookie *before* exchanging
+    the code (a mismatch never redeems a stolen authorization code),
+    verifies the ID token against the provider's JWKS (`iss` / `aud` /
+    `exp`, one `kid`-rotation refresh, `email_verified` required) and
+    applies the allowlist — exact `allowed_emails` or
+    `allowed_domains` suffixes, case-insensitive, either wins.
+    Success mints an HS256 session (`iss` fixed to `llm-gateway:sso`,
+    `aud` `admin`, `sub` the email, `exp` the TTL, default 900s) into
+    an HttpOnly cookie; failure lands on `/admin/ui?sso=error` with an
+    honest reason, never a stack trace.
+  - **Session transport**: the cookie alone never authenticates an
+    admin-API call — `POST /admin/ui/sso/session` exchanges it once
+    for the Bearer the dashboard's `api()` sends. The admin API stays
+    exactly Bearer-only: zero new auth paths on every `/admin/*`
+    endpoint, zero CSRF surface (SameSite=Lax + no CORS on the
+    exchange: a cross-site POST may mint a token it can never read).
+  - **The principal**: the new `sso_session` chain step
+    (`core/auth.py`, auto-inserted before `jwt` when `sso.enabled`,
+    explicit chain entry also valid) claims only tokens whose
+    unverified `iss` says ours — a foreign JWT still falls through to
+    `jwt` untouched — then proves the claim with full HS256
+    verification. The principal is the *signed-in human* as a
+    platform admin: audit records name the person (`actor` = the
+    email, `auth_method` = `sso`) — the thing the shared raw key
+    could never do. Sessions are stateless by design: the TTL is the
+    revocation bound, logout drops the cookie, and replicas sharing
+    `GATEWAY_SSO_SESSION_SECRET` verify each other's sessions.
+  - **Honest edges**: secrets are env-only (`client_secret_env`,
+    `session_secret_env` — never config.yaml, per the house rule) and
+    enabling SSO with an incomplete config or an unset secret fails at
+    startup naming the variable; `redirect_uri` is explicit (never
+    derived from request hosts); the Secure cookie flag follows the
+    request's own scheme; the login/callback/session/logout routes
+    are deliberately public (they *are* the login — their anti-abuse
+    story is the OAuth machinery, not a dashboard credential) and 404
+    `sso_disabled` when SSO is off; explicit endpoint overrides skip
+    discovery field-by-field.
+  - 19 new tests (`tests/test_sso.py`: a mock OIDC IdP with RSA keys
+    over an injectable transport, the full cookie-jar flow, every
+    refusal, the foreign-JWT fall-through composition, the audit
+    record naming the human; `tests/test_admin_ui.py`: the dashboard
+    SSO surface pin). Suite 1402.
 - Redis semantic cache (tier 59) — `semantic_cache.backend: redis`
   closes the biggest multi-replica gap: the similarity store was the
   one cache still per-process, so a near-duplicate that replica A
