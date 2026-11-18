@@ -73,6 +73,7 @@ from .shadow_diff import extract_content_text, score_pair
 from .cost import CostCalculator, cached_tokens_from_usage
 from .mcp import (
     GUARDRAIL_BLOCKED,
+    MCP_CONTENT_METHODS,
     MCPToolBlocked,
     MCPServerConfig,
     MCPSession,
@@ -1103,7 +1104,7 @@ class GatewayPipeline:
         """One POST /v1/mcp/{server}: one JSON-RPC message in, the
         server's answer out — JSON or SSE, with the response frame
         intercepted where policy applies (tools/list filtering,
-        tools/call guardrails). The transport follows MCP 2025-06-18
+        tools/call and the content-method guardrails of tier 49). The transport follows MCP 2025-06-18
         Streamable HTTP: the gateway issues its OWN Mcp-Session-Id at
         initialize and maps it to the upstream session + negotiated
         protocol version; notifications and client responses relay as
@@ -1220,6 +1221,10 @@ class GatewayPipeline:
                     if method == "tools/call":
                         return await self._mcp_tools_call(
                             ctx, server, registry, session, message
+                        )
+                    if method in MCP_CONTENT_METHODS:
+                        return await self._mcp_content_call(
+                            ctx, server, registry, session, message, method
                         )
                     return await self._mcp_exchange(
                         ctx,
@@ -1493,6 +1498,171 @@ class GatewayPipeline:
             method_label="tools/list",
         )
 
+    async def _mcp_guard_request(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        text: str,
+        *,
+        tool: str | None = None,
+        method: str | None = None,
+    ) -> tuple[ChatCompletionRequest, str | None, MCPToolBlocked | None]:
+        """The request-phase guardrails over one piece of caller-
+        controlled MCP content, factored from tools/call (tier 49):
+        the serialized params run through run_request_phase as a
+        synthetic chat request — model = the server name (what the
+        caller chose to talk to, and what model-scoped guardrails
+        match on this surface), one user message = the text.
+
+        Returns ``(modified_request, new_text, blocked)``:
+
+        * ``blocked`` — a denial, a model-redirect verdict (there is
+          no model to redirect on this surface — fail closed, never
+          silently drop a verdict) or a NON-TEXT rewrite (content the
+          caller cannot consume is a corruption, not a policy). The
+          caller answers with the in-band error; nothing travels
+          upstream.
+        * ``new_text`` — the rewritten text when a modify verdict
+          changed it, ``None`` when it did not. Whether the rewrite is
+          still the right SHAPE (a JSON object) is the caller's to
+          validate — each message type knows its own.
+        """
+        synthetic = ChatCompletionRequest(
+            model=server.name,
+            messages=[Message(role="user", content=text)],
+        )
+        try:
+            modified = await self.guardrails.run_request_phase(synthetic, ctx)
+        except GuardrailBlocked as exc:
+            return (
+                synthetic,
+                None,
+                MCPToolBlocked(
+                    GUARDRAIL_BLOCKED,
+                    f"Request blocked by guardrail '{exc.guardrail}': {exc.reason}",
+                    tool=tool,
+                    guardrail=exc.guardrail,
+                    method=method,
+                ),
+            )
+        if modified.model != server.name:
+            return (
+                synthetic,
+                None,
+                MCPToolBlocked(
+                    GUARDRAIL_BLOCKED,
+                    "Blocked: a guardrail issued a model redirect, which the "
+                    "MCP surface cannot honor — failing closed.",
+                    tool=tool,
+                    method=method,
+                ),
+            )
+        new_content = modified.messages[-1].content if modified.messages else None
+        if new_content is not None and not isinstance(new_content, str):
+            return (
+                synthetic,
+                None,
+                MCPToolBlocked(
+                    GUARDRAIL_BLOCKED,
+                    "Blocked: a guardrail rewrote the MCP message content "
+                    "into a non-text message — failing closed.",
+                    tool=tool,
+                    method=method,
+                ),
+            )
+        return modified, (new_content if new_content != text else None), None
+
+    async def _mcp_guard_response_text(
+        self,
+        request_for_response: ChatCompletionRequest,
+        ctx: RequestContext,
+        server_name: str,
+        text: str,
+        *,
+        tool: str | None = None,
+        method: str | None = None,
+    ) -> str:
+        """One piece of server-returned MCP text through the
+        response-phase guardrails, factored from tools/call (tier 49):
+        a synthetic chat.completion — one assistant message = the
+        text — run over the request the (possibly rewritten) inbound
+        message produced, so response policies judge the content that
+        actually went upstream. Returns the new text when a modify
+        verdict produced one, the original otherwise (a non-text
+        rewrite is ignored, never a corruption); raises
+        MCPToolBlocked on a denial — the exchange turns it into the
+        in-band error."""
+        synthetic_response = {
+            "id": f"chatcmpl-mcp-{ctx.request_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": server_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": text},
+                }
+            ],
+        }
+        try:
+            rewritten = await self.guardrails.run_response_phase(
+                request_for_response, synthetic_response, ctx
+            )
+        except GuardrailBlocked as exc:
+            raise MCPToolBlocked(
+                GUARDRAIL_BLOCKED,
+                f"Request blocked by guardrail '{exc.guardrail}': {exc.reason}",
+                tool=tool,
+                guardrail=exc.guardrail,
+                method=method,
+            ) from exc
+        new_text = (
+            rewritten.get("choices", [{}])[0].get("message", {}).get("content")
+        )
+        return new_text if isinstance(new_text, str) else text
+
+    async def _mcp_guard_result_items(
+        self,
+        request_for_response: ChatCompletionRequest,
+        ctx: RequestContext,
+        server_name: str,
+        items: list[Any],
+        *,
+        tool: str | None = None,
+        method: str | None = None,
+    ) -> None:
+        """Content blocks (tools/call results, prompt messages) through
+        the response-phase guardrails, in place: text items and the
+        TEXT of embedded resources are guarded; image/audio items and
+        resource blobs carry base64, not text — skipped by design, and
+        a text guardrail run over base64 would only mangle it."""
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                item["text"] = await self._mcp_guard_response_text(
+                    request_for_response,
+                    ctx,
+                    server_name,
+                    item["text"],
+                    tool=tool,
+                    method=method,
+                )
+            elif (
+                item.get("type") == "resource"
+                and isinstance(item.get("resource"), dict)
+                and isinstance(item["resource"].get("text"), str)
+            ):
+                item["resource"]["text"] = await self._mcp_guard_response_text(
+                    request_for_response,
+                    ctx,
+                    server_name,
+                    item["resource"]["text"],
+                    tool=tool,
+                    method=method,
+                )
+
     async def _mcp_tools_call(
         self,
         ctx: RequestContext,
@@ -1516,10 +1686,15 @@ class GatewayPipeline:
         that from its JSON-RPC layer. Nothing upstream sees a denied
         call.
 
-        After upstream — the response-phase guardrails over each text
-        item of the result (synthetic chat.completion per item). A
-        blocked result becomes the same in-band error, upstream's
-        answer discarded."""
+        After upstream — the response-phase guardrails over the
+        result's text: each text item, the text of embedded resource
+        items, and structuredContent guarded as serialized JSON (a
+        rewrite applied only if it is still a JSON object — the
+        same fail-closed rule as the arguments). Base64 payloads —
+        image/audio items, resource blobs — are binary: no text to
+        scan, skipped by design, and a text guardrail run over
+        base64 would only mangle it. A blocked result becomes the
+        same in-band error, upstream's answer discarded."""
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         name = params.get("name")
         message_id = message.get("id")
@@ -1556,37 +1731,19 @@ class GatewayPipeline:
 
         arguments = params.get("arguments")
         serialized = json.dumps(arguments, sort_keys=True) if arguments is not None else "{}"
-        synthetic = ChatCompletionRequest(
-            model=server.name,
-            messages=[Message(role="user", content=serialized)],
+        modified, new_text, blocked = await self._mcp_guard_request(
+            ctx, server, serialized, tool=name, method="tools/call"
         )
-        try:
-            modified = await self.guardrails.run_request_phase(synthetic, ctx)
-        except GuardrailBlocked as exc:
-            blocked = MCPToolBlocked(
-                GUARDRAIL_BLOCKED,
-                f"Request blocked by guardrail '{exc.guardrail}': {exc.reason}",
-                tool=name,
-                guardrail=exc.guardrail,
-            )
+        if blocked is not None:
             await self._mcp_apply_block(ctx, blocked)
             return denied(blocked)
-        if modified.model != server.name:
-            # A model-redirect verdict cannot apply to an MCP tool call
-            # (there is no model to redirect) — fail closed, never
-            # silently drop the verdict.
-            blocked = MCPToolBlocked(
-                GUARDRAIL_BLOCKED,
-                "Blocked: a guardrail issued a model redirect, which the "
-                "MCP surface cannot honor — failing closed.",
-                tool=name,
-            )
-            await self._mcp_apply_block(ctx, blocked)
-            return denied(blocked)
-        new_content = modified.messages[-1].content if modified.messages else None
-        if isinstance(new_content, str) and new_content != serialized:
+        if new_text is not None:
+            # Applied ONLY if the rewrite is still a JSON object — the
+            # fail-closed rule: a corrupted call is worse than a
+            # blocked one, and a blocked call at least explains
+            # itself.
             try:
-                new_arguments = json.loads(new_content)
+                new_arguments = json.loads(new_text)
                 if not isinstance(new_arguments, dict):
                     raise ValueError("not a JSON object")
                 params["arguments"] = new_arguments
@@ -1597,64 +1754,57 @@ class GatewayPipeline:
                     "something that is no longer a valid JSON object — "
                     "failing closed rather than corrupting the call.",
                     tool=name,
+                    method="tools/call",
                 )
                 await self._mcp_apply_block(ctx, blocked)
                 return denied(blocked)
-        elif new_content is not None and not isinstance(new_content, str):
-            blocked = MCPToolBlocked(
-                GUARDRAIL_BLOCKED,
-                "Blocked: a guardrail rewrote the tool arguments into a "
-                "non-text message — failing closed.",
-                tool=name,
-            )
-            await self._mcp_apply_block(ctx, blocked)
-            return denied(blocked)
 
         request_for_response = modified
 
         async def on_response(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(body.get("result"), dict):
                 return body
-            content = body["result"].get("content")
-            if not isinstance(content, list):
-                return body
-            for item in content:
-                if (
-                    isinstance(item, dict)
-                    and item.get("type") == "text"
-                    and isinstance(item.get("text"), str)
-                ):
-                    synthetic_response = {
-                        "id": f"chatcmpl-mcp-{ctx.request_id}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": server.name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "finish_reason": "stop",
-                                "message": {"role": "assistant", "content": item["text"]},
-                            }
-                        ],
-                    }
+            result = body["result"]
+            content = result.get("content")
+            if isinstance(content, list):
+                await self._mcp_guard_result_items(
+                    request_for_response,
+                    ctx,
+                    server.name,
+                    content,
+                    tool=name,
+                    method="tools/call",
+                )
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                # The typed-result companion: guarded as serialized
+                # JSON, a rewrite applied only if it is still a JSON
+                # object — the same fail-closed rule as the arguments.
+                serialized_structured = json.dumps(structured, sort_keys=True)
+                new_structured = await self._mcp_guard_response_text(
+                    request_for_response,
+                    ctx,
+                    server.name,
+                    serialized_structured,
+                    tool=name,
+                    method="tools/call",
+                )
+                if new_structured != serialized_structured:
                     try:
-                        rewritten = await self.guardrails.run_response_phase(
-                            request_for_response, synthetic_response, ctx
-                        )
-                    except GuardrailBlocked as exc:
+                        parsed = json.loads(new_structured)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("not a JSON object")
+                        result["structuredContent"] = parsed
+                    except ValueError:
                         raise MCPToolBlocked(
                             GUARDRAIL_BLOCKED,
-                            f"Request blocked by guardrail '{exc.guardrail}': {exc.reason}",
+                            "Blocked: a guardrail rewrote the tool's "
+                            "structuredContent into something that is no "
+                            "longer a valid JSON object — failing closed "
+                            "rather than corrupting the result.",
                             tool=name,
-                            guardrail=exc.guardrail,
-                        ) from exc
-                    new_text = (
-                        rewritten.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content")
-                    )
-                    if isinstance(new_text, str):
-                        item["text"] = new_text
+                            method="tools/call",
+                        ) from None
             return body
 
         return await self._mcp_exchange(
@@ -1666,6 +1816,136 @@ class GatewayPipeline:
             on_response=on_response,
             kind="request",
             method_label="tools/call",
+        )
+
+    async def _mcp_content_call(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        registry: MCPSessionRegistry,
+        session: MCPSession,
+        message: dict[str, Any],
+        method: str,
+    ) -> Response:
+        """The content-bearing methods (tier 49): resources/read,
+        prompts/get, completion/complete — everything that moves
+        caller-controlled text in and server-generated text out,
+        besides tools/call's dedicated path (tool policy + the
+        arguments shape).
+
+        Before upstream — the request-phase guardrails over the
+        serialized params (the whole object: uri, name, arguments,
+        ref, argument — everything the caller controls on these
+        methods, as a synthetic chat request). A modify verdict is
+        applied ONLY if the rewrite is still a JSON object — the
+        arguments rule; a redirect verdict cannot apply here either
+        and fails closed. Denials are in-band JSON-RPC errors
+        (HTTP 200); nothing upstream sees them.
+
+        After upstream — the response-phase guardrails over every
+        text shape the method can answer with, each piece its own
+        synthetic chat.completion: resources/read's
+        ``contents[].text`` (a ``blob`` twin is binary — skipped by
+        design), prompts/get's message content blocks (the field in
+        BOTH its shapes — a single block or a list — because the
+        spec widened it and servers ship both), and
+        completion/complete's ``completion.values[]``. A denial
+        replaces the whole answer with the in-band error."""
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        message_id = message.get("id")
+
+        def denied(blocked: MCPToolBlocked) -> Response:
+            return JSONResponse(
+                jsonrpc_error(message_id, blocked.code, blocked.reason)
+            )
+
+        serialized = json.dumps(params, sort_keys=True) if params else "{}"
+        modified, new_text, blocked = await self._mcp_guard_request(
+            ctx, server, serialized, method=method
+        )
+        if blocked is not None:
+            await self._mcp_apply_block(ctx, blocked)
+            return denied(blocked)
+        if new_text is not None:
+            try:
+                new_params = json.loads(new_text)
+                if not isinstance(new_params, dict):
+                    raise ValueError("not a JSON object")
+                message["params"] = new_params
+            except ValueError:
+                blocked = MCPToolBlocked(
+                    GUARDRAIL_BLOCKED,
+                    "Blocked: a guardrail rewrote the message params into "
+                    "something that is no longer a valid JSON object — "
+                    "failing closed rather than corrupting the call.",
+                    method=method,
+                )
+                await self._mcp_apply_block(ctx, blocked)
+                return denied(blocked)
+
+        request_for_response = modified
+
+        async def on_response(body: dict[str, Any]) -> dict[str, Any]:
+            result = body.get("result")
+            if not isinstance(result, dict):
+                return body
+            if method == "resources/read":
+                contents = result.get("contents")
+                if isinstance(contents, list):
+                    for item in contents:
+                        if (
+                            isinstance(item, dict)
+                            and isinstance(item.get("text"), str)
+                        ):
+                            item["text"] = await self._mcp_guard_response_text(
+                                request_for_response,
+                                ctx,
+                                server.name,
+                                item["text"],
+                                method=method,
+                            )
+            elif method == "prompts/get":
+                messages = result.get("messages")
+                if isinstance(messages, list):
+                    for entry in messages:
+                        if not isinstance(entry, dict):
+                            continue
+                        block = entry.get("content")
+                        # A single block or a list of them — the walk
+                        # handles both shapes.
+                        blocks = block if isinstance(block, list) else [block]
+                        await self._mcp_guard_result_items(
+                            request_for_response,
+                            ctx,
+                            server.name,
+                            blocks,
+                            method=method,
+                        )
+            elif method == "completion/complete":
+                completion = result.get("completion")
+                if isinstance(completion, dict):
+                    values = completion.get("values")
+                    if isinstance(values, list):
+                        for i, value in enumerate(values):
+                            if isinstance(value, str):
+                                values[i] = await self._mcp_guard_response_text(
+                                    request_for_response,
+                                    ctx,
+                                    server.name,
+                                    value,
+                                    method=method,
+                                )
+            return body
+
+        return await self._mcp_exchange(
+            ctx,
+            server,
+            registry,
+            session,
+            message,
+            on_response=on_response,
+            kind="request",
+            method_label=method,
         )
 
     async def _mcp_apply_block(
@@ -1683,6 +1963,7 @@ class GatewayPipeline:
             tool=blocked.tool,
             code=blocked.code,
             guardrail=blocked.guardrail,
+            method=blocked.method,
         )
 
     async def _mcp_exchange(

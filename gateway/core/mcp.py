@@ -48,6 +48,19 @@ TOOL_NOT_ALLOWED = -32001  # tools/call outside the key's tool policy
 GUARDRAIL_BLOCKED = -32002  # a guardrail blocked the call's args or result
 SESSION_TERMINATED = -32003  # unknown/expired Mcp-Session-Id (404)
 
+# The JSON-RPC methods that move content worth guarding (tier 49):
+# caller-controlled text in (a URI, prompt arguments, a completion
+# argument), server-generated text out (resource bodies, prompt
+# messages, completion values). tools/call guards its own path. Every
+# other method — lifecycle (initialize), notifications, catalog reads
+# (tools/list, resources/list, prompts/list, resources/templates/list),
+# ping — passes through untouched by design: nothing the caller wrote
+# beyond a cursor, nothing the server generated beyond static catalog
+# descriptions.
+MCP_CONTENT_METHODS: frozenset[str] = frozenset(
+    {"resources/read", "prompts/get", "completion/complete"}
+)
+
 
 def jsonrpc_error(
     message_id: Any, code: int, message: str, data: Any = None
@@ -230,12 +243,13 @@ class MCPSessionRegistry:
 
 
 class MCPToolBlocked(Exception):
-    """A tools/call denied by gateway policy — carried as a plain
-    exception (NOT a GatewayError) so the exchange turns it into an
-    IN-BAND JSON-RPC error — HTTP 200 with the error body, or an SSE
+    """A guarded MCP message denied by gateway policy — carried as a
+    plain exception (NOT a GatewayError) so the exchange turns it into
+    an IN-BAND JSON-RPC error — HTTP 200 with the error body, or an SSE
     error frame — instead of a transport-level failure. A transport 4xx
     would hide the reason from the client's JSON-RPC layer; the agent
-    calling the tool needs to see *which* tool and *why*.
+    at the other end needs to see *which* message (``method``, and the
+    tool name for tools/call) and *why*.
     """
 
     def __init__(
@@ -245,12 +259,16 @@ class MCPToolBlocked(Exception):
         *,
         tool: str | None = None,
         guardrail: str | None = None,
+        method: str | None = None,
     ) -> None:
         super().__init__(reason)
         self.code = code
         self.reason = reason
         self.tool = tool
         self.guardrail = guardrail
+        # The JSON-RPC method the denial belongs to (tools/call,
+        # resources/read, ...) — None when the blocker did not say.
+        self.method = method
 
 
 # --------------------------------------------------------------------------

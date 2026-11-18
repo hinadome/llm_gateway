@@ -8,6 +8,51 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- MCP guardrail coverage (tier 49) — the three audit gaps closed: the
+  proxy's guardrails now cover every content-bearing method instead of
+  `tools/call` alone.
+  - **The content methods guard both directions.**
+    `resources/read`, `prompts/get` and `completion/complete` now run
+    the request-phase guardrails over the whole serialized `params`
+    (uri, name, `arguments`, `ref`, the completion `argument` —
+    everything the caller controls), and the response phase over every
+    server text shape they can answer with: `contents[].text`, prompt
+    message text blocks (in **both** content shapes — a single block or
+    a list, because the spec widened mid-life and servers ship both),
+    and `completion.values[]`. A modify verdict applies only while the
+    rewrite stays a JSON object — the arguments rule, now on params
+    too; redirects and corrupt rewrites fail closed; denials stay
+    in-band JSON-RPC errors (HTTP 200), nothing upstream sees them.
+  - **`tools/call` results cover the non-text shapes.** The response
+    phase now scans `structuredContent` (as serialized JSON, a rewrite
+    applied only while it stays a JSON object — corrupt rewrites fail
+    closed) and the **text of embedded-resource items**. Base64
+    payloads — image/audio items, resource `blob`s — are binary, with
+    no text to scan: skipped by design and passed through
+    byte-identical.
+  - **Everything else stays verbatim by design**: lifecycle
+    (`initialize`), notifications, catalog reads (`tools/list`,
+    `resources/list`, `prompts/list`), `ping` — nothing the caller
+    wrote beyond a cursor, nothing the server generated beyond static
+    descriptions.
+
+  Guardrail **`scope:` binds on this route as on every other**, now
+  pinned by tests: `routes: ["mcp"]` is the lever for MCP-only
+  policies (the same content denied here passes on chat), `models:`
+  matches the **server name** (the log row's model column — an
+  in-scope guardrail governs the server's traffic while an
+  other-server scope never runs, and chat model names never collide
+  with server names), and `keys`/`exclude_keys` match the calling key's
+  name. `MCPToolBlocked` gained the denied `method`, so the
+  `mcp.tool.blocked` event (and the blocked log row's context) says
+  whether the denial was a `tools/call`, a `resources/read`, a
+  `prompts/get` or a `completion/complete`.
+
+  Internally the pass is factored into three shared helpers
+  (`_mcp_guard_request` / `_mcp_guard_response_text` /
+  `_mcp_guard_result_items`) that `tools/call` and the new
+  `_mcp_content_call` both use — one rulebook, two dispatch paths, no
+  drift. 18 tests in `tests/test_mcp.py`; the suite stands at 1259.
 - Budget forecast alerts (tier 48) — the tier-47 projections get
   teeth. A forecast nobody reads is a spreadsheet, so a background
   evaluator (the canary-loop shape: always started, re-reading

@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 90 Python files, ~33,400 lines, 1241 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 90 Python files, ~33,700 lines, 1259 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -800,9 +800,26 @@ gateway/
 │   │                       synthetic chat request — MODIFY applied
 │   │                       only while the rewrite stays a JSON
 │   │                       object, else fail-closed; redirects fail
-│   │                       closed) and the response phase per text
-│   │                       item, denials as MCPToolBlocked →
-│   │                       in-band JSON-RPC errors, the generic
+│   │                       closed) and the response phase over the
+│   │                       result's text — each text item, the text
+│   │                       of embedded-resource items, and
+│   │                       structuredContent guarded as serialized
+│   │                       JSON (the same fail-closed rewrite rule;
+│   │                       base64 payloads — blobs, image/audio
+│   │                       items — are binary, skipped by design);
+│   │                       tier 49 factors the pass into
+│   │                       _mcp_guard_request / _mcp_guard_
+│   │                       response_text / _mcp_guard_result_items,
+│   │                       shared with _mcp_content_call — the
+│   │                       content methods (resources/read,
+│   │                       prompts/get, completion/complete): the
+│   │                       whole params in (uri/name/arguments/ref/
+│   │                       argument — everything the caller wrote),
+│   │                       every server text shape out (contents[].
+│   │                       text, message blocks in BOTH content
+│   │                       shapes, completion.values[]), denials as
+│   │                       MCPToolBlocked → in-band JSON-RPC
+│   │                       errors, the generic
 │   │                       exchange handling JSON or SSE answers
 │   │                       (SSE relayed live, response frame
 │   │                       intercepted, everything else verbatim);
@@ -866,10 +883,19 @@ gateway/
 │   │                       + the session/protocol stamps — never the
 │   │                       caller's gateway credential), MCPToolBlocked
 │   │                       (a plain Exception, NOT a GatewayError: it
-│   │                       carries tool denials so the exchange turns
-│   │                       them IN-BAND — HTTP 200 JSON-RPC error —
-│   │                       instead of a transport 4xx that would hide
-│   │                       the reason from the client SDK), and
+│   │                       carries policy/guardrail denials — code,
+│   │                       reason, the tool for tools/call, the
+│   │                       guardrail, and (tier 49) the denied
+│   │                       method — so the exchange turns them
+│   │                       IN-BAND — HTTP 200 JSON-RPC error —
+│   │                       instead of a transport 4xx that would
+│   │                       hide the reason from the client SDK),
+│   │                       MCP_CONTENT_METHODS (tier 49: the
+│   │                       frozenset of methods that move content
+│   │                       worth guarding — resources/read,
+│   │                       prompts/get, completion/complete;
+│   │                       lifecycle, notifications and catalog
+│   │                       reads stay verbatim by design), and
 │   │                       SSEReader (the incremental SSE frame parser
 │   │                       — \n\n and \r\n\r\n boundaries, multi-line
 │   │                       data, keepalive comments — used by the
@@ -2557,7 +2583,7 @@ Every stage boundary below is also an event emission (the full catalog with payl
 - **`request.routed`** — after deployment selection, on both the stream and non-stream paths (observer-only: the router's retry machinery has the provider call in flight — an in-band veto there would be unsafe, so routing is notification, not a checkpoint).
 - **`response.completed`** — the final non-streaming response, post-guardrails, pre-client, with usage and cost (and `surface` for the non-chat modalities). *Interceptable* — the last in-band veto point; an interceptor raising here fails the request instead of returning the body.
 - **`stream.started` / `stream.completed`** — first chunk / end of the streamed body, emitted from the stream wrapper's iteration and `finally` (any outcome; `ctx.status` says which). Coarse by design; never per-chunk.
-- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` / `runaway.released` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `runaway.trip` from phase 1.5 when the loop detector jails a key (observer-only — the jail is the decision, not negotiable by handlers); `concurrency.timeout` from phase 5.5 when a queue wait for a slot expires (observer-only — the 429 is the decision; carries key, model, cap, wait_seconds and actual waited seconds); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure); `pii.found` from the PII scan endpoints (a scanned log row's stored bodies matched detectors); `mcp.session.opened` / `mcp.session.closed` from the MCP proxy (a gateway session created at initialize; dropped via DELETE / TTL sweep / lazy upstream-404 — `reason` says which) and `mcp.tool.blocked` from `handle_mcp`'s denial path (observer-only — the in-band JSON-RPC error IS the decision; carries server, tool, code, guardrail).
+- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` / `runaway.released` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `runaway.trip` from phase 1.5 when the loop detector jails a key (observer-only — the jail is the decision, not negotiable by handlers); `concurrency.timeout` from phase 5.5 when a queue wait for a slot expires (observer-only — the 429 is the decision; carries key, model, cap, wait_seconds and actual waited seconds); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure); `pii.found` from the PII scan endpoints (a scanned log row's stored bodies matched detectors); `mcp.session.opened` / `mcp.session.closed` from the MCP proxy (a gateway session created at initialize; dropped via DELETE / TTL sweep / lazy upstream-404 — `reason` says which) and `mcp.tool.blocked` from `handle_mcp`'s denial path (observer-only — the in-band JSON-RPC error IS the decision; carries server, tool, code, guardrail — and, tier 49, the denied method, so the stream says whether the denial was a `tools/call`, a `resources/read`, a `prompts/get` or a `completion/complete`).
 
 Emits enqueue observers *before* an interceptor's abort propagates — subscribers always see the event that was vetoed.
 
@@ -2857,7 +2883,7 @@ Shutdown is the mirror image of composition, in reverse dependency order: `/read
 
 Being honest about the seams — these are the current trade-offs (all are localizable; none require redesigning the pipeline concept):
 
-1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. The fifth inbound surface, realtime (`WS /v1/realtime`), proved a different face of the same claim: a *stateful* transport rides the identical policy spine (auth chain, scopes, model permission, rate limits, budgets, concurrency, guardrail phases, routing ladder, accounting) through a session-shaped entry — `pipeline.handle_realtime` + `core/realtime.py` — with the per-request phases re-anchored to session semantics (gates once at open, budget re-checked per create, one log row summing the session), and zero changes to any HTTP path. The sixth, the MCP proxy (`POST /v1/mcp/{server}`), proved the sharpest edge of the same claim: a surface whose payload never touches the chat abstraction at all (JSON-RPC proxied to external servers) still rides the policy spine — auth + `mcp` scope, the two-layer `allowed_mcp_servers` allowlist, RPM, concurrency, the tier-30 tool policy applied per name, and the guardrail phases over synthetic chat requests built from the tool arguments/result texts — while contributing its own protocol machinery (`core/mcp.py`: the session registry, the SSE frame parser, the in-band error envelope) in the same layer `core/realtime.py` occupies. What MCP deliberately does NOT reuse: the routing ladder (§5.3), tokens/cost/TPM/budgets (no tokens exist), and the response caches (tool calls are side-effecting by definition). Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Images and audio now exist as first-class non-chat surfaces (`generate_image` / `edit_image` / `vary_image` / `transcribe` / `speak` on `ProviderAdapter`, 501-with-fallback defaults so chat-only providers need no special handling — the router falls through), with OpenAI/Azure passing all of them through, Gemini translating image generation *and editing* to `generateContent` and speaking TTS natively (voice mapping, PCM-as-WAV), and speech streaming end to end. Audio *in chat* works across every inbound format — `input_audio` parts in, `message.audio`/`modalities`+`audio` out (Anthropic refuses both directions — no audio in the Messages API — and falls through, see §4.5) — and Gemini image models serve image-to-image chat with images in and out. Native Gemini *embeddings* are inbound too (`:embedContent`/`:batchEmbedContents`, §4.5), so every Gemini chat client can point at the gateway wholesale. The modality matrix is deliberately shallow: no Gemini or Anthropic *audio understanding* (no Whisper-style transcription APIs), Gemini images have no size/quality/mask mapping and `n` means `n` sequential calls, transcription is billed only from the duration `verbose_json` reports, Gemini TTS and audio-output chat are not transcoded to mp3 & friends (WAV or raw PCM), audio-output chat does not stream on Gemini (no WAV re-framing mid-stream), and audio *uploads* are OpenAI-multipart-shaped only. Still missing: native Responses for Anthropic/Gemini (no such endpoint). Adding that means generalizing `ProviderAdapter` and the schema layer, not just registering something.
+1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. The fifth inbound surface, realtime (`WS /v1/realtime`), proved a different face of the same claim: a *stateful* transport rides the identical policy spine (auth chain, scopes, model permission, rate limits, budgets, concurrency, guardrail phases, routing ladder, accounting) through a session-shaped entry — `pipeline.handle_realtime` + `core/realtime.py` — with the per-request phases re-anchored to session semantics (gates once at open, budget re-checked per create, one log row summing the session), and zero changes to any HTTP path. The sixth, the MCP proxy (`POST /v1/mcp/{server}`), proved the sharpest edge of the same claim: a surface whose payload never touches the chat abstraction at all (JSON-RPC proxied to external servers) still rides the policy spine — auth + `mcp` scope, the two-layer `allowed_mcp_servers` allowlist, RPM, concurrency, the tier-30 tool policy applied per name, and the guardrail phases over synthetic chat requests built from the content — the tool arguments and result texts, plus (tier 49) embedded-resource texts and `structuredContent` on results, and the whole params / every server text shape of `resources/read`, `prompts/get` and `completion/complete` — while contributing its own protocol machinery (`core/mcp.py`: the session registry, the SSE frame parser, the in-band error envelope) in the same layer `core/realtime.py` occupies. What MCP deliberately does NOT reuse: the routing ladder (§5.3), tokens/cost/TPM/budgets (no tokens exist), and the response caches (tool calls are side-effecting by definition). Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Images and audio now exist as first-class non-chat surfaces (`generate_image` / `edit_image` / `vary_image` / `transcribe` / `speak` on `ProviderAdapter`, 501-with-fallback defaults so chat-only providers need no special handling — the router falls through), with OpenAI/Azure passing all of them through, Gemini translating image generation *and editing* to `generateContent` and speaking TTS natively (voice mapping, PCM-as-WAV), and speech streaming end to end. Audio *in chat* works across every inbound format — `input_audio` parts in, `message.audio`/`modalities`+`audio` out (Anthropic refuses both directions — no audio in the Messages API — and falls through, see §4.5) — and Gemini image models serve image-to-image chat with images in and out. Native Gemini *embeddings* are inbound too (`:embedContent`/`:batchEmbedContents`, §4.5), so every Gemini chat client can point at the gateway wholesale. The modality matrix is deliberately shallow: no Gemini or Anthropic *audio understanding* (no Whisper-style transcription APIs), Gemini images have no size/quality/mask mapping and `n` means `n` sequential calls, transcription is billed only from the duration `verbose_json` reports, Gemini TTS and audio-output chat are not transcoded to mp3 & friends (WAV or raw PCM), audio-output chat does not stream on Gemini (no WAV re-framing mid-stream), and audio *uploads* are OpenAI-multipart-shaped only. Still missing: native Responses for Anthropic/Gemini (no such endpoint). Adding that means generalizing `ProviderAdapter` and the schema layer, not just registering something.
 2. **Pipeline phase order is fixed in code.** auth → runaway-jail → rate-limit → idempotency → budget → guardrails → cache → concurrency-admission → routing → respond. You cannot reorder or disable phases via config (e.g., "check cache before rate limits"). Guardrails *within* the request phase are ordered; *phases* are not. Idempotency sits before budget on purpose: a retry must still serve even if the ceiling was crossed after the original was authorized. The runaway jail sits before everything else in `_handle` on the same logic: nothing a stuck agent sends is useful — not even an idempotent replay or a request the cache would serve free. Concurrency admission sits *after* the cache on the opposite logic: a hit or a replay never touches the upstream, so it never needs a slot — only the call the slot wraps pays for it.
 3. ~~Request-phase guardrails can only modify `messages`~~ **Solved:** `GuardrailResult` now carries `modified_model` (reject-and-redirect — "serve this on the small model" instead of blocking, with the pipeline re-checking the key's allowlist after the guardrail phase, fail closed) and `modified_request_fields` (arbitrary `ChatCompletionRequest` fields: `temperature`, `tools`, ...). All three compose and chain across guardrails (one `model_copy` per guardrail, each seeing the previous one's output).
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
@@ -3733,8 +3759,25 @@ tests/
 │                        never sees, nameless fail-closed), guardrails
 │                        (request-phase block/modify over the args,
 │                        broken-rewrite + redirect fail-closed,
-│                        response-phase block/redact over result texts),
-│                        SSE relay (progress frame verbatim + response
+│                        response-phase block/redact over result
+│                        texts), tier 49 coverage (structuredContent
+│                        blocked/redacted + a corrupt rewrite
+│                        fail-closed, embedded-resource text blocked/
+│                        redacted, an image item passed byte-
+│                        identical; the content methods BOTH
+│                        directions — a blocked uri, prompt
+│                        arguments redacted upstream, corrupt params
+│                        fail-closed, resource bodies and prompt
+│                        messages (list + dict shapes) and
+│                        completion values blocked/redacted, a
+│                        blob passed through, the blocked event
+│                        carrying the method; guardrail scopes as
+│                        they bind on this route — routes:["mcp"]
+│                        denies MCP while the same content passes
+│                        on chat, models: the SERVER name (an
+│                        in-scope guardrail denies, an other-server
+│                        one never runs), keys by calling-key
+│                        name), SSE relay (progress frame verbatim + response
 │                        frame intercepted/replaced), lazy upstream-404
 │                        drop, TTL sweep (closed event reason=ttl,
 │                        best-effort upstream DELETE), log rows, /admin/

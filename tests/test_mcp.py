@@ -22,10 +22,16 @@ The suite pins, against a scripted JSON-RPC upstream:
   exist on this surface), the tier-30 tool policy applied per name
   (tools/list filtered, tools/call admitted one name at a time,
   nameless calls failing closed under a policy), and the request/
-  response guardrail phases over the tool arguments / result texts
-  (modify only when the rewrite stays a JSON object; redirect and
-  broken rewrites fail closed; denials are in-band JSON-RPC errors,
-  HTTP 200, so the caller's JSON-RPC layer sees them);
+  response guardrail phases over every content-bearing method
+  (tier 49): the tool arguments and the result's text items, embedded-
+  resource texts and structuredContent on tools/call; the whole params
+  and every server text shape on resources/read, prompts/get and
+  completion/complete (modify only when the rewrite stays a JSON
+  object; redirect and broken rewrites fail closed; base64 payloads —
+  blobs, image/audio items — are binary, skipped by design; denials
+  are in-band JSON-RPC errors, HTTP 200, so the caller's JSON-RPC
+  layer sees them) — with the guardrail config scopes pinned as they
+  bind on this route (routes: "mcp", models: the SERVER name, keys);
 * observability — the log row (route ``mcp``, provider ``mcp``,
   model = server name), the mcp.session.opened / mcp.tool.blocked /
   mcp.session.closed events, /admin/mcp introspection (header NAMES
@@ -43,6 +49,7 @@ from gateway.config import (
     EventsConfig,
     EventHandlerConfig,
     GuardrailConfig,
+    GuardrailScope,
     MCPConfig,
     MCPServerConfig,
 )
@@ -132,12 +139,29 @@ class MockMCP:
         sse_initialize: bool = False,
         sse_calls: bool = False,
         call_text: str = "weather is sunny",
+        call_content: list | None = None,
+        structured_content: dict | None = None,
+        read_text: str = "the docs say hello",
+        read_blob: str | None = None,
+        prompt_text: str = "the password is swordfish",
+        prompt_shape: str = "list",
+        completion_values: list[str] | None = None,
     ) -> None:
         self.requests: list[httpx.Request] = []
         self.deleted: list[str | None] = []
         self.sse_initialize = sse_initialize
         self.sse_calls = sse_calls
         self.call_text = call_text
+        # Tier 49: scripted result shapes — call_content replaces the
+        # default tools/call content list (embedded resources, image
+        # items), structured_content rides beside it.
+        self.call_content = call_content
+        self.structured_content = structured_content
+        self.read_text = read_text
+        self.read_blob = read_blob
+        self.prompt_text = prompt_text
+        self.prompt_shape = prompt_shape
+        self.completion_values = completion_values
         self.fail_next: int | None = None
         self._next_sid = 0
 
@@ -210,10 +234,60 @@ class MockMCP:
             }
             return self._answer(message)
         if method == "tools/call":
+            result: dict = {}
+            if self.call_content is not None:
+                result["content"] = self.call_content
+            else:
+                result["content"] = [{"type": "text", "text": self.call_text}]
+            if self.structured_content is not None:
+                result["structuredContent"] = self.structured_content
             message = {
                 "jsonrpc": "2.0",
                 "id": message_id,
-                "result": {"content": [{"type": "text", "text": self.call_text}]},
+                "result": result,
+            }
+            return self._answer(message)
+        if method == "resources/read":
+            contents = [
+                {
+                    "uri": "file:///docs/readme.md",
+                    "mimeType": "text/plain",
+                    "text": self.read_text,
+                }
+            ]
+            if self.read_blob is not None:
+                contents.append(
+                    {
+                        "uri": "file:///docs/blob.bin",
+                        "mimeType": "application/octet-stream",
+                        "blob": self.read_blob,
+                    }
+                )
+            message = {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {"contents": contents},
+            }
+            return self._answer(message)
+        if method == "prompts/get":
+            block = {"type": "text", "text": self.prompt_text}
+            content = [block] if self.prompt_shape == "list" else block
+            message = {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {"messages": [{"role": "user", "content": content}]},
+            }
+            return self._answer(message)
+        if method == "completion/complete":
+            values = (
+                list(self.completion_values)
+                if self.completion_values is not None
+                else ["hello there", "help"]
+            )
+            message = {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {"completion": {"values": values}},
             }
             return self._answer(message)
         # ping and any other request: an empty result.
@@ -321,6 +395,34 @@ class _Redirector(Guardrail):
 
     async def check_request(self, request, ctx):
         return GuardrailResult.redirect("other-model", "policy: redirect")
+
+
+class _ResponseRewriter(Guardrail):
+    """Rewrites the (single) assistant message — on the MCP surface
+    that is one piece of server-returned text, so this scripts
+    response-phase MODIFY verdicts: a clean rewrite, or a broken one
+    (text that is no longer the JSON object structuredContent must
+    stay — the fail-closed rule)."""
+
+    name = "test_response_rewriter"
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.text = (params or {}).get("text", "rewritten")
+
+    async def check_response(self, request, response, ctx):
+        return GuardrailResult.modified(
+            response={
+                **response,
+                "choices": [
+                    {
+                        **response["choices"][0],
+                        "message": {"role": "assistant", "content": self.text},
+                    }
+                ],
+            },
+            reason="rewritten response",
+        )
 
 
 class _Recorder(EventHandler):
@@ -895,6 +997,476 @@ async def test_tools_call_response_phase_redacted(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# Guardrails on tools/call results: structuredContent + embedded
+# resources (tier 49 — the non-text shapes the old pass skipped)
+# ----------------------------------------------------------------------
+
+
+async def test_tools_call_structured_content_blocked(tmp_path):
+    """structuredContent is server-generated text (serialized JSON):
+    a blocked term inside it denies the whole answer, in-band —
+    the tool ran, the answer never reaches the caller."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["sunny"], "check_prompt": False},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(
+            call_content=[],
+            structured_content={"forecast": "weather is sunny"},
+        ),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"city": "x"}), key, session=sid
+        )
+        assert env.mcp.bodies("tools/call")
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+
+
+async def test_tools_call_structured_content_redacted(tmp_path):
+    """A clean rewrite of structuredContent (still a JSON object) is
+    applied — the arguments rule, on the result side."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="pii_redaction",
+                params={"types": ["email"], "mask_in_response": True},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(
+            call_content=[],
+            structured_content={"contact": "alice@example.com"},
+        ),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"city": "x"}), key, session=sid
+        )
+        assert resp.status_code == 200
+        structured = resp.json()["result"]["structuredContent"]
+        assert structured["contact"] == "[REDACTED:EMAIL]"
+
+
+async def test_tools_call_structured_content_broken_rewrite_fails_closed(tmp_path):
+    """A rewrite that corrupts structuredContent (no longer a JSON
+    object) — fail closed, the structuredContent twin of the
+    arguments rule: a corrupted result is worse than a blocked one."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="test_response_rewriter",
+                class_path="tests.test_mcp:_ResponseRewriter",
+                params={"text": "definitely not json"},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(call_content=[], structured_content={"a": 1}),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"city": "x"}), key, session=sid
+        )
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+        assert "structuredContent" in resp.json()["error"]["message"]
+
+
+async def test_tools_call_resource_item_blocked(tmp_path):
+    """An embedded resource's TEXT is guarded like any other
+    server-returned text — the exfiltration shape (a tool result
+    wrapping a file the server read) cannot launder past the
+    response phase by riding a resource item."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["swordfish"], "check_prompt": False},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(
+            call_content=[
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///secrets.txt",
+                        "mimeType": "text/plain",
+                        "text": "the password is swordfish",
+                    },
+                }
+            ]
+        ),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"city": "x"}), key, session=sid
+        )
+        assert env.mcp.bodies("tools/call")
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+
+
+async def test_tools_call_resource_item_redacted_image_skipped(tmp_path):
+    """Redaction reaches the embedded resource's text — and the image
+    item beside it is UNTOUCHED: base64 is binary, no text to scan,
+    skipped by design (a text guardrail run over it would only mangle
+    it)."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="pii_redaction",
+                params={"types": ["email"], "mask_in_response": True},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(
+            call_content=[
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///contact.txt",
+                        "mimeType": "text/plain",
+                        "text": "reach alice@example.com",
+                    },
+                },
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            ]
+        ),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"city": "x"}), key, session=sid
+        )
+        assert resp.status_code == 200
+        items = resp.json()["result"]["content"]
+        assert "[REDACTED:EMAIL]" in items[0]["resource"]["text"]
+        assert items[1] == {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}
+
+
+# ----------------------------------------------------------------------
+# Guardrails on the content methods (tier 49): resources/read,
+# prompts/get, completion/complete — both directions
+# ----------------------------------------------------------------------
+
+
+async def test_resources_read_request_phase_blocked(tmp_path):
+    """The URI is caller-controlled content: the request-phase
+    guardrails run over the whole params object (uri included —
+    nothing the caller wrote slips past unscanned), and a denial
+    means NOTHING upstream, answered in-band."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["forbidden"], "check_completion": False},
+            )
+        ],
+    )
+    async for env in _make_env(tmp_path, config=config, mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _request("resources/read", {"uri": "file:///docs/forbidden.md"}),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+        assert "keyword_blocklist" in resp.json()["error"]["message"]
+        assert not env.mcp.bodies("resources/read")
+
+
+async def test_prompts_get_request_phase_modified(tmp_path):
+    """The prompt arguments are caller-controlled content: a clean
+    rewrite (still a JSON object) is applied to the whole params and
+    travels — the arguments rule, moved to the content methods, with
+    everything the caller did NOT write (here: nothing, the whole
+    params is theirs) carried through the rewrite."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[GuardrailConfig(name="pii_redaction", params={"types": ["email"]})],
+    )
+    async for env in _make_env(tmp_path, config=config, mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _request(
+                "prompts/get",
+                {"name": "greet", "arguments": {"user": "alice@example.com"}},
+            ),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200
+        sent = env.mcp.bodies("prompts/get")[0]["params"]
+        assert sent["name"] == "greet"  # untouched fields survive the rewrite
+        assert sent["arguments"]["user"] == "[REDACTED:EMAIL]"
+
+
+async def test_content_method_broken_rewrite_fails_closed(tmp_path):
+    """A rewrite that corrupts the params (no longer a JSON object)
+    fails closed — the content methods share the arguments rule, and
+    never corrupt the call."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="test_args_rewriter",
+                class_path="tests.test_mcp:_ArgsRewriter",
+                params={"text": "definitely not json"},
+            )
+        ],
+    )
+    async for env in _make_env(tmp_path, config=config, mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _request("resources/read", {"uri": "file:///docs/readme.md"}),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+        assert "valid JSON object" in resp.json()["error"]["message"]
+        assert not env.mcp.bodies("resources/read")
+
+
+async def test_resources_read_response_phase_blocked(tmp_path):
+    """The resource body is server-generated text: a denial replaces
+    the whole answer in-band (the read ran, the body never reaches the
+    caller) — and the block event carries the METHOD now, so an
+    operator reading the stream knows what was denied."""
+    config = _recorded_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["swordfish"], "check_prompt": False},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path, config=config, mcp_mock=MockMCP(read_text="the password is swordfish")
+    ):
+        recorder = _recorder(env)
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _request("resources/read", {"uri": "file:///docs/readme.md"}),
+            key,
+            session=sid,
+        )
+        assert env.mcp.bodies("resources/read")
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+        await env.app.state.events.drain()
+        blocked = [e for e in recorder.events if e.name == "mcp.tool.blocked"]
+        assert blocked
+        assert blocked[0].payload["method"] == "resources/read"
+        assert blocked[0].payload["tool"] is None  # no tool on this method
+
+
+async def test_resources_read_response_phase_redacted_blob_skipped(tmp_path):
+    """Redaction rewrites the resource TEXT; a blob twin (base64) is
+    binary — no text to scan, skipped by design and passed through
+    byte-identical."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="pii_redaction",
+                params={"types": ["email"], "mask_in_response": True},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(
+            read_text="contact alice@example.com",
+            read_blob="aGVsbG8gd29ybGQ=",
+        ),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _request("resources/read", {"uri": "file:///docs/readme.md"}),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200
+        contents = resp.json()["result"]["contents"]
+        assert "[REDACTED:EMAIL]" in contents[0]["text"]
+        assert "alice@example.com" not in contents[0]["text"]
+        assert contents[1]["blob"] == "aGVsbG8gd29ybGQ="  # untouched
+
+
+async def test_prompts_get_response_phase_blocked(tmp_path):
+    """Prompt message text is server-generated: blocked in-band, the
+    list-shaped content blocks walked (the spec's 2025-06-18 shape)."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["swordfish"], "check_prompt": False},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(prompt_text="the password is swordfish"),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _request("prompts/get", {"name": "greet"}), key, session=sid
+        )
+        assert env.mcp.bodies("prompts/get")
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+
+
+async def test_prompts_get_response_phase_redacted_dict_shape(tmp_path):
+    """The single-block content shape (the pre-widening revision
+    servers still ship) walks the same — the guard must not care
+    which shape the server chose."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="pii_redaction",
+                params={"types": ["email"], "mask_in_response": True},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(
+            prompt_text="email alice@example.com", prompt_shape="dict"
+        ),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _request("prompts/get", {"name": "greet"}), key, session=sid
+        )
+        assert resp.status_code == 200
+        block = resp.json()["result"]["messages"][0]["content"]
+        assert "[REDACTED:EMAIL]" in block["text"]
+        assert "alice@example.com" not in block["text"]
+
+
+async def test_completion_complete_response_phase_blocked(tmp_path):
+    """completion/complete's values are server-generated text
+    suggestions: one poisoned value denies the whole answer, in-band."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["swordfish"], "check_prompt": False},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(completion_values=["hello", "the swordfish option"]),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _request(
+                "completion/complete",
+                {"ref": {"type": "ref/prompt", "name": "greet"}, "argument": {"name": "g", "value": "s"}},
+            ),
+            key,
+            session=sid,
+        )
+        assert env.mcp.bodies("completion/complete")
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+
+
+async def test_completion_complete_response_phase_redacted(tmp_path):
+    """Each value is its own text piece: a redaction rewrites the
+    pieces it matches and leaves the rest alone — never one mangled
+    blob."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="pii_redaction",
+                params={"types": ["email"], "mask_in_response": True},
+            )
+        ],
+    )
+    async for env in _make_env(
+        tmp_path,
+        config=config,
+        mcp_mock=MockMCP(
+            completion_values=["ping alice@example.com", "hello"]
+        ),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _request(
+                "completion/complete",
+                {"ref": {"type": "ref/prompt", "name": "greet"}, "argument": {"name": "g", "value": "s"}},
+            ),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200
+        values = resp.json()["result"]["completion"]["values"]
+        assert values[0] == "ping [REDACTED:EMAIL]"
+        assert values[1] == "hello"
+
+
+# ----------------------------------------------------------------------
 # SSE answers
 # ----------------------------------------------------------------------
 
@@ -1124,3 +1696,143 @@ async def test_events_session_and_tool_lifecycle(tmp_path):
         assert opened.payload["gateway_session_id"] == sid
         assert opened.payload["protocol_version"] == "2025-06-18"
         assert opened.payload["server"] == "test-server"
+
+
+# ----------------------------------------------------------------------
+# Guardrail scope on the MCP surface (tier 49): how config scopes bind
+# on this route — routes: "mcp", models: the SERVER name, keys: names
+# ----------------------------------------------------------------------
+
+
+async def test_guardrail_scope_routes_mcp(tmp_path):
+    """``scope.routes: ["mcp"]`` runs the guardrail HERE and nowhere
+    else: the same content, denied on the MCP surface, passes clean
+    on /v1/chat/completions — the operator's lever for MCP-only
+    policies (an exfiltration-worried proxy, say) works exactly as
+    written."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["forbidden"]},
+                scope=GuardrailScope(routes=["mcp"]),
+            )
+        ],
+    )
+    async for env in _make_env(tmp_path, config=config, mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        # In scope here: denied before upstream.
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"note": "forbidden"}), key, session=sid
+        )
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+        assert not env.mcp.bodies("tools/call")
+        # Out of scope on chat: the same term passes untouched.
+        chat = await env.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "forbidden word"}],
+            },
+            headers=auth(key),
+        )
+        assert chat.status_code == 200
+        assert not chat.json().get("error")
+
+
+async def test_guardrail_scope_models_server_name(tmp_path):
+    """``scope.models`` binds to the SERVER name on this route (the
+    log row's model column) — a guardrail scoped to the server denies
+    MCP traffic while the SAME guardrail is out of scope for a chat
+    request on a real model name: the two namespaces never collide."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["forbidden"], "check_completion": False},
+                scope=GuardrailScope(models=["test-server"]),
+            )
+        ],
+    )
+    async for env in _make_env(tmp_path, config=config, mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        # ctx.model == "test-server" on this route: in scope, denied.
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"note": "forbidden"}), key, session=sid
+        )
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+        # ctx.model == "test-model" on chat: out of scope, passes.
+        chat = await env.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "forbidden word"}],
+            },
+            headers=auth(key),
+        )
+        assert chat.status_code == 200
+        assert not chat.json().get("error")
+
+
+async def test_guardrail_scope_models_other_server_passes(tmp_path):
+    """The negative leg: a guardrail scoped to some OTHER server never
+    runs here — MCP traffic to test-server is untouched, the call
+    reaches upstream and the answer comes back whole."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["forbidden"], "check_completion": False},
+                scope=GuardrailScope(models=["some-other-server"]),
+            )
+        ],
+    )
+    async for env in _make_env(tmp_path, config=config, mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"note": "forbidden"}), key, session=sid
+        )
+        assert resp.status_code == 200
+        assert "error" not in resp.json()
+        assert resp.json()["result"]["content"][0]["text"] == "weather is sunny"
+        assert env.mcp.bodies("tools/call")
+
+
+async def test_guardrail_scope_keys_on_mcp(tmp_path):
+    """``scope.keys`` / ``exclude_keys`` match the calling key's NAME
+    on this surface like every other one — one guardrail, two keys:
+    the named key is denied, the other passes clean."""
+    config = make_config(
+        mcp=_mcp_config(),
+        guardrails=[
+            GuardrailConfig(
+                name="keyword_blocklist",
+                params={"blocked_terms": ["forbidden"], "check_completion": False},
+                scope=GuardrailScope(keys=["mcp-key"]),
+            )
+        ],
+    )
+    async for env in _make_env(tmp_path, config=config, mcp_mock=MockMCP()):
+        named = (await create_key(env.client, "mcp-key"))["key"]
+        other = (await create_key(env.client, "other-key"))["key"]
+        sid_named = await _open_session(env.client, named)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"note": "forbidden"}), named, session=sid_named
+        )
+        assert resp.json()["error"]["code"] == GUARDRAIL_BLOCKED
+        # The other key: out of scope, the call travels.
+        sid_other = await _open_session(env.client, other)
+        resp = await _post(
+            env.client, _tools_call("get_weather", {"note": "forbidden"}), other, session=sid_other
+        )
+        assert resp.status_code == 200
+        assert "error" not in resp.json()
+        assert env.mcp.bodies("tools/call")
