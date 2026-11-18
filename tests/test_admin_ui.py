@@ -490,3 +490,31 @@ async def test_admin_ui_quiet_key_badge_surface(env):
         'class="b b-gray" title="Quiet — no use for',
     ):
         assert marker in body, marker
+
+
+async def test_admin_ui_pii_panel_surface(env):
+    # Tier 57: the tier-53 teeth get their dashboard surface — a PII
+    # scan tab (loading it IS the on-demand scan), the config-echo
+    # badges (quarantine/purge/sweep), the honest-disabled 404 branch,
+    # the summary cards, and the by-kind + flagged-rows tables.
+    # Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'data-tab="pii"',
+        'id="tab-pii"',
+        "async function loadPII(",
+        'id="pii-limit"',
+        'id="btn-pii-scan"',
+        'id="pii-status"',
+        'id="pii-summary"',
+        'id="pii-kinds"',
+        'id="pii-rows-table"',
+        "e.status === 404",
+        "Enable pii_scan.enabled",
+        "quarantine on",
+        "no purge",
+        "Bodies not captured",
+        "with_findings",
+        "bodies_not_captured",
+    ):
+        assert marker in body, marker

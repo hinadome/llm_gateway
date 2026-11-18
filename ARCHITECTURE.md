@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 93 Python files, ~35,600 lines, 1353 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 93 Python files, ~35,600 lines, 1356 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -584,7 +584,11 @@ gateway/
 │                           pii-scan (GET /admin/pii-scan bulk over recent
 │                           rows — per-row findings + by_kind aggregates,
 │                           bodies_not_captured counted separately from
-│                           clean, tenant scoping like /admin/logs; GET
+│                           clean, tenant scoping like /admin/logs,
+│                           and (tier 57) a config echo — enabled/
+│                           quarantine/purge_days/bounds, the public
+│                           knobs the dashboard panel's teeth-status
+│                           badges read, no second endpoint; GET
 │                           /admin/logs/{id}/pii-scan for one row; kind +
 │                           count only, never matched text; tier 53:
 │                           findings LAND once per row via a guarded
@@ -2298,7 +2302,7 @@ gateway/
                             /admin/ui without auth (the shell holds no data);
                             talks to the JSON admin API above with the admin key
                             pasted into a login overlay (kept in sessionStorage,
-                            sent as Bearer). 10 tabs: overview stats (+ usage CSV
+                            sent as Bearer). 12 tabs: overview stats (+ usage CSV
                             export for the selected window, by-tenant breakdown
                             when tenants have traffic; tier 42 adds the SLO
                             panel above the traffic tables — one row per
@@ -2346,7 +2350,29 @@ gateway/
                             credential manager, hints only), prompt library
                             (versions, activate/candidate patching, the
                             new-version dialog), request logs (filter,
-                            paginate, expand full bodies), billing (tier
+                            paginate, expand full bodies), PII scan
+                            (tier 57: the tier-53 teeth's dashboard
+                            surface — loading the tab IS the on-demand
+                            scan, a GET /admin/pii-scan of the newest
+                            unscanned rows within the chosen limit
+                            (100-5000, the endpoint still caps at
+                            pii_scan.max_rows), so the tab doubles as
+                            the background sweep's manual companion;
+                            three summary cards — rows scanned / with
+                            findings / bodies not captured (the
+                            third's sub line says what it is:
+                            invisible to the scan, never "safe") —
+                            findings by kind, and the flagged rows
+                            with kind×count chips per direction
+                            (matched text never rendered in the UI
+                            either); the status line is the
+                            teeth-status readout from the response's
+                            config echo — quarantine on/off, purge
+                            N d / no purge, the sweep cadence + bound,
+                            the active detector set — and a disabled
+                            scan renders as an honest state (the 404
+                            message with how to enable), not an
+                            error), billing (tier
                             45: the month statement — a month picker
                             (calendar months in UTC, empty = current)
                             and a CSV download (one row per line item,
@@ -3390,7 +3416,11 @@ tests/
 │                        tooltip, the ISO tooltip, colspan 9), quiet-badge
 │                        markers (tier 56: the 💤 quiet badge, its 7-day
 │                        idle threshold, the alerts.quiet_days + re-arm
-│                        tooltip),
+│                        tooltip), PII-panel markers (tier 57: the
+│                        PII scan tab + section, loadPII with its
+│                        honest-disabled 404 branch, the config-echo
+│                        quarantine/purge badges, the summary cards
+│                        and both tables),
 │                        /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,
@@ -4065,8 +4095,14 @@ tests/
 │                        as separate facts, bulk aggregates + filters,
 │                        tenant scoping (forced, plus the foreign-row
 │                        404 wall), extra_patterns/exclude_kinds, the
-│                        once-per-row metric + pii.found event, and the
-│                        enabled=false 404s
+│                        once-per-row metric + pii.found event, the
+│                        enabled=false 404s, and (tier 57) the bulk
+│                        response's config echo — defaults verbatim
+│                        (quarantine on, purge None, the bounds),
+│                        knob-for-knob against a custom config
+│                        (quarantine off, a purge deadline, custom
+│                        detectors — echo and findings agree), and
+│                        the per-row endpoint staying echo-free
 ├── test_pii_sweep.py     PII-scan teeth (tier 53): the sweep with its
 │                        clock PINNED finds and persists findings
 │                        without an admin asking (payloads captured

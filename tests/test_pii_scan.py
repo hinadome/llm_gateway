@@ -267,3 +267,65 @@ async def test_scan_disabled_404(tmp_path):
 async def test_bad_extra_pattern_rejected():
     with pytest.raises(ValidationError):
         GatewayConfig(pii_scan=PIIScanConfig(extra_patterns={"broken": "("}))
+
+
+async def test_bulk_config_echo_defaults(tmp_path):
+    # Tier 57: the dashboard panel's teeth-status readout — the bulk
+    # response echoes the public scan knobs so the UI can show which
+    # teeth are active without a second endpoint. Defaults, verbatim.
+    async for env in _make_env(tmp_path):
+        key = (await create_key(env.client, "echoed"))["key"]
+        log_id = await _chat(env, key, "Hello")
+        bulk = (
+            await env.client.get("/admin/pii-scan", headers=auth(ADMIN_KEY))
+        ).json()
+        cfg = bulk["config"]
+        assert cfg["enabled"] is True
+        assert cfg["quarantine"] is True
+        assert cfg["purge_days"] is None
+        assert cfg["max_rows"] == 500
+        assert cfg["sweep_interval_seconds"] == 3600.0
+        assert cfg["sweep_max_rows"] == 500
+        assert cfg["exclude_kinds"] == []
+        assert cfg["extra_patterns"] == []  # names only — the regexes are config, not findings
+        # The per-row endpoint keeps its own shape (no echo — the
+        # panel reads the bulk one).
+        one = (
+            await env.client.get(
+                f"/admin/logs/{log_id}/pii-scan", headers=auth(ADMIN_KEY)
+            )
+        ).json()
+        assert "config" not in one
+
+
+async def test_bulk_config_echo_rides_the_live_config(tmp_path):
+    # The echo reflects the running config, knob for knob — quarantine
+    # opted out, a purge deadline set, detectors customized — so the
+    # panel never lies about which teeth are protecting the rows.
+    config = make_config(
+        pii_scan=PIIScanConfig(
+            quarantine=False,
+            purge_days=7.0,
+            max_rows=250,
+            sweep_interval_seconds=120.0,
+            sweep_max_rows=40,
+            exclude_kinds=["email", "ipv4"],
+            extra_patterns={"employee_id": r"EMP-\d{6}"},
+        )
+    )
+    async for env in _make_env(tmp_path, config=config):
+        key = (await create_key(env.client, "custom"))["key"]
+        await _chat(env, key, "EMP-123456")
+        bulk = (
+            await env.client.get("/admin/pii-scan", headers=auth(ADMIN_KEY))
+        ).json()
+        cfg = bulk["config"]
+        assert cfg["quarantine"] is False
+        assert cfg["purge_days"] == 7.0
+        assert cfg["max_rows"] == 250
+        assert cfg["sweep_interval_seconds"] == 120.0
+        assert cfg["sweep_max_rows"] == 40
+        assert cfg["exclude_kinds"] == ["email", "ipv4"]  # sorted
+        assert cfg["extra_patterns"] == ["employee_id"]
+        # the custom detector actually ran — echo and findings agree
+        assert bulk["by_kind"]["employee_id"] == 1

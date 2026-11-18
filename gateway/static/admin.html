@@ -179,6 +179,7 @@
   <button data-tab="vault">Vault</button>
   <button data-tab="prompts">Prompts</button>
   <button data-tab="logs">Request logs</button>
+  <button data-tab="pii">PII scan</button>
   <button data-tab="billing">Billing</button>
   <button data-tab="routing">Routing &amp; breakers</button>
   <button data-tab="guardrails">Guardrails</button>
@@ -302,6 +303,36 @@
         <button class="ghost small" id="btn-clearfilter">Reset</button>
       </div>
       <div style="overflow-x:auto"><table id="logs-table"></table></div>
+    </div>
+  </section>
+
+  <!-- PII / secret scan (tier 57): the dashboard surface for the tier-53 teeth.
+       Loading the tab IS the on-demand scan (a GET scans the newest unscanned
+       rows within the limit), so the panel doubles as the background sweep's
+       manual companion. -->
+  <section class="tab" id="tab-pii">
+    <div class="panel">
+      <div class="ph">PII / secret scan
+        <div class="right" style="display:flex;gap:8px;align-items:center;font-weight:400;font-size:12px">
+          <span class="muted">rows to scan</span>
+          <select id="pii-limit" style="width:auto">
+            <option>100</option><option selected>500</option><option>1000</option><option>5000</option>
+          </select>
+          <button class="ghost small" id="btn-pii-scan">Scan now</button>
+        </div>
+      </div>
+      <div class="pb" id="pii-status"></div>
+      <div class="cards" id="pii-summary"></div>
+    </div>
+    <div class="panel">
+      <div class="ph">Findings by kind</div>
+      <div style="overflow-x:auto"><table id="pii-kinds"></table></div>
+    </div>
+    <div class="panel">
+      <div class="ph">Flagged rows
+        <div class="right muted" style="font-weight:400;font-size:12px">kind &times; count, request &rarr; response &middot; the matched text is never shown, and a flagged row's full-body read is masked while its bodies await purge</div>
+      </div>
+      <div style="overflow-x:auto"><table id="pii-rows-table"></table></div>
     </div>
   </section>
 
@@ -886,6 +917,7 @@ async function refresh() {
     else if (state.tab === "vault") await loadVault();
     else if (state.tab === "prompts") await loadPrompts();
     else if (state.tab === "logs") await loadLogs();
+    else if (state.tab === "pii") await loadPII();
     else if (state.tab === "billing") await loadInvoices();
     else if (state.tab === "routing") await loadRouting();
     else if (state.tab === "guardrails") await loadGuardrails();
@@ -1865,6 +1897,82 @@ async function fillLogDetail(id) {
     cell.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
 }
+
+// ---------- PII / secret scan (tier 57) ----------------------------------
+//
+// Loading this tab IS the on-demand scan (the tier-53 contract: the
+// GET scans the newest `limit` unscanned rows, bounded by
+// pii_scan.max_rows, and reports everything recorded) — so the panel
+// doubles as the background sweep's manual companion. Auto-refresh
+// re-GETs like every tab; the endpoint is bounded and scan-once, so
+// that is safe. The response's config echo (also tier 57) is the
+// teeth-status readout: which of the operator's knobs are active.
+
+async function loadPII() {
+  let body;
+  try {
+    body = await api("/admin/pii-scan?limit=" + encodeURIComponent($("#pii-limit").value));
+  } catch (e) {
+    if (e.status === 404) {
+      // pii_scan.enabled: false — the honest disabled state, not an error.
+      $("#pii-status").innerHTML = '<span class="b b-red">disabled</span> ' +
+        '<span class="muted" style="font-size:12px">' + esc(e.message) +
+        " — stored bodies are not being audited. Enable pii_scan.enabled (config) to turn the scan on.</span>";
+      $("#pii-summary").innerHTML = "";
+      $("#pii-kinds").innerHTML = "";
+      $("#pii-rows-table").innerHTML = "";
+      return;
+    }
+    throw e;
+  }
+  const cfg = body.config || {};
+
+  // Teeth status: quarantine (flagged bodies masked on read) and the
+  // purge deadline are the two the operator set — the panel says
+  // which are protecting the rows right now.
+  const quarantine = cfg.quarantine
+    ? '<span class="b b-purple" title="Flagged rows are quarantined: their full-body read is masked (kind-tagged placeholders, the same detector set that found them) and the replay export withholds their bodies.">quarantine on</span>'
+    : '<span class="b b-gray" title="pii_scan.quarantine: false — flagged rows are served raw. The findings stay visible either way; this is the containment you opted out of.">quarantine off</span>';
+  const purge = cfg.purge_days != null
+    ? `<span class="b b-amber" title="pii_scan.purge_days: a flagged row's stored bodies are deleted this many days after its findings landed (metadata + findings stay for the audit trail).">purge ${cfg.purge_days}d</span>`
+    : '<span class="b b-gray" title="pii_scan.purge_days is unset — flagged bodies are kept until general log retention. Set it to eventually delete them.">no purge</span>';
+  const sweep = (cfg.sweep_interval_seconds != null)
+    ? ` <span class="muted" style="font-size:12px">· background sweep every ${Math.round(cfg.sweep_interval_seconds / 60)} min, ${fmtInt(cfg.sweep_max_rows)} rows/pass</span>`
+    : "";
+  const detectors = (body.kinds || []).length
+    ? ' <span class="muted" style="font-size:12px">· detectors: ' +
+      (body.kinds || []).map(k => `<span class="mono">${esc(k)}</span>`).join(" ") + "</span>"
+    : "";
+  $("#pii-status").innerHTML = quarantine + " " + purge + sweep + detectors;
+
+  $("#pii-summary").innerHTML = `
+    <div class="card"><div class="k">Rows scanned</div><div class="v">${fmtInt(body.scanned)}</div><div class="sub">newest first, capped at ${fmtInt(cfg.max_rows)}</div></div>
+    <div class="card"><div class="k">With findings</div><div class="v">${fmtInt(body.with_findings)}</div><div class="sub">${(body.by_kind && Object.keys(body.by_kind).length) ? Object.keys(body.by_kind).length + " kinds" : "no exposure recorded"}</div></div>
+    <div class="card"><div class="k">Bodies not captured</div><div class="v">${fmtInt(body.bodies_not_captured)}</div><div class="sub">store_bodies=false — invisible to the scan, never "safe"</div></div>`;
+
+  const kinds = Object.entries(body.by_kind || {});
+  $("#pii-kinds").innerHTML = "<thead><tr><th>Kind</th><th class=num>Matches</th></tr></thead><tbody>" +
+    (kinds.length ? kinds.map(([k, n]) =>
+      `<tr><td class="mono">${esc(k)}</td><td class="num">${fmtInt(n)}</td></tr>`).join("")
+      : '<tr><td colspan="2" class="empty">No findings recorded in the scanned window</td></tr>') + "</tbody>";
+
+  const rows = body.rows || [];
+  $("#pii-rows-table").innerHTML = "<thead><tr><th>Log</th><th>Request id</th><th>Key</th><th>Model</th><th class=num>Status</th><th>Findings</th></tr></thead><tbody>" +
+    (rows.length ? rows.map(r => {
+      const chips = [];
+      for (const [dir, label, title] of [
+        ["request", "req", "found in the stored request body (the original as received — guardrail masks protect the provider, not the log)"],
+        ["response", "resp", "found in the stored response body"],
+      ]) {
+        for (const [kind, n] of Object.entries(r.findings[dir] || {})) {
+          chips.push(`<span class="b b-red mono" title="${esc(kind)} ${title}">${esc(kind)}&times;${n} ${label}</span>`);
+        }
+      }
+      return `<tr><td class="mono">${r.log_id}</td><td class="mono muted" style="font-size:12px">${esc(r.request_id || "—")}</td><td>${esc(r.key_name || "—")}</td><td class="mono">${esc(r.model || "—")}</td><td class="num">${esc(String(r.status))}</td><td>${chips.join(" ")}</td></tr>`;
+    }).join("") : '<tr><td colspan="6" class="empty">No flagged rows in the scanned window</td></tr>') + "</tbody>";
+}
+$("#btn-pii-scan").addEventListener("click", () => loadPII());
+$("#pii-limit").addEventListener("change", () => loadPII());
 
 // ---------- billing (tier 45): usage invoices ---------------------------
 // The month statement the finance side asks for: what did each tenant

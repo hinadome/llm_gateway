@@ -8,6 +8,34 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- PII dashboard panel (tier 57) — the tier-53 teeth get their
+  dashboard surface. The scan had endpoints and a background sweep
+  but no admin.html presence: an operator auditing what storage
+  held was hand-curling `/admin/pii-scan`. New **PII scan tab**
+  (12th tab, beside Request logs — it audits the same rows):
+  - **Loading the tab IS the on-demand scan** — the GET scans the
+    newest unscanned rows within the chosen limit (100–5000
+    selector; the endpoint still caps at `pii_scan.max_rows`), so
+    the tab doubles as the background sweep's manual companion.
+    Auto-refresh re-GETs like every tab; the endpoint is bounded
+    and scan-once, so that is safe.
+  - **Three summary cards** — rows scanned / with findings / bodies
+    not captured (the third's sub line says what it is: invisible
+    to the scan, never "safe"), **findings by kind**, and the
+    flagged rows with kind×count chips per direction
+    (request → response; the matched text never renders in the UI
+    either).
+  - **Teeth-status badges from a new `config` echo** on the bulk
+    response (tier 57's only backend change, additive): enabled /
+    quarantine on-off / purge N d / the sweep cadence + bound / the
+    active detector set — all public knobs, no secrets, no second
+    endpoint. The per-row endpoint keeps its lean shape.
+  - **Honest disabled state**: `pii_scan.enabled: false` renders the
+    404 message as a state with how to enable, not an error.
+  2 new endpoint tests (`tests/test_pii_scan.py`: the echo's
+  defaults verbatim, and knob-for-knob against a custom config —
+  echo and findings agree — plus the per-row endpoint staying
+  echo-free) and an admin-UI marker pin; suite 1356.
 - Quiet-key alerts (tier 56) — the page a key's own *silence* never
   sends. Spend alerts fire when spend crosses a threshold, so a key
   that stopped authenticating costs nothing and pages nothing: a dead

@@ -1469,10 +1469,14 @@ async def pii_scan_bulk(
     first scan — here or by the background sweep — persists them, and
     re-reads report the recorded findings without re-counting or
     re-emitting. Returns per-row findings for the rows that have
-    any, plus aggregates. Tenant admins are scoped to their own
-    tenant (forced, like /admin/logs). Rows whose bodies were never
-    stored report ``captured: false`` — counted separately from clean
-    rows, never blurred."""
+    any, plus aggregates, plus (tier 57) a ``config`` echo — the
+    dashboard panel's teeth-status readout: enabled/quarantine/purge
+    and the bounds, all public non-secret knobs (the panel shows the
+    operator which teeth are active, without a second endpoint).
+    Tenant admins are scoped to their own tenant (forced, like
+    /admin/logs). Rows whose bodies were never stored report
+    ``captured: false`` — counted separately from clean rows, never
+    blurred."""
     config = raw_request.app.state.config.pii_scan
     if not config.enabled:
         raise GatewayError(404, "PII scan is disabled (pii_scan.enabled).",
@@ -1507,6 +1511,17 @@ async def pii_scan_bulk(
         "kinds": sorted(raw_request.app.state.pii_scanner.detectors),
         "by_kind": dict(sorted(by_kind.items())),
         "rows": flagged,
+        "config": {
+            "enabled": config.enabled,
+            "quarantine": config.quarantine,
+            "purge_days": config.purge_days,
+            "max_rows": config.max_rows,
+            "sweep_interval_seconds": config.sweep_interval_seconds,
+            "sweep_max_rows": config.sweep_max_rows,
+            "exclude_kinds": sorted(config.exclude_kinds),
+            # names only — the regexes are config, not findings
+            "extra_patterns": sorted(config.extra_patterns),
+        },
     }
 
 
