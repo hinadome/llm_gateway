@@ -103,6 +103,11 @@ class VirtualKey(Base):
     # each threshold fires once; raising the budget re-arms below-current
     # levels. Null = never evaluated.
     budget_alerts_fired: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    # Expiry-warning levels (day values, tier 52) already fired for this
+    # key — each fires once as the deadline approaches (14/7/1/0); setting
+    # or moving the deadline re-arms the same budget way. Null = never
+    # evaluated (the sweep discovers such keys honestly).
+    expiry_alerts_fired: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     # Guardrail names that are skipped for requests authenticated with this
     # key — a runtime override of config scoping (see GuardrailScope).
     disabled_guardrails: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
@@ -180,6 +185,7 @@ class VirtualKey(Base):
             "monthly_spend_usd": self.monthly_spend_usd or 0.0,
             "monthly_bucket": self.monthly_bucket,
             "budget_alerts_fired": self.budget_alerts_fired,
+            "expiry_alerts_fired": self.expiry_alerts_fired,
             "disabled_guardrails": self.disabled_guardrails,
             "required_residencies": self.required_residencies,
             "model_mappings": self.model_mappings,

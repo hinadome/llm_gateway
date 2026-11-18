@@ -8,6 +8,40 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Key-expiry warnings (tier 52) — the deadline's own pages. `expires_at`
+  was always enforced (the 401 tells callers the moment a key dies) but
+  never announced: on-call's first signal was the user complaint. A
+  background sweep (hourly, `alerts.expiry_interval_seconds`) walks
+  active keys with an `expires_at` and fires once per day-level as the
+  deadline approaches — `alerts.expiry_days` (default **14/7/1/0**; 0 is
+  the page that the key just died).
+  - **Fire-once per level, highest first**, state persisted on the key
+    row (`expiry_alerts_fired`, beside the budget levels) *before*
+    delivery — a restart never re-pages; a crash mid-sweep prefers
+    duplicate silence over duplicate noise. Several levels crossed in
+    one pass (a key discovered already past its deadline) each fire
+    their own page, highest first.
+  - **Setting or moving a deadline arms silently** — every level
+    already crossed is marked fired at create/PATCH (the budget
+    re-arm rule, deadline edition): a key born 6 days from its
+    deadline never pages "expires in 14 days" for a choice the
+    operator just made. Moving a deadline **out** honestly re-arms
+    the levels it now sits above; moving it **in** never pages.
+  - **Discovery is honest**: a key the sweep finds near its deadline
+    with no fired state (it predates the feature) fires its
+    already-crossed levels. Revoked keys and deadline-less keys never
+    warn; an expiring key with zero traffic still pages —
+    spend-triggered alerts structurally cannot see a quiet key.
+    Rotation (tier 51) never touches the state — a deadline is a
+    deadline whichever credential presents it.
+  - **Delivery** on the budget alerts' webhook (`type: expiry_alert`,
+    with key, level, days remaining, deadline, human message) and
+    metric family (`gateway_alerts_total{kind="expiry",outcome=...}`;
+    no URL → counted `skipped`), plus `expiry.threshold` observer
+    events on the lifecycle bus. `alerts.enabled: false` stops the
+    sweep. Dashboard: an amber "expiring" badge on active keys inside
+    the first warning level. 10 tests pin the contract
+    (`tests/test_expiry_alerts.py`).
 - Key rotation & grace windows (tier 51) — `POST /admin/keys/{id}/rotate`
   replaces a key's *credential* while the row keeps its identity: name,
   tenant, allowlists, budgets, limits, spend and logs all stay with the

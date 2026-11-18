@@ -187,6 +187,11 @@ async def create_key(
             raise GatewayError(
                 409, f"A key named '{body.name}' already exists.", "invalid_request_error"
             )
+        # The expiry warning levels arm silently at create: a key born
+        # 6 days from its deadline does not page "expires in 14 days"
+        # for a deadline the operator just chose. Only future crossings
+        # alert (the budget re-arm rule, deadline edition).
+        expires_at = _parse_expires(body.expires_at)
         vkey = VirtualKey(
             name=body.name,
             key_hash=hash_key(raw_key),
@@ -203,7 +208,10 @@ async def create_key(
             max_budget_usd=body.max_budget_usd,
             daily_budget_usd=body.daily_budget_usd,
             monthly_budget_usd=body.monthly_budget_usd,
-            expires_at=_parse_expires(body.expires_at),
+            expires_at=expires_at,
+            expiry_alerts_fired=raw_request.app.state.expiry_alerts.rearm(
+                None, expires_at
+            ),
             metadata_json=body.metadata,
             disabled_guardrails=body.disabled_guardrails,
             required_residencies=body.required_residencies,
@@ -271,7 +279,15 @@ async def update_key(
         _require_key_access(admin, vkey)
         updates = body.model_dump(exclude_unset=True)
         if "expires_at" in updates:
-            vkey.expires_at = _parse_expires(updates.pop("expires_at"))
+            new_expires = _parse_expires(updates.pop("expires_at"))
+            vkey.expires_at = new_expires
+            # The deadline moved: re-arm the warning levels the budget
+            # way — everything already crossed is marked fired, so only
+            # future crossings alert. Moving the deadline OUT re-arms
+            # the levels it now sits above; moving it IN never pages.
+            vkey.expiry_alerts_fired = raw_request.app.state.expiry_alerts.rearm(
+                None, new_expires
+            )
         if "grace_until" in updates:
             # Rotation grace management: an explicit null ends the
             # previous credential's window at once (the incident knob

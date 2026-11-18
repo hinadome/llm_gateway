@@ -49,6 +49,7 @@ from .core.auth import AuthChain
 from .core.audit import AuditLogger
 from .core.batch_worker import BatchWorker
 from .core.canary import CanaryProber
+from .core.expiry_alerts import ExpiryAlertManager
 from .core.idempotency import IdempotencyStore
 from .core.pii_scan import PIIScanner
 from .core.slo_alerts import SLOAlertEvaluator
@@ -298,6 +299,10 @@ def create_app(
     # Budget alerts: own (non-instrumented) HTTP client; disabled unless a
     # webhook URL resolves. An explicitly injected client wins (tests).
     alerts = BudgetAlertManager(config.alerts, client=alert_http_client, events=events_bus)
+    # Key-expiry warnings (tier 52): the same webhook, deadline edition —
+    # a sweep (the lifespan loop below) fires day-levels as expires_at
+    # approaches. Shares the budget alerts' HTTP client and config.
+    expiry_alerts = ExpiryAlertManager(config.alerts, client=alert_http_client, events=events_bus)
     # Audit webhooks: same delivery story as alerts, for admin actions.
     audit = AuditLogger(config.audit, client=audit_http_client, events=events_bus)
     # Request logging: synchronous by default (a returned response
@@ -553,6 +558,31 @@ def create_app(
 
         forecast_alert_task = asyncio.create_task(_forecast_alert_loop())
 
+        # Key-expiry warning sweep (tier 52): one pass per interval over
+        # active keys with an expires_at — the day-levels the deadline
+        # itself never sends (the 401 tells callers; this tells on-call
+        # BEFORE). Always started (not gated on alerts.enabled or
+        # expiry_days) so hot-enabling takes effect from the next pass;
+        # re-reads app.state.config.alerts each iteration — enabled,
+        # the day levels and the interval all apply live. Under pytest
+        # (ASGITransport skips the lifespan) this loop never starts —
+        # tests drive evaluate_once() directly.
+        async def _expiry_alert_loop() -> None:
+            while True:
+                current = app.state.config.alerts
+                active = current.enabled and bool(current.expiry_days)
+                if active:
+                    expiry_alerts.config = current
+                    try:
+                        await expiry_alerts.evaluate_once()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("key expiry sweep failed")
+                await asyncio.sleep(
+                    current.expiry_interval_seconds if active else 30.0
+                )
+
+        expiry_alert_task = asyncio.create_task(_expiry_alert_loop())
+
         # MCP session TTL: evict gateway-issued sessions idle past
         # mcp.session_ttl_seconds. The registry is the gateway's OWN
         # state (survives hot-reloads — a client mid-conversation is
@@ -631,6 +661,7 @@ def create_app(
         canary_task.cancel()
         slo_alert_task.cancel()
         forecast_alert_task.cancel()
+        expiry_alert_task.cancel()
         mcp_sweep_task.cancel()
         if vault_invalidation_task is not None:
             vault_invalidation_task.cancel()
@@ -703,6 +734,10 @@ def create_app(
     # Budget forecast alert evaluator (admin-plane; tests drive
     # evaluate_once(), optionally pinning the pass's clock).
     app.state.forecast_alerts = forecast_alert_evaluator
+    # Key-expiry warning sweep (admin-plane; tests drive evaluate_once(),
+    # pinning the sweep's clock — the lifespan loop never starts under
+    # ASGITransport).
+    app.state.expiry_alerts = expiry_alerts
     # PII/secret scanner (admin-plane GETs; rebuilt on config swap).
     app.state.pii_scanner = pii_scanner
     # Prompt library (admin-plane CRUD routes live in api/admin.py).

@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 90 Python files, ~34,100 lines, 1287 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 91 Python files, ~34,400 lines, 1297 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -82,7 +82,10 @@ gateway/
 │                           cancelled — a live run on another replica sees it
 │                           at its next between-wave check; runs whether or
 │                           not trials are enabled now, best-effort),
-│                           log-retention background task, SIGHUP →
+│                           log-retention background task, key-expiry warning
+│                           sweep (tier 52: one expiry_alerts pass per
+│                           alerts.expiry_interval_seconds — always started,
+│                           config re-read each pass), SIGHUP →
 │                           reload, readiness flag, drain-before-close), reload_gateway
 │                           (one path for /admin/reload + SIGHUP), /healthz liveness
 │                           (never checks deps) + /readyz readiness (503 while
@@ -313,7 +316,13 @@ gateway/
 │                           (400), audited as key.rotated, never either raw
 │                           key; PATCH grace_until is the incident knob —
 │                           explicit null kills the old credential at once,
-│                           a future timestamp re-arms it; tenancy —
+│                           a future timestamp re-arms it; key create/PATCH
+│                           also arm the expiry-warning levels (tier 52:
+│                           setting or moving expires_at marks every
+│                           already-crossed day-level fired via the
+│                           expiry manager's rearm — a chosen deadline
+│                           never pages; rotation itself never touches
+│                           the state); tenancy —
 │                           tenant admins are forced into their own tenant on
 │                           create (mismatch 400), refused re-homing (403),
 │                           and see 404s for other tenants' keys/logs),
@@ -1185,6 +1194,30 @@ gateway/
 │   │                       tenants identified as tenant:{id}) — survives restarts,
 │   │                       correct across workers; raising a budget re-arms;
 │   │                       best-effort delivery
+│   ├── expiry_alerts.py    Key-expiry warnings (tier 52): the deadline's own pages.
+│   │                       days_remaining / crossed_levels / rearm_levels are
+│   │                       the pure math (a level crosses when remaining days
+│   │                       <= the level — a naive SQLite datetime normalizes to
+│   │                       UTC first, the _is_expired rule); ExpiryAlertManager
+│   │                       sweeps active keys with an expires_at and fires once
+│   │                       per day-level (alerts.expiry_days 14/7/1/0, 0 = the
+│   │                       expired page) as the deadline approaches, highest
+│   │                       first. The sweep is the canary-loop shape — always
+│   │                       started by the lifespan loop, alerts: re-read each
+│   │                       pass (enabled, levels, cadence hot-apply); tests
+│   │                       drive evaluate_once(now=) directly, pinning the
+│   │                       clock. Arming: setting or moving a deadline marks
+│   │                       every already-crossed level fired (admin.py calls
+│   │                       rearm at create/PATCH — the budget re-arm rule,
+│   │                       deadline edition, so a chosen deadline never pages);
+│   │                       discovery (fired state NULL) fires honestly; revoked
+│   │                       and deadline-less keys never warn; rotation (tier
+│   │                       51) never touches the state. Single writer (the
+│   │                       loop) → no CAS; fired state persists before
+│   │                       delivery (duplicate silence over duplicate noise).
+│   │                       Delivery = the budget alerts' webhook/metric family
+│   │                       (kind="expiry", gateway_alerts_total; no URL →
+│   │                       counted skipped) + expiry.threshold observer events
 │   └── logging_svc.py      Request log persistence + spend accounting — add_spend uses
 │                           UPDATE…RETURNING for an atomic post-update snapshot and
 │                           feeds it to the alert manager (same background task);
@@ -2618,7 +2651,7 @@ Every stage boundary below is also an event emission (the full catalog with payl
 - **`request.routed`** — after deployment selection, on both the stream and non-stream paths (observer-only: the router's retry machinery has the provider call in flight — an in-band veto there would be unsafe, so routing is notification, not a checkpoint).
 - **`response.completed`** — the final non-streaming response, post-guardrails, pre-client, with usage and cost (and `surface` for the non-chat modalities). *Interceptable* — the last in-band veto point; an interceptor raising here fails the request instead of returning the body.
 - **`stream.started` / `stream.completed`** — first chunk / end of the streamed body, emitted from the stream wrapper's iteration and `finally` (any outcome; `ctx.status` says which). Coarse by design; never per-chunk.
-- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` / `runaway.released` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `runaway.trip` from phase 1.5 when the loop detector jails a key (observer-only — the jail is the decision, not negotiable by handlers); `concurrency.timeout` from phase 5.5 when a queue wait for a slot expires (observer-only — the 429 is the decision; carries key, model, cap, wait_seconds and actual waited seconds); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure); `pii.found` from the PII scan endpoints (a scanned log row's stored bodies matched detectors); `mcp.session.opened` / `mcp.session.closed` from the MCP proxy (a gateway session created at initialize; dropped via DELETE / TTL sweep / lazy upstream-404 — `reason` says which) and `mcp.tool.blocked` from `handle_mcp`'s denial path (observer-only — the in-band JSON-RPC error IS the decision; carries server, tool, code, guardrail — and, tier 49, the denied method, so the stream says whether the denial was a `tools/call`, a `resources/read`, a `prompts/get` or a `completion/complete`).
+- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` / `runaway.released` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `runaway.trip` from phase 1.5 when the loop detector jails a key (observer-only — the jail is the decision, not negotiable by handlers); `concurrency.timeout` from phase 5.5 when a queue wait for a slot expires (observer-only — the 429 is the decision; carries key, model, cap, wait_seconds and actual waited seconds); `budget.threshold` from the alert manager (per crossed level); `expiry.threshold` from the key-expiry sweep (per crossed day-level, tier 52 — observer-only, carries key, key_name, level_days, days_remaining, expires_at); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure); `pii.found` from the PII scan endpoints (a scanned log row's stored bodies matched detectors); `mcp.session.opened` / `mcp.session.closed` from the MCP proxy (a gateway session created at initialize; dropped via DELETE / TTL sweep / lazy upstream-404 — `reason` says which) and `mcp.tool.blocked` from `handle_mcp`'s denial path (observer-only — the in-band JSON-RPC error IS the decision; carries server, tool, code, guardrail — and, tier 49, the denied method, so the stream says whether the denial was a `tools/call`, a `resources/read`, a `prompts/get` or a `completion/complete`).
 
 Emits enqueue observers *before* an interceptor's abort propagates — subscribers always see the event that was vetoed.
 
@@ -2679,6 +2712,7 @@ erDiagram
         float monthly_spend_usd "stale monthly_bucket => counts as 0"
         str monthly_bucket "YYYY-MM of monthly_spend_usd"
         json budget_alerts_fired "alert threshold levels (%) already fired"
+        json expiry_alerts_fired "expiry warning day-levels already fired (14/7/1/0, tier 52), NULL = never evaluated"
         json disabled_guardrails "guardrail names skipped for this key (runtime override)"
         json required_residencies "deployment residency tags that may serve this key, NULL = unrestricted"
         json model_mappings "per-key requested name to public model routing table"
@@ -3691,6 +3725,23 @@ tests/
 │                        state + the config echo. A seventh UI pin
 │                        covers the paged badge + the alerts-off
 │                        say-so (tests/test_admin_ui.py)
+├── test_expiry_alerts.py  Key-expiry warnings (tier 52): pure level math
+│                        (crossed highest-first, a level crosses at
+│                        remaining <= level — 0 only once actually
+│                        past, naive-UTC normalization, rearm = the
+│                        crossed levels at arm time) and the sweep
+│                        with its clock PINNED: the full 14/7/1/0
+│                        ladder fires once per level (webhook payload,
+│                        expiry.threshold events, persisted state
+│                        ascending), multi-level discovery in one pass
+│                        each as its own page, create/PATCH arm
+│                        silently (a chosen deadline never pages;
+│                        moved OUT re-arms, moved IN never), honest
+│                        discovery of pre-feature keys (fired NULL),
+│                        revoked + deadline-less keys never warn,
+│                        no-webhook = skipped metric while events
+│                        still fire, and rotation (tier 51) leaves
+│                        the expiry state alone
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while

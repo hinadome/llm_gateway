@@ -432,8 +432,19 @@ metrics:
 # (Daily/monthly budget windows — daily_budget_usd / monthly_budget_usd —
 # are set per key via the admin API and are NOT alert-tracked; alerts
 # always compare against the total max_budget_usd.)
+#
+# The same webhook also carries key-expiry warnings (tier 52): a
+# background sweep (hourly) walks active keys with an expires_at and
+# fires once per day-level as the deadline approaches — 0 is the page
+# that the key just died (its credential stops authenticating at that
+# moment). Setting or moving a deadline arms silently (levels already
+# crossed never page — the operator just chose the deadline); a key the
+# sweep discovers already near its deadline fires honestly. Revoked keys
+# and keys with no deadline never warn.
 alerts:
   budget_thresholds: [50, 80, 90, 100]   # % of max_budget_usd
+  expiry_days: [14, 7, 1, 0]   # days before expires_at; 0 = expired page
+  #expiry_interval_seconds: 3600          # expiry sweep cadence (seconds)
   # webhook_url: https://hooks.slack.com/services/T000/B000/XXXX
   # url_env: ALERT_WEBHOOK_URL           # env var that overrides webhook_url
   # timeout_seconds: 5                   # per POST attempt

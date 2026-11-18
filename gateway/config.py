@@ -428,12 +428,26 @@ class AlertsConfig(BaseModel):
     re-arms thresholds: levels already crossed are marked fired, so only
     future crossings alert. Without a ``webhook_url`` (or ``url_env``)
     alerting is a no-op.
+
+    The same webhook also carries key-expiry warnings (tier 52): a
+    background sweep walks active keys with an ``expires_at`` and fires
+    once per day-level as the deadline approaches — ``expiry_days``
+    (default 14/7/1/0; 0 = the page that the key just died). Setting or
+    moving a deadline arms silently (levels already crossed never page —
+    the operator just chose the deadline); a key the sweep *discovers*
+    already near its deadline fires honestly. The fired levels persist
+    on the key row beside the budget ones.
     """
 
     enabled: bool = True
     webhook_url: str | None = None
     url_env: str | None = None  # env var that overrides webhook_url when set
     budget_thresholds: list[int] = Field(default_factory=lambda: [50, 80, 90, 100])
+    # Day levels for the expiry-warning sweep: a key inside N days of
+    # its expires_at fires each level once, highest first; 0 fires when
+    # the deadline passes (the key stops authenticating at that moment).
+    expiry_days: list[int] = Field(default_factory=lambda: [14, 7, 1, 0])
+    expiry_interval_seconds: float = 3600.0  # sweep cadence (hourly)
     timeout_seconds: float = 5.0
     max_attempts: int = 2  # delivery attempts (1 retry)
 
