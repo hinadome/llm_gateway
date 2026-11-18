@@ -178,7 +178,21 @@ class RedisResponseCache:
     def _entry_key(self, key: str) -> str:
         return f"{self._key_prefix}{key}"
 
-    async def get(self, key: str) -> dict | None:
+    def _stored_at_key(self, entry_key: str | bytes) -> str | bytes:
+        # Companion to the entry: the write-time wall-clock timestamp
+        # (per-key cache policy, tier 54), expiring with its entry. A
+        # reader with a freshness window computes the entry's age from
+        # it — client-side, where Redis's TTL alone cannot recover the
+        # write time. Bytes-in/bytes-out because the LRU index
+        # (zrange) speaks bytes under redis-py's default
+        # decode_responses=False — str()-ing an index member would
+        # build a repr-garbage key (b'…') and silently orphan the real
+        # companion on clear/evict.
+        if isinstance(entry_key, bytes):
+            return entry_key + b":t"
+        return f"{entry_key}:t"
+
+    async def get(self, key: str, max_age: float | None = None) -> dict | None:
         if not self.enabled:
             return None
         entry_key = self._entry_key(key)
@@ -187,27 +201,62 @@ class RedisResponseCache:
             # do not touch the LRU index for misses (would add phantom
             # entries for keys that were never stored / already expired)
             return None
+        if max_age is not None:
+            ts = await self._client.get(self._stored_at_key(entry_key))
+            if ts is not None:
+                if self._clock() - float(ts) > max_age:
+                    # Fresh enough for the entry's own TTL, too stale
+                    # for THIS caller — a per-key freshness miss. The
+                    # entry stays for callers with longer windows; no
+                    # index touch, like any miss.
+                    return None
+            else:
+                # No companion: a default-window write (or a pre-tier-54
+                # entry) — either way it was written with the global
+                # TTL, so the remaining TTL recovers its age.
+                remaining = await self._client.ttl(entry_key)
+                if remaining <= 0 or self.ttl_seconds - remaining > max_age:
+                    return None
         await self._client.zadd(self._index_key, {entry_key: self._clock()})  # touch
         return json.loads(raw)
 
-    async def put(self, key: str, response: dict) -> None:
+    async def put(self, key: str, response: dict, ttl_seconds: float | None = None) -> None:
         if not self.enabled:
             return
         entry_key = self._entry_key(key)
-        ttl = max(1, int(self.ttl_seconds))
+        # Per-entry EX carries the writer's window (tier 54): None = the
+        # configured global TTL, a per-key window stamps its own entry.
+        ttl = max(1, int(ttl_seconds or self.ttl_seconds))
+        companion = self._stored_at_key(entry_key)
         pipe = self._client.pipeline(transaction=True)
         pipe.set(entry_key, json.dumps(response, default=str), ex=ttl)
+        if ttl_seconds is not None:
+            # A companion timestamp (the reader-side age source) exists
+            # only for custom-window writes: default-window entries are
+            # all written with the global TTL, so the remaining TTL
+            # recovers their age (see get) — and idempotency, which
+            # wraps this backend with default args, keeps its exact
+            # one-key-per-entry namespace (retry safety ≠ caching; its
+            # semantics deliberately untouched by tier 54).
+            pipe.set(companion, str(self._clock()), ex=ttl)
+        else:
+            # A previous custom-window write of this entry may have
+            # left a companion; drop it or it would mis-date the new
+            # (global-window) entry for freshness readers.
+            pipe.delete(companion)
         pipe.zadd(self._index_key, {entry_key: self._clock()})
         pipe.zcard(self._index_key)
-        _, _, size = await pipe.execute()
+        _, _, _, size = await pipe.execute()
         if size > self.max_entries:
-            # evict the least-recently-touched entries
+            # evict the least-recently-touched entries (companions go
+            # with their entries — they expire together anyway, but a
+            # same-pipe delete keeps the namespace tidy under churn)
             victims = await self._client.zrange(
                 self._index_key, 0, size - self.max_entries - 1
             )
             if victims:
                 pipe = self._client.pipeline(transaction=True)
-                pipe.delete(*victims)
+                pipe.delete(*victims, *[self._stored_at_key(v) for v in victims])
                 pipe.zrem(self._index_key, *victims)
                 await pipe.execute()
 
@@ -216,6 +265,10 @@ class RedisResponseCache:
         pipe = self._client.pipeline(transaction=True)
         if members:
             pipe.delete(*members)
+            # Companions ride along (entries' :t timestamps, tier 54) —
+            # note members added before the feature have none, and this
+            # delete is idempotent on absent keys.
+            pipe.delete(*[self._stored_at_key(m) for m in members])
         pipe.delete(self._index_key)
         await pipe.execute()
 

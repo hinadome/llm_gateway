@@ -392,6 +392,15 @@ class KeyCreateRequest(_ResidencyRequirement):
     expires_at: str | None = None
     metadata: dict[str, Any] | None = None
     disabled_guardrails: list[str] | None = None  # guardrail names to skip
+    # Per-key cache policy (tier 54): NULL/absent = inherit the global
+    # cache config. cache_enabled=false bypasses BOTH response caches
+    # (exact + semantic, chat and embeddings) for lookup and store.
+    # cache_ttl_seconds is this key's own window — read-side freshness
+    # bound AND write-side entry lifetime (a window longer than the
+    # global one is possible; entries still live the global TTL when
+    # this is unset).
+    cache_enabled: bool | None = None
+    cache_ttl_seconds: int | None = Field(default=None, ge=1)
     # Data-residency requirement: deployment tags that may serve this
     # key's traffic (None = unrestricted). Lowercased slugs; intersected
     # with the tenant's requirement — the tenant can only narrow.
@@ -436,6 +445,11 @@ class KeyUpdateRequest(_ResidencyRequirement):
     is_active: bool | None = None
     expires_at: str | None = None
     disabled_guardrails: list[str] | None = None
+    # Per-key cache policy (see KeyCreateRequest): an explicit null
+    # resets to inherit (the global cache config); explicit false opts
+    # out; the window likewise.
+    cache_enabled: bool | None = None
+    cache_ttl_seconds: int | None = Field(default=None, ge=1)
     model_mappings: dict[str, str] | None = None
     default_model: str | None = None
     system_prompt: str | None = None

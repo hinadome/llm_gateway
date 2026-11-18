@@ -93,6 +93,14 @@ class AuthContext:
     # Guardrail names disabled for this key (admin API, no restart needed).
     # Wins over config scoping; None/empty = no overrides.
     disabled_guardrails: list[str] | None = None
+    # Per-key cache policy (tier 54), snapshotted at auth like the other
+    # key ceilings. cache_enabled: None = inherit the global cache
+    # config; False = this caller bypasses both response caches (exact +
+    # semantic, chat and embeddings) for lookup and store. cache_ttl_seconds:
+    # None = the global TTL; otherwise this caller's own window (read-side
+    # freshness bound + write-side entry lifetime).
+    cache_enabled: bool | None = None
+    cache_ttl_seconds: int | None = None
     # Data-residency requirement (tier 28): deployment tags this
     # caller's traffic may be served (and mirrored) by — a
     # deployment qualifies only if its `residency` tag is in the

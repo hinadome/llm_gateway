@@ -95,6 +95,24 @@ async def test_ttl_expiry():
     assert await cache.get("m", [1.0, 0.0]) is None
 
 
+async def test_per_entry_ttl_and_freshness_window():
+    # Per-key cache policy (tier 54), both sides: a writer's own window
+    # stamps the entry (a LONGER window than the configured global
+    # outlives it), and a reader's max_age bounds what it accepts
+    # without deleting the entry.
+    clock = FakeClock()
+    cache = SemanticCache(SemanticCacheConfig(ttl_seconds=10), _fake_embed, clock=clock)
+    await cache.put("m", _request("hello"), [1.0, 0.0], {"id": "long"}, ttl_seconds=30)
+    clock.now += 15  # past the global 10, inside the writer's 30
+    assert await cache.get("m", [1.0, 0.0]) == {"id": "long"}
+    # ...but 15s old is too stale for a 5-second caller — a freshness
+    # miss that leaves the entry in place for wider-window readers.
+    assert await cache.get("m", [1.0, 0.0], max_age=5) is None
+    assert await cache.get("m", [1.0, 0.0], max_age=15) == {"id": "long"}
+    clock.now += 16  # 31s total: past the writer's window — expired
+    assert await cache.get("m", [1.0, 0.0]) is None
+
+
 async def test_lru_eviction_bound():
     cache = SemanticCache(SemanticCacheConfig(max_entries=2), _fake_embed)
     await cache.put("m", _request("one"), [1.0, 0.0], {"id": "r1"})

@@ -8,6 +8,45 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Per-key cache policy (tier 54) — the response caches stop being
+  global. One `cache.enabled` and one `cache.ttl_seconds` for every
+  caller meant a team wanting no caching (a support bot that must
+  answer fresh) or a longer window (a slow-moving catalog) had no
+  key-level say. Two nullable `VirtualKey` columns, snapshotted at
+  auth like every other key ceiling and honored at every cache site
+  (chat non-stream, stream completion, embeddings):
+  - **`cache_enabled: false` — bypass.** This key's requests skip
+    BOTH response caches (exact + semantic) for lookup AND store:
+    never served from a cache, never writing entries, never counting
+    a miss on `gateway_cache_hits_total`, answering
+    `X-Gateway-Cache: BYPASS` (a new vocabulary value — the per-key
+    opt-out's; a globally-off cache keeps `MISS` for compat). Opt-out
+    only narrows: `cache.enabled: false` stays off for every key.
+  - **`cache_ttl_seconds` — the key's own window, honored two-sided.**
+    Read side: a hit serves only entries within the caller's window —
+    an entry past it is a freshness miss *for that caller without
+    being deleted* (longer-window callers keep serving it; each
+    window is its own staleness tolerance over the shared store).
+    Write side: an entry the key writes lives the *writer's* window —
+    so a window longer than the global `cache.ttl_seconds` actually
+    materializes. NULL = the global default; explicit PATCH null
+    resets to inherit; the window must be ≥ 1 second.
+  - **Backends**: the in-memory and Redis caches share the same two
+    optional parameters — `put(ttl_seconds=)` stamps the writer's
+    window (per-entry, the Redis entry's own EX; a companion
+    timestamp key supplies read-side age for custom windows, while
+    default-window writes add nothing — remaining-TTL recovers their
+    age and idempotency's wrapped namespace stays exact), and
+    `get(max_age=)` is the caller's freshness bound. The semantic
+    cache carries the same two-sided semantics.
+  - **Deliberately untouched**: idempotency (retry safety ≠ caching —
+    `Idempotency-Key` replays work identically for opted-out callers)
+    and the shared LRU size bound (no per-key entry count — opt-out
+    and window are the useful knobs).
+  - Admin UI: key-dialog cache select (inherit/bypass) + window
+    input, ⛁ policy badge on key rows. 14 new e2e tests
+    (`tests/test_key_cache_policy.py`) + backend units; closes the
+    §8.2 item-6 gap.
 - PII-scan teeth (tier 53) — the scan stops being a mirror. Findings
   were informational: reported at scan time, evaporating into a
   metric and an event, while the flagged bodies stayed fully

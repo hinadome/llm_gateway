@@ -81,11 +81,14 @@ class SemanticCache:
         self.config = config
         self._embed_fn = embed_fn
         self._clock = clock
-        # (model, policy_token, entry_id) -> (stored_at, embedding,
-        # response); insertion order doubles as LRU order, bounded
-        # globally across models.
+        # (model, policy_token, entry_id) -> (stored_at, entry_ttl,
+        # embedding, response); insertion order doubles as LRU order,
+        # bounded globally across models. The per-entry TTL carries the
+        # per-key cache policy (tier 54): a writer with its own window
+        # stamps its entry, and a reader's max_age bounds what they
+        # accept (a freshness miss leaves the entry for longer windows).
         self._entries: OrderedDict[
-            tuple[str, str, str], tuple[float, list[float], dict]
+            tuple[str, str, str], tuple[float, float, list[float], dict]
         ] = OrderedDict()
 
     # -- lookup ---------------------------------------------------------
@@ -116,19 +119,28 @@ class SemanticCache:
             return None
 
     async def get(
-        self, model: str, embedding: list[float], policy_token: str = ""
+        self,
+        model: str,
+        embedding: list[float],
+        policy_token: str = "",
+        max_age: float | None = None,
     ) -> dict | None:
-        """Best same-(model, policy) entry with similarity >= threshold."""
+        """Best same-(model, policy) entry with similarity >= threshold,
+        fresh enough for the entry's own TTL and (when set) the
+        caller's ``max_age`` window — the per-key freshness bound."""
         threshold = self.config.threshold
         best_key: tuple[str, str, str] | None = None
         best_score = 0.0
         best_response: dict | None = None
         now = self._clock()
         expired: list[tuple[str, str, str]] = []
-        for key, (stored_at, entry_embedding, response) in self._entries.items():
-            if now - stored_at > self.config.ttl_seconds:
+        for key, (stored_at, entry_ttl, entry_embedding, response) in self._entries.items():
+            age = now - stored_at
+            if age > entry_ttl:
                 expired.append(key)
                 continue
+            if max_age is not None and age > max_age:
+                continue  # too stale for THIS caller; keep for others
             if key[0] != model or key[1] != policy_token:
                 continue
             score = cosine_similarity(embedding, entry_embedding)
@@ -149,11 +161,15 @@ class SemanticCache:
         embedding: list[float],
         response: dict,
         policy_token: str = "",
+        ttl_seconds: float | None = None,
     ) -> None:
-        """Store a successful response under its normalized-request id."""
+        """Store a successful response under its normalized-request id,
+        stamped with the writer's TTL window (None = the configured
+        global — per-key cache policy, tier 54)."""
         entry_id = cache_key_for(request)
         self._entries[(model, policy_token, entry_id)] = (
             self._clock(),
+            ttl_seconds or self.config.ttl_seconds,
             embedding,
             response,
         )

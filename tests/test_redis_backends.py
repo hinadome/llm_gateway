@@ -168,6 +168,78 @@ async def test_cache_clear(redis, clock):
 
 
 # ----------------------------------------------------------------------
+# Per-key cache policy (tier 54): per-entry windows + read-side freshness
+# ----------------------------------------------------------------------
+
+
+async def test_cache_per_entry_ttl(redis, clock):
+    # The writer's window rides the entry as its own EX: None = the
+    # configured global, an explicit ttl_seconds stamps the entry.
+    cache = RedisResponseCache(redis, ttl_seconds=60, max_entries=10, prefix="t", clock=clock)
+    await cache.put("custom", {"v": 1}, ttl_seconds=120)
+    await cache.put("default", {"v": 2})
+    assert await redis.ttl("t:cache:custom") == 120
+    assert await redis.ttl("t:cache:default") == 60
+
+
+async def test_cache_max_age_freshness_with_companion(redis, clock):
+    # A custom-window write also stores the companion timestamp (the
+    # reader-side age source); a caller's max_age bounds what it
+    # accepts without deleting anything.
+    cache = RedisResponseCache(redis, ttl_seconds=60, max_entries=10, prefix="t", clock=clock)
+    await cache.put("k", {"v": 1}, ttl_seconds=120)
+    assert await redis.get("t:cache:k:t") == str(clock.now).encode()
+    clock.advance(30)  # 30s old: inside the entry's 120, past a 10s caller
+    assert await cache.get("k", max_age=10) is None
+    # A freshness miss is not an expiry: the entry serves callers with
+    # acceptable windows, and plain reads, unchanged.
+    assert await cache.get("k", max_age=30) == {"v": 1}
+    assert await cache.get("k") == {"v": 1}
+    # (The entry's own EX window is server-side real time — pinned as
+    # ttl == 120 in the per-entry test above, not clock-testable here.)
+
+
+async def test_cache_default_write_keeps_the_namespace(redis, clock):
+    # Default-window writes add no companion (they were all written
+    # with the global TTL, so remaining-TTL recovers their age — see
+    # the fallback test below), which keeps idempotency's wrapped use
+    # of this backend at exactly one key per entry. A custom-window
+    # write adds one; a default overwrite of that entry drops it (a
+    # stale companion would mis-date the new entry).
+    cache = RedisResponseCache(redis, ttl_seconds=60, max_entries=10, prefix="t", clock=clock)
+    await cache.put("k", {"v": 1})
+    # entry + LRU index only
+    assert await redis.dbsize() == 2
+    await cache.put("k", {"v": 2}, ttl_seconds=90)
+    assert await redis.exists("t:cache:k:t") == 1
+    await cache.put("k", {"v": 3})
+    assert await redis.exists("t:cache:k:t") == 0
+    # and the default-overwritten entry still answers
+    assert await cache.get("k") == {"v": 3}
+
+
+async def test_cache_companionless_entry_age_from_ttl(redis, clock):
+    # Entries with no companion (default-window writes, or entries
+    # written before tier 54): the remaining TTL recovers the age —
+    # written with the global 60, remaining 55 means 5 seconds old.
+    cache = RedisResponseCache(redis, ttl_seconds=60, max_entries=10, prefix="t", clock=clock)
+    await redis.set("t:cache:k", b'{"v": 1}', ex=55)
+    assert await cache.get("k", max_age=10) == {"v": 1}  # ~5s old: fresh enough
+    assert await cache.get("k", max_age=4) is None  # too stale for a 4s caller
+    assert await redis.exists("t:cache:k") == 1  # the miss deleted nothing
+
+
+async def test_cache_companions_cleaned_on_evict_and_clear(redis, clock):
+    cache = RedisResponseCache(redis, ttl_seconds=60, max_entries=1, prefix="t", clock=clock)
+    await cache.put("a", {"v": 1}, ttl_seconds=120)
+    await cache.put("b", {"v": 2}, ttl_seconds=120)  # evicts a (LRU bound 1)
+    assert await redis.exists("t:cache:a") == 0
+    assert await redis.exists("t:cache:a:t") == 0
+    await cache.clear()
+    assert await redis.dbsize() == 0
+
+
+# ----------------------------------------------------------------------
 # End to end through the app (fakeredis-injected backends)
 # ----------------------------------------------------------------------
 

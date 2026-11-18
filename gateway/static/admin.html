@@ -553,6 +553,8 @@
           Daily budget (USD) <input id="k-daily" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld" title="Spend cap per UTC calendar month; resets on the 1st at 00:00 UTC">
           Monthly budget (USD) <input id="k-monthly" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+        <label class="fld" title="Per-key cache policy (tier 54): 'bypass' opts this key out of the response caches (exact + semantic, chat and embeddings alike) for lookup AND store — its requests always execute and answer X-Gateway-Cache: BYPASS. It can only narrow: with the global cache off, nothing caches regardless. '— inherit —' = the global cache.enabled governs.">Cache <select id="k-cache"><option value="">— inherit (global) —</option><option value="off">bypass</option></select></label>
+        <label class="fld" title="Per-key cache window (tier 54): this key's own freshness bound — a hit serves only entries within it, and entries this key writes live it (a window longer than the global cache.ttl_seconds is possible). Empty = the global TTL.">Cache TTL seconds <input id="k-cache-ttl" type="number" min="1" step="1" placeholder="global (cache.ttl_seconds)"></label>
       </div>
       <label class="fld" style="grid-template-columns:auto 1fr;display:grid;gap:8px;align-items:center;color:var(--text)" id="k-active-row">
         <input type="checkbox" id="k-active" checked style="width:16px;height:16px;accent-color:var(--accent)"> Active
@@ -1070,6 +1072,15 @@ async function loadKeys() {
     const resBadge = (k.required_residencies || []).length
       ? ` <span class="b b-purple" title="Data-residency requirement: only deployments tagged ${(k.required_residencies || []).map(esc).join(" or ")} may serve this key (intersected with its tenant's requirement); untagged deployments never qualify.">⌖ ${(k.required_residencies || []).map(esc).join(",")}</span>`
       : "";
+    // Per-key cache policy (tier 54): bypass opts the key out of the
+    // response caches (lookup + store); its own window bounds what a
+    // hit may serve and how long its writes live.
+    const cacheBits = [];
+    if (k.cache_enabled === false) cacheBits.push("bypass");
+    if (k.cache_ttl_seconds != null) cacheBits.push(k.cache_ttl_seconds + "s window");
+    const cacheBadge = cacheBits.length
+      ? ` <span class="b b-gray" title="Per-key cache policy: ${esc(cacheBits.join(", "))}">⛁ ${esc(cacheBits.join(" · "))}</span>`
+      : "";
     const expired = k.expires_at && new Date(k.expires_at) < new Date();
     // Expiring-soon badge: inside 14 days of the deadline (the first
     // warning level — alerts.expiry_days 14/7/1/0 fire webhooks + events
@@ -1093,7 +1104,7 @@ async function loadKeys() {
       <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}${expiringBadge}${graceBadge}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
-      <td>${models}${grOff}${scoped}${ipLock}${toolLock}${mcpLock}${promptPolicy}${concBadge}${resBadge}</td>
+      <td>${models}${grOff}${scoped}${ipLock}${toolLock}${mcpLock}${promptPolicy}${concBadge}${resBadge}${cacheBadge}</td>
       <td class="num">${k.rpm_limit == null ? "—" : fmtInt(k.rpm_limit)} / ${k.tpm_limit == null ? "—" : fmtInt(k.tpm_limit)}</td>
       <td>${budgetCell}</td>
       <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
@@ -1175,6 +1186,8 @@ function openKeyDialog(k) {
   populatePromptRefSelect(k ? k.system_prompt_ref : null);
   $("#k-endpoints").value = k && k.allowed_endpoints ? k.allowed_endpoints.join(", ") : "";
   $("#k-ips").value = k && k.allowed_ips ? k.allowed_ips.join(", ") : "";
+  $("#k-cache").value = k && k.cache_enabled === false ? "off" : "";
+  $("#k-cache-ttl").value = k && k.cache_ttl_seconds != null ? k.cache_ttl_seconds : "";
   $("#k-rpm").value = k && k.rpm_limit != null ? k.rpm_limit : "";
   $("#k-tpm").value = k && k.tpm_limit != null ? k.tpm_limit : "";
   $("#k-conc").value = k && k.max_concurrency != null ? k.max_concurrency : "";
@@ -1241,6 +1254,8 @@ async function submitKeyDialog() {
     max_budget_usd: num("k-budget"),
     daily_budget_usd: num("k-daily"),
     monthly_budget_usd: num("k-monthly"),
+    cache_enabled: $("#k-cache").value === "off" ? false : null,
+    cache_ttl_seconds: num("k-cache-ttl"),
   };
   const exp = $("#k-expires").value;
   if (exp) body.expires_at = new Date(exp).toISOString();
@@ -1272,6 +1287,8 @@ async function submitKeyDialog() {
       if (body.max_budget_usd == null) delete body.max_budget_usd;
       if (body.daily_budget_usd == null) delete body.daily_budget_usd;
       if (body.monthly_budget_usd == null) delete body.monthly_budget_usd;
+      if (body.cache_enabled == null) delete body.cache_enabled;
+      if (body.cache_ttl_seconds == null) delete body.cache_ttl_seconds;
       if (!body.expires_at) delete body.expires_at;
       const payload = Object.assign({ name: $("#k-name").value.trim() }, body);
       if ($("#k-admin").checked) payload.is_admin = true;

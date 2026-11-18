@@ -431,3 +431,22 @@ async def test_log_detail_requires_admin(env):
     assert (
         await env.client.get("/admin/logs/1", headers=auth(plain["key"]))
     ).status_code == 403
+
+
+async def test_admin_ui_key_cache_policy_surface(env):
+    # Tier 54: the key dialog carries the per-key cache policy — the
+    # cache select (inherit/bypass) + the window input, submit body +
+    # create-mode null-deletion, and the key-row badge. Static-shell
+    # assertions only, like the other surface pins.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="k-cache"',
+        'id="k-cache-ttl"',
+        'cache_enabled: $("#k-cache").value === "off" ? false : null',
+        'cache_ttl_seconds: num("k-cache-ttl")',
+        "delete body.cache_enabled",
+        "delete body.cache_ttl_seconds",
+        "cacheBadge",
+        "bypass",
+    ):
+        assert marker in body, marker

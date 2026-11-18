@@ -646,12 +646,33 @@ class GatewayPipeline:
         #    skips response guardrails, so an entry may only serve a
         #    caller whose response policy (and tenant) matches the one
         #    that stored it — keys with identical policies still share.
+        #    Per-key cache policy (tier 54): the caller's snapshot can
+        #    opt out of both caches (cache_enabled=False — narrowing
+        #    only; a global-off cache stays off) or set its own window
+        #    (cache_ttl_seconds — a read-side freshness bound here; the
+        #    writer's window stamps entries at put-time). A bypassed
+        #    caller skips the lookup AND the stores (key stays None),
+        #    never counts a miss, and answers X-Gateway-Cache: BYPASS.
         policy_token = self.guardrails.response_policy_token(ctx)
-        key = cache_key_for(request, policy_token) if self.cache.enabled else None
+        # Per-key cache policy (tier 54). The exact cache serves this
+        # caller unless the global switch is off or the key opted out —
+        # narrowing only; a global-off cache stays off for every key.
+        # The semantic cache has its own global switch
+        # (semantic_cache.enabled, which builds self.semantic); the
+        # key's opt-out gates it too (a bypass is BOTH caches), but a
+        # global cache.enabled=false never silenced semantic lookups
+        # before and still doesn't — the pre-tier-54 scope stands.
+        cache_active = self.cache.enabled and ctx.auth.cache_enabled is not False
+        semantic_active = ctx.auth.cache_enabled is not False
+        key = cache_key_for(request, policy_token) if cache_active else None
         semantic_embedding: list[float] | None = None
-        cached = await self.cache.get(key) if key is not None else None
+        cached = (
+            await self.cache.get(key, max_age=ctx.auth.cache_ttl_seconds)
+            if key is not None
+            else None
+        )
         hit_kind = "hit" if cached is not None else None
-        if cached is None and self.semantic is not None:
+        if cached is None and self.semantic is not None and semantic_active:
             # The caller's residency requirement rides along: a
             # restricted caller's prompt is only embedded compliantly,
             # and a model with no compliant deployment is a miss here
@@ -661,7 +682,10 @@ class GatewayPipeline:
             )
             if semantic_embedding is not None:
                 cached = await self.semantic.get(
-                    request.model, semantic_embedding, policy_token
+                    request.model,
+                    semantic_embedding,
+                    policy_token,
+                    max_age=ctx.auth.cache_ttl_seconds,
                 )
                 if cached is not None:
                     hit_kind = "semantic"
@@ -683,7 +707,10 @@ class GatewayPipeline:
                     self._replay_cached_stream(cached), ctx, headers
                 )
             return JSONResponse(content=cached, headers=headers)
-        if key is not None or self.semantic is not None:
+        # A bypassed caller (per-key opt-out) counts no miss — it never
+        # consulted the caches, so there is nothing to count; the miss
+        # vocabulary stays for callers the caches could have served.
+        if key is not None or (self.semantic is not None and semantic_active):
             metrics.CACHE.labels("miss").inc()
 
         # 5.5 Concurrency admission (pre-routing): the slot wraps the
@@ -719,7 +746,9 @@ class GatewayPipeline:
                 native_model=deployment.model,
                 stream=True,
             )
-            headers = self._headers(ctx, "MISS")
+            headers = self._headers(
+                ctx, "BYPASS" if self.cache.enabled and ctx.auth.cache_enabled is False else "MISS"
+            )
             return self._streaming_response(
                 self._stream_with_guardrails(
                     request,
@@ -780,14 +809,22 @@ class GatewayPipeline:
             self._queue_prompt_ab(request, ctx, primary_raw_text)
 
         if key is not None and ctx.status == "success":
-            await self.cache.put(key, response)
+            # The writer's window stamps the entry (per-key cache
+            # policy): a key with a longer window than the global one
+            # gets it; unset means the cache's configured default.
+            await self.cache.put(key, response, ttl_seconds=ctx.auth.cache_ttl_seconds)
         if (
             semantic_embedding is not None
             and self.semantic is not None
             and ctx.status == "success"
         ):
             await self.semantic.put(
-                request.model, request, semantic_embedding, response, policy_token
+                request.model,
+                request,
+                semantic_embedding,
+                response,
+                policy_token,
+                ttl_seconds=ctx.auth.cache_ttl_seconds,
             )
 
         # 10.5 Idempotency: store the successful completion under
@@ -822,7 +859,15 @@ class GatewayPipeline:
             usage=usage,
             cost_usd=ctx.cost_usd,
         )
-        return JSONResponse(content=response, headers=self._headers(ctx, "MISS"))
+        return JSONResponse(
+            content=response,
+            headers=self._headers(
+                ctx,
+                "BYPASS"
+                if self.cache.enabled and ctx.auth.cache_enabled is False
+                else "MISS",
+            ),
+        )
 
     async def _idempotent_replay(
         self,
@@ -2362,15 +2407,19 @@ class GatewayPipeline:
         # 4. Cache lookup — embeddings are deterministic per model+input.
         #    Salted by the caller's residency requirement like the chat
         #    path's policy token: residency classes never share entries.
+        #    Per-key cache policy (tier 54) gates here too: an opted-out
+        #    caller skips the lookup and the store, and its window is
+        #    the read-side freshness bound (see the chat path, phase 5).
+        cache_active = self.cache.enabled and ctx.auth.cache_enabled is not False
         key = (
             embedding_cache_key_for(
                 request, ctx.auth.tenant_id, ctx.auth.effective_residencies()
             )
-            if self.cache.enabled
+            if cache_active
             else None
         )
         if key is not None:
-            cached = await self.cache.get(key)
+            cached = await self.cache.get(key, max_age=ctx.auth.cache_ttl_seconds)
             if cached is not None:
                 metrics.CACHE.labels("hit").inc()
                 ctx.cache_hit = True
@@ -2403,7 +2452,8 @@ class GatewayPipeline:
         ctx.status = "success"
 
         if key is not None:
-            await self.cache.put(key, response)
+            # The writer's window stamps the entry (tier 54).
+            await self.cache.put(key, response, ttl_seconds=ctx.auth.cache_ttl_seconds)
 
         self._request_metric(ctx)
         metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
@@ -2420,7 +2470,12 @@ class GatewayPipeline:
         )
         return JSONResponse(
             content=self._embedding_out(request, response),
-            headers=self._headers(ctx, "MISS"),
+            headers=self._headers(
+                ctx,
+                "BYPASS"
+                if self.cache.enabled and ctx.auth.cache_enabled is False
+                else "MISS",
+            ),
         )
 
     def _embedding_out(self, request: EmbeddingRequest, response: dict) -> dict:
@@ -3008,7 +3063,14 @@ class GatewayPipeline:
                     request.model, emitted_text, finish_reason, usage
                 )
                 if cache_key is not None:
-                    await self.cache.put(cache_key, full_response)
+                    # The writer's window stamps the entry (tier 54) —
+                    # the streaming path stores exactly like the
+                    # non-streaming one.
+                    await self.cache.put(
+                        cache_key,
+                        full_response,
+                        ttl_seconds=ctx.auth.cache_ttl_seconds,
+                    )
                 if semantic_embedding is not None and self.semantic is not None:
                     await self.semantic.put(
                         request.model,
@@ -3016,6 +3078,7 @@ class GatewayPipeline:
                         semantic_embedding,
                         full_response,
                         policy_token or "",
+                        ttl_seconds=ctx.auth.cache_ttl_seconds,
                     )
                 # Idempotency: same success rule as the cache (a complete,
                 # unblocked stream with usage) — a client that retries a

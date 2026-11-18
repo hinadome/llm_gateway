@@ -11,6 +11,15 @@ The interface is async so the in-memory and Redis implementations are
 interchangeable (``RedisResponseCache`` in ``redis_backends.py`` shares
 entries across workers/replicas; the pipeline only depends on the
 ``get`` / ``put`` / ``clear`` methods).
+
+Per-key cache policy (tier 54) rides the same two optional parameters
+on both backends: ``put(..., ttl_seconds=)`` stamps the entry with the
+writer's window (None = the configured global TTL — a key with a
+longer window gets it), and ``get(..., max_age=)`` bounds what the
+CALLER accepts (None = the entry's own TTL is the only limit; a
+freshness miss does not delete the entry — it may still serve callers
+with longer windows). Idempotency (which wraps the same backends)
+never passes either, so retry semantics are untouched by policy.
 """
 
 from __future__ import annotations
@@ -77,25 +86,39 @@ class ResponseCache:
         self.enabled = enabled
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
-        self._store: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+        # key -> (stored_at, entry_ttl, response). The per-entry TTL
+        # (tier 54, per-key cache policy) defaults to the configured
+        # global; a writer with its own window stamps its entry with it
+        # (put(ttl_seconds=...)), so a window longer than the global
+        # one is possible. Reads take an optional max_age — the
+        # CALLER's freshness bound: an entry past it is a miss for that
+        # caller without being deleted (it may still serve callers with
+        # longer windows).
+        self._store: OrderedDict[str, tuple[float, float, dict]] = OrderedDict()
 
-    async def get(self, key: str) -> dict | None:
+    async def get(self, key: str, max_age: float | None = None) -> dict | None:
         if not self.enabled:
             return None
         entry = self._store.get(key)
         if entry is None:
             return None
-        stored_at, response = entry
-        if time.monotonic() - stored_at > self.ttl_seconds:
+        stored_at, entry_ttl, response = entry
+        age = time.monotonic() - stored_at
+        if age > entry_ttl:
             del self._store[key]
+            return None
+        if max_age is not None and age > max_age:
+            # Fresh enough for the entry, too stale for THIS caller —
+            # a per-key freshness miss, not an expiry. The entry stays:
+            # callers with longer windows may still serve from it.
             return None
         self._store.move_to_end(key)
         return response
 
-    async def put(self, key: str, response: dict) -> None:
+    async def put(self, key: str, response: dict, ttl_seconds: float | None = None) -> None:
         if not self.enabled:
             return
-        self._store[key] = (time.monotonic(), response)
+        self._store[key] = (time.monotonic(), ttl_seconds or self.ttl_seconds, response)
         self._store.move_to_end(key)
         while len(self._store) > self.max_entries:
             self._store.popitem(last=False)

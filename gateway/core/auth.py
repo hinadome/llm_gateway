@@ -158,6 +158,8 @@ def auth_context_from_key(
         monthly_spend_usd=vkey.monthly_spend_usd,
         monthly_bucket=vkey.monthly_bucket,
         disabled_guardrails=vkey.disabled_guardrails,
+        cache_enabled=vkey.cache_enabled,
+        cache_ttl_seconds=vkey.cache_ttl_seconds,
         model_mappings=vkey.model_mappings,
         default_model=vkey.default_model,
         system_prompt=vkey.system_prompt,

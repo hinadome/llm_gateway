@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 92 Python files, ~34,900 lines, 1311 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 92 Python files, ~35,100 lines, 1332 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -327,7 +327,10 @@ gateway/
 │                           already-crossed day-level fired via the
 │                           expiry manager's rearm — a chosen deadline
 │                           never pages; rotation itself never touches
-│                           the state); tenancy —
+│                           the state); key create/PATCH carry the
+│                           per-key cache policy (tier 54:
+│                           cache_enabled / cache_ttl_seconds, explicit
+│                           null on PATCH resets to inherit); tenancy —
 │                           tenant admins are forced into their own tenant on
 │                           create (mismatch 400), refused re-homing (403),
 │                           and see 404s for other tenants' keys/logs),
@@ -759,7 +762,25 @@ gateway/
 │   │                       cache lookup/store salt the key with a
 │   │                       response-policy token (tenant + active
 │   │                       response-capable guardrails — see manager.py)
-│   │                       so entries never cross tenants or policies
+│   │                       so entries never cross tenants or policies;
+│   │                       per-key cache policy (tier 54) gates phase 5
+│   │                       and the embeddings cache step from the auth
+│   │                       snapshot: cache_enabled=false bypasses BOTH
+│   │                       caches (lookup AND store, key stays None —
+│   │                       answering X-Gateway-Cache: BYPASS and
+│   │                       counting no miss; narrowing only, global-off
+│   │                       keeps MISS for compat), cache_ttl_seconds is
+│   │                       the caller's read-side max_age on every
+│   │                       lookup and the writer's ttl stamp on every
+│   │                       store (chat non-stream, stream-completion
+│   │                       and embeddings alike); the semantic switch
+│   │                       keeps its own global scope (cache.enabled
+│   │                       never silenced semantic lookups before and
+│   │                       still doesn't — the opt-out gates it, the
+│   │                       global exact-cache flag does not);
+│   │                       idempotency (phase 2b, before the cache)
+│   │                       is deliberately untouched — retry safety ≠
+│   │                       caching
 │   │                       _stream_with_guardrails runs block-style checks on
 │   │                       the SOURCE text, then chains stream rewriters
 │   │                       (rewrite_stream_text) — held-back text flushes
@@ -1099,17 +1120,50 @@ gateway/
 │   │                       Registry — shared windows, cache entries and circuit-breaker
 │   │                       state across workers/replicas, semantics preserved;
 │   │                       RedisVaultInvalidator (tier 34) fans BYOK cache
-│   │                       invalidations across the same fleet (see vault.py)
+│   │                       invalidations across the same fleet (see vault.py).
+│   │                       Tier 54 in RedisResponseCache: the writer's
+│   │                       window is the entry's own EX (per-entry, not
+│   │                       per-cache), and custom-window writes add a
+│   │                       companion {entry}:t timestamp key (same EX)
+│   │                       as the read-side age source — client-side,
+│   │                       where TTL alone cannot recover write time.
+│   │                       Default-window writes add NO companion
+│   │                       (remaining-TTL recovers their age, and
+│   │                       idempotency's wrapped use keeps its exact
+│   │                       one-key-per-entry namespace); a default
+│   │                       overwrite drops a stale companion so it
+│   │                       cannot mis-date the new entry. Eviction and
+│   │                       clear() delete companions with their
+│   │                       entries (bytes-safe derivation — the LRU
+│   │                       index speaks bytes under decode_responses
+│   │                       =False)
 │   ├── cache.py            Exact-match response cache + stream replay (async
 │   │                       interface); cache_key_for salts the normalized
-│   │                       request with the caller's response-policy token
+│   │                       request with the caller's response-policy token.
+│   │                       Tier 54 (per-key cache policy) rides two
+│   │                       optional parameters shared with the Redis twin:
+│   │                       put(ttl_seconds=) stamps the entry with the
+│   │                       writer's window (None = the configured global
+│   │                       — a longer per-key window materializes; the
+│   │                       store tuple is (stored_at, entry_ttl,
+│   │                       response)), and get(max_age=) is the CALLER's
+│   │                       freshness bound — an entry past it is a miss
+│   │                       for that caller without being deleted (it may
+│   │                       still serve longer-window callers; an expiry
+│   │                       still deletes). Idempotency, which wraps this
+│   │                       backend, never passes either
 │   ├── semantic_cache.py   Semantic cache: embeds the normalized request (via the
 │   │                       configured embeddings model, routed like any embeddings
 │   │                       call — see embed_fn_for in router.py) and serves the best
 │   │                       same-model response above a cosine threshold; buckets
 │   │                       are (model, policy token) so near-duplicates never
 │   │                       cross tenants or policies; TTL + LRU
-│   │                       bounded, embedder failures degrade to a miss
+│   │                       bounded, embedder failures degrade to a miss.
+│   │                       Tier 54: the same two-sided window as the
+│   │                       exact cache — the entry tuple gains the
+│   │                       per-entry TTL (the writer's window) and
+│   │                       get(max_age=) bounds what the caller
+│   │                       accepts (freshness misses leave the entry)
 │   ├── vault.py            BYOK vault (tier 31): tenant-owned provider
 │   │                       credentials, encrypted at rest. VaultService
 │   │                       wraps Fernet/MultiFernet under
@@ -1176,7 +1230,12 @@ gateway/
 │   │                       supplies all policy) steps + "pkg.module:ClassName"
 │   │                       custom loading, unknown names failing at startup;
 │   │                       auth_context_from_key snapshots a row (incl. scoping
-│   │                       + routing overrides and auth_method for logs) and
+│   │                       + routing overrides, the tier-54 cache policy
+│   │                       — cache_enabled/cache_ttl_seconds ride the same
+│   │                       auth-time snapshot as every other key ceiling,
+│   │                       so JWT/playground/batch callers get their key's
+│   │                       policy automatically — and auth_method for logs)
+│   │                       and
 │   │                       load_tenant_for_key loads the key's tenant row
 │   │                       into the same snapshot — the ceiling fields
 │   │                       plus pricing_markup_pct (cost-plus billing)
@@ -2605,7 +2664,7 @@ sequenceDiagram
         Note over P: 4.6 tool-policy re-check: a guardrail may<br/>overlay tools (modified_request_fields) —<br/>the policy is a hard boundary, re-checked<br/>so a guardrail can never inject a tool past<br/>the key's allowlist (same fail-closed shape<br/>as the model redirect re-check above)
     end
 
-    Note over P: 4. cache lookup (exact hash match,<br/>then semantic similarity if enabled) — keys salted<br/>by the response-policy token (tenant + active<br/>response-capable guardrails): entries never cross<br/>tenants or policies, identical-policy keys share
+    Note over P: 4. cache lookup (exact hash match,<br/>then semantic similarity if enabled) — keys salted<br/>by the response-policy token (tenant + active<br/>response-capable guardrails): entries never cross<br/>tenants or policies, identical-policy keys share.<br/>Per-key policy (tier 54) gates the whole step:<br/>cache_enabled=false bypasses it (no lookup, no<br/>store, X-Gateway-Cache: BYPASS, no miss counted),<br/>cache_ttl_seconds = read-side max_age here,<br/>write-side entry TTL at store time
     alt cache HIT
         P->>L: write log (cache_hit)
         P-->>C: 200 cached response (X-Gateway-Cache: HIT)
@@ -2779,6 +2838,8 @@ erDiagram
         json budget_alerts_fired "alert threshold levels (%) already fired"
         json expiry_alerts_fired "expiry warning day-levels already fired (14/7/1/0, tier 52), NULL = never evaluated"
         json disabled_guardrails "guardrail names skipped for this key (runtime override)"
+        bool cache_enabled "tier 54 per-key cache policy: NULL = inherit global, false = bypass both response caches (exact + semantic, chat and embeddings) for lookup AND store — narrowing only"
+        int cache_ttl_seconds "the key's own cache window: read-side freshness bound AND write-side entry lifetime (longer than the global is possible); NULL = global cache.ttl_seconds"
         json required_residencies "deployment residency tags that may serve this key, NULL = unrestricted"
         json model_mappings "per-key requested name to public model routing table"
         str default_model "this key's catch-all for unknown names"
@@ -3029,7 +3090,7 @@ Being honest about the seams — these are the current trade-offs (all are local
 3. ~~Request-phase guardrails can only modify `messages`~~ **Solved:** `GuardrailResult` now carries `modified_model` (reject-and-redirect — "serve this on the small model" instead of blocking, with the pipeline re-checking the key's allowlist after the guardrail phase, fail closed) and `modified_request_fields` (arbitrary `ChatCompletionRequest` fields: `temperature`, `tools`, ...). All three compose and chain across guardrails (one `model_copy` per guardrail, each seeing the previous one's output).
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
 5. **Service selection beyond the built-ins is code.** The rate limiter, response cache and circuit-breaker registry have two built-in backends each (in-memory, Redis) selectable from `config.yaml`, but swapping in something else (e.g., a DynamoDB cache) still means calling `create_app` differently — the selection switch covers the shipped implementations only.
-6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. The same choice is why rotation never touches tokens: a JWT names the *key*, not its credential, so every token naming a key keeps working across its rotations (tier 51) — only raw-credential holders need the new secret. Not covered: mTLS client certificates, and per-key *cache* overrides (per-team TTL/size) still don't exist — the cache is global.
+6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. The same choice is why rotation never touches tokens: a JWT names the *key*, not its credential, so every token naming a key keeps working across its rotations (tier 51) — only raw-credential holders need the new secret. ~~Per-key cache overrides don't exist~~ **Solved (tier 54):** the key row now carries `cache_enabled` (NULL = inherit; `false` = bypass both response caches, exact + semantic, chat and embeddings, lookup and store — narrowing only, global-off stays off) and `cache_ttl_seconds` (NULL = the global window; otherwise the key's own, honored read-side as a freshness bound and write-side as the entry's lifetime), snapshotted at auth like every other key ceiling. Not covered: mTLS client certificates.
 7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
 9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
@@ -3075,7 +3136,7 @@ Ship it safely with `mode: observe` first — verdicts land in `/admin/logs` and
 2. Register in `BUILTIN_ADAPTERS` (`providers/__init__.py`) — one line.
 3. Add `providers: bedrock: {...}` + a deployment in `config.yaml`.
 
-**Run multiple workers/replicas (Redis backends)**: the shipped `RedisRateLimiter` / `RedisResponseCache` / `RedisCircuitBreakerRegistry` (`core/redis_backends.py`) preserve the in-memory semantics exactly — true sliding windows (sorted sets, one member per request; token counts in a companion hash), an exact-match cache with server-side TTL and LRU size bound (index sorted set scored by last access), and the same three-state breaker with one hash per deployment (every read-modify-write inside a WATCH/MULTI transaction, so concurrent replicas serialize instead of interleaving; one replica's trip opens the circuit fleet-wide). Enable via config, no code:
+**Run multiple workers/replicas (Redis backends)**: the shipped `RedisRateLimiter` / `RedisResponseCache` / `RedisCircuitBreakerRegistry` (`core/redis_backends.py`) preserve the in-memory semantics exactly — true sliding windows (sorted sets, one member per request; token counts in a companion hash), an exact-match cache with server-side TTL and LRU size bound (index sorted set scored by last access; tier 54: the TTL is per-entry — the writer's window — with a companion timestamp key for freshness readers, see the module map), and the same three-state breaker with one hash per deployment (every read-modify-write inside a WATCH/MULTI transaction, so concurrent replicas serialize instead of interleaving; one replica's trip opens the circuit fleet-wide). Enable via config, no code:
 
 ```yaml
 redis:
@@ -3151,6 +3212,31 @@ tests/
 │                        RS256 via JWKS (caching, kid-rotation refresh, 503 when
 │                        the IdP is down), custom Authenticator steps, invalid
 │                        chain entries failing at construction
+├── test_key_cache_policy.py  Per-key cache policy (tier 54, the §8.2 item-6
+│                        close): bypass opts out of BOTH caches for
+│                        lookup AND store (chat, stream, semantic
+│                        near-duplicates, embeddings — BYPASS header,
+│                        upstream called every time, no entry ever
+│                        written, no miss ever counted), the window is
+│                        two-sided (read-side freshness via _store
+│                        time-travel — an entry past a caller's window
+│                        is a miss without being deleted while a
+│                        longer-window caller keeps serving it;
+│                        write-side lifetime — a 600s key's entry
+│                        outlives the global 300, the store tuple
+│                        stamps the writer's window, and a global-
+│                        window write stays the default), global-off
+│                        stays off for every key (MISS, not BYPASS —
+│                        the narrowing boundary), idempotency is
+│                        deliberately unaffected (Idempotency-Key
+│                        replays IDEMPOTENT for an opted-out caller,
+│                        one upstream call), tenants carry the policy
+│                        (same-tenant keys share entries, each
+│                        window its own), and the admin API contract:
+│                        create echo, ge=1 validation 400s, live
+│                        PATCH toggles (opt-out stops serving the
+│                        existing entry — reset-to-inherit serves it
+│                        again; window shrink/reset likewise)
 ├── test_key_rotation.py  Tier 51: rotate issues a new raw key once (old prefix
 │                        kept for display, hashes never exposed), both
 │                        credentials inside grace, honest post-grace 401
@@ -3177,7 +3263,10 @@ tests/
 ├── test_admin_ui.py     Dashboard shell served unauthenticated at /admin/ui (all data
 │                        endpoints still 401), /admin 307 redirect, offline invariant
 │                        (no http/https substrings), tenants surface (table, dialog,
-│                        key-dialog tenancy) markers, /admin/logs/{id} full row incl.
+│                        key-dialog tenancy) markers, key-dialog per-key cache
+│                        policy markers (tier 54: k-cache select, k-cache-ttl
+│                        window, submit wiring + create-mode null-deletion,
+│                        row badge), /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,
 │                        tool_result, images, stop reasons, error chunks) + e2e through
@@ -3251,7 +3340,16 @@ tests/
 ├── test_observability.py  OTel span tree/attributes/parenting, W3C propagation, streaming
 │                        span lifetime, retry/fallback events, TTFT + in-flight metrics
 ├── test_redis_backends.py  Redis limiter/cache semantics (fakeredis, deterministic clock)
-│                        + e2e on Redis backends incl. two apps sharing one client
+│                        + e2e on Redis backends incl. two apps sharing one client;
+│                        tier 54 units — per-entry EX carries the
+│                        writer's window, custom-window writes store a
+│                        companion :t timestamp read-side (max_age
+│                        freshness miss deletes nothing), default
+│                        writes add no companion (namespace preserved,
+│                        overwrite drops the stale one), companionless
+│                        entries recover age from remaining TTL,
+│                        eviction + clear clean companions
+│                        bytes-safely
 ├── test_breaker.py       Circuit state machine (injectable clock), router trip/skip/recover
 │                        incl. streaming, all-open bypass, admin reset, gauge + trace event
 ├── test_redis_breaker.py  RedisCircuitBreakerRegistry: state machine vs fakeredis with a
@@ -3500,7 +3598,11 @@ tests/
 │                        independent, shadow mirrors excluded, overflow
 │                        collapses past per_key_max_series
 ├── test_semantic_cache.py  cosine_similarity + SemanticCache units (threshold, TTL via
-│                        injectable clock, LRU bound, model isolation, embed failure)
+│                        injectable clock, LRU bound, model isolation, embed failure;
+│                        tier 54 — the two-sided window: a longer
+│                        per-entry TTL outlives the configured global,
+│                        a reader's max_age freshness-misses without
+│                        deleting the entry)
 │                        + e2e with a deterministic fake embedder (SEMANTIC header,
 │                        stream replay, exact-hit precedence, model isolation, threshold)
 │                        + real router-embedder wiring + startup disable on bad model

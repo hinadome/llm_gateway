@@ -111,6 +111,23 @@ class VirtualKey(Base):
     # Guardrail names that are skipped for requests authenticated with this
     # key — a runtime override of config scoping (see GuardrailScope).
     disabled_guardrails: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    # Per-key cache policy (tier 54 — the §8.2 item-6 gap closes): the
+    # response caches were global; now each key can opt out or set its
+    # own window. cache_enabled: NULL = inherit the global cache.enabled;
+    # false = this key's requests bypass BOTH response caches (exact +
+    # semantic, chat and embeddings alike) for lookup AND store — never
+    # served from the cache, never writing entries. It can only narrow:
+    # a global cache.enabled=false stays off for every key.
+    # cache_ttl_seconds: NULL = the global cache.ttl_seconds governs;
+    # otherwise this key's own window, honored on BOTH sides — a hit
+    # serves only entries fresh enough for the caller (read-side bound),
+    # and an entry written by this key's request lives the writer's
+    # window (write-side lifetime, so a window LONGER than the global
+    # one is actually possible). Entries are shared across keys with
+    # the same response-policy token; each caller's window is their
+    # own staleness tolerance, so nobody is served beyond it.
+    cache_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    cache_ttl_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Per-key model routing (LiteLLM-style per-team config): requested
     # name -> public model name, applied before global aliases — an
     # explicit admin decision for this key wins, even over real public
@@ -187,6 +204,8 @@ class VirtualKey(Base):
             "budget_alerts_fired": self.budget_alerts_fired,
             "expiry_alerts_fired": self.expiry_alerts_fired,
             "disabled_guardrails": self.disabled_guardrails,
+            "cache_enabled": self.cache_enabled,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
             "required_residencies": self.required_residencies,
             "model_mappings": self.model_mappings,
             "default_model": self.default_model,

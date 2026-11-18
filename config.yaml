@@ -339,6 +339,15 @@ cache:
   # backend: memory (default) | redis — redis shares cache entries across
   # workers/replicas (requires the redis section below)
   backend: memory
+  # Per-key overrides live on the key row (admin API/UI, tier 54), not
+  # here: a key's cache_enabled: false opts it out of BOTH response
+  # caches (exact + semantic, chat and embeddings alike) — lookup AND
+  # store; it can only narrow, so enabled: false above stays off for
+  # every key regardless. A key's cache_ttl_seconds is its own window,
+  # honored two-sided: a hit serves only entries within the caller's
+  # window (read-side freshness bound) and entries the key writes live
+  # that window (write-side lifetime — a window longer than the global
+  # ttl_seconds is possible). NULL on the key row = inherit this block.
 
 # Semantic (approximate-match) cache, on top of the exact cache above:
 # after an exact miss, embed the normalized request and serve the best
