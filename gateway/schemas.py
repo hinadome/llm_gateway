@@ -110,6 +110,31 @@ class ChatCompletionRequest(BaseModel):
         return self.max_completion_tokens or self.max_tokens
 
 
+class PlaygroundChatRequest(BaseModel):
+    """POST /admin/playground/chat body (tier 41): one chat completion
+    typed into the admin dashboard, executed through the REAL pipeline
+    — the same auth-context snapshot a live request from that key would
+    get (budgets, residency, guardrail scopes, rate limits), the same
+    routing, caching and billing. ``key`` names a virtual key from
+    /admin/keys to impersonate (None = the calling platform admin's
+    own context — unrestricted); the impersonated key is the one the
+    request is billed to. Non-streaming only: ``stream: true`` is an
+    explicit 400 — the playground is one request, one answer, one
+    diagnostics panel.
+    """
+
+    key: str | None = None
+    model: str
+    messages: list[Message]
+    # The two knobs a chat box offers. Everything else rides the
+    # pipeline's defaults, exactly as a plain /v1 request would.
+    temperature: float | None = None
+    max_tokens: int | None = None
+    # Declared (not an ignored extra) so refusing it is an explicit,
+    # explained 400.
+    stream: bool = False
+
+
 class EmbeddingRequest(BaseModel):
     """POST /v1/embeddings body (OpenAI schema, extras allowed).
 

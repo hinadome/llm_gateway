@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 84 Python files, ~30,200 lines, 1154 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 84 Python files, ~30,400 lines, 1167 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -107,7 +107,13 @@ gateway/
 ├── schemas.py              OpenAI-compatible pydantic models (request, response, chunks, admin);
 │                           ChatCompletionRequest carries private attrs (never serialized,
 │                           excluded from cache identity/logs) for the native Responses
-│                           southbound — the bridge body + pristine-messages snapshot
+│                           southbound — the bridge body + pristine-messages snapshot;
+│                           PlaygroundChatRequest (tier 41) is the closed admin
+│                           surface's body — key optional (the impersonated
+│                           key's name), model + messages required, the two
+│                           chat knobs, and stream DECLARED (default false)
+│                           so refusing it is an explicit explained 400
+│                           instead of an ignored extra
 ├── errors.py               OpenAI-style error envelope + typed errors (ProviderError, GuardrailBlocked,
 │                           RateLimitError, BudgetExceededError, ...)
 ├── models.py / db.py       SQLAlchemy ORM (Tenant, VirtualKey, RequestLog, Prompt,
@@ -436,6 +442,39 @@ gateway/
 │                           back, never an automatic one;
 │                           ?model=/?deployment= narrow, ?since=
 │                           (ISO-8601) overrides every window;
+│                           POST /admin/playground/chat (tier 41, same
+│                           platform-admin boundary) is the
+│                           dashboard's own chat client — one
+│                           completion through the REAL pipeline: the
+│                           optional body key names a virtual key to
+│                           impersonate, resolved through the same
+│                           chain the JWT auth step uses (name ->
+│                           active/expiry -> tenant ->
+│                           auth_context_from_key), so the
+│                           impersonated key's allowlists, budgets,
+│                           residency, guardrail scopes and rate
+│                           limits bind and its spend accrues
+│                           (omitted = the calling admin's own,
+│                           unrestricted context); auth_method
+│                           "playground" labels every row and event;
+│                           route="chat" keeps guardrail route-scopes
+│                           identical; stream:true is an explicit
+│                           400; the answer wraps the client-facing
+│                           completion (verbatim, json off the
+│                           pipeline's JSONResponse) beside the
+│                           request-log row the run just wrote as
+│                           diagnostics (request id, key,
+│                           model/deployment/provider, status,
+│                           tokens, cost, latency, cache-hit,
+│                           guardrail verdicts) read back by
+│                           request_id — one honest source, the same
+│                           row /admin/logs shows and the export
+│                           bills; errors pass through verbatim (the
+│                           GatewayError re-raised into the standard
+│                           envelope) while every attempt — success,
+│                           blocked or failed — is audited as
+│                           playground.chat with the calling admin
+│                           as the actor;
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -1630,7 +1669,23 @@ gateway/
                             requests/errors, latency mean, the latency
                             delta vs the tier peers pulled from the
                             recommendation's checks, cost mean, and
-                            the watching-since column —
+                            the watching-since column — and tier 41
+                            adds the Playground tab between
+                            Guardrails and System: model dropdown
+                            (from /admin/routing) + key dropdown
+                            (from /admin/keys, empty = the admin's
+                            own context) + max-tokens/temperature
+                            knobs, a client-side conversation where
+                            each Send posts the whole history to
+                            POST /admin/playground/chat (a real
+                            multi-turn body), and a diagnostics
+                            panel rendering the request-log row the
+                            run just wrote (key with auth_method,
+                            route/status, deployment, provider,
+                            cache hit, tokens, cost, latency,
+                            guardrail verdicts — errors render there
+                            as the envelope the real client would
+                            receive) —
                             guardrail inventory, system (health/readiness,
                             config reload, backups). A test enforces the
                             no-external-resources invariant.
@@ -2769,6 +2824,49 @@ tests/
 │                        + e2e with a deterministic fake embedder (SEMANTIC header,
 │                        stream replay, exact-hit precedence, model isolation, threshold)
 │                        + real router-embedder wiring + startup disable on bad model
+├── test_playground.py   Admin playground (tier 41): the schema unit
+│                        (key optional, knobs default, stream DECLARED
+│                        so the refusal is the endpoint's explicit
+│                        400, never a silent ignore) and the e2e —
+│                        the happy path (the admin's own context: the
+│                        response is the exact client-facing
+│                        completion, diagnostics = the request-log row
+│                        — request id == X-Request-Id, key "admin",
+│                        auth_method "playground", route "chat",
+│                        status/tokens/cost/latency/cache-hit/
+│                        guardrail_actions all pinned), impersonation
+│                        (spend accrues to the key row after the
+│                        background drain, the log row carries the
+│                        key's name + id + auth_method —
+│                        indistinguishable from live traffic except
+│                        the label), guardrail verdicts (PII masked
+│                        in the client-facing content, the modify
+│                        verdict in diagnostics), the blocked run
+│                        (BADOUTPUT: the completion ships verbatim
+│                        with finish_reason content_filter while the
+│                        diagnostics say status "blocked" + the
+│                        output_moderation block), the cache hit (an
+│                        identical repeat answers from the response
+│                        cache and its diagnostics say so), rate
+│                        limits (the impersonated key's rpm_limit
+│                        binds: first 200, second the same 429 a
+│                        real client gets), errors verbatim (both
+│                        upstream models failed — the default env has
+│                        a priority-200 fallback a real failure must
+│                        exhaust — playground and /v1 produce the
+│                        same envelope shape), key resolution (404
+│                        unknown, 400 key_inactive, 400 expired —
+│                        the JWT chain's semantics in the admin's
+│                        vocabulary), stream rejected (400
+│                        stream_not_supported), permissions (403
+│                        tenant-admin/plain, the 400 validation
+│                        envelope for missing model/messages, an
+│                        unknown model passing through to the
+│                        router's own 404), and the audit trail (via
+│                        the audit webhook sink: playground.chat
+│                        records for success, error and no-key runs,
+│                        actor = the calling admin, details = key/
+│                        model/request_id/outcome/cost)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while

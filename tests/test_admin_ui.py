@@ -203,6 +203,37 @@ async def test_admin_ui_watch_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_playground_surface(env):
+    # Tier 41: the Playground tab — the dashboard's own chat client
+    # (POST /admin/playground/chat): model dropdown from /admin/routing
+    # and key dropdown from /admin/keys (empty = the admin's own
+    # context), max-tokens/temperature knobs, a client-side conversation
+    # list where each Send posts the whole history, and a diagnostics
+    # panel rendering the request-log row the run just wrote (key,
+    # route/status, deployment, provider, cache hit, tokens, cost,
+    # latency, guardrail verdicts) — with the error envelope a real
+    # client would receive on failure. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'data-tab="playground"',
+        'id="tab-playground"',
+        'id="pg-model"',
+        'id="pg-key"',
+        'id="pg-max-tokens"',
+        'id="pg-temp"',
+        'id="pg-send"',
+        'id="pg-messages"',
+        'id="pg-input"',
+        'id="pg-diagnostics"',
+        'id="pg-clear"',
+        "loadPlayground",
+        "/admin/playground/chat",
+        "auth_method",
+        "guardrail_actions",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

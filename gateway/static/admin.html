@@ -181,6 +181,7 @@
   <button data-tab="logs">Request logs</button>
   <button data-tab="routing">Routing &amp; breakers</button>
   <button data-tab="guardrails">Guardrails</button>
+  <button data-tab="playground">Playground</button>
   <button data-tab="system">System</button>
   <span style="flex:1"></span>
   <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;padding:8px 0">
@@ -354,6 +355,44 @@
     <div class="panel">
       <div class="ph">Registered guardrails</div>
       <div style="overflow-x:auto"><table id="guardrails-table"></table></div>
+    </div>
+  </section>
+
+  <!-- Playground (tier 41): one chat through the real pipeline, as the admin or any key -->
+  <section class="tab" id="tab-playground">
+    <div class="panel">
+      <div class="ph">Playground
+        <div class="right muted" style="font-weight:400;font-size:12px">one chat through the REAL pipeline, as the admin or any key &middot; budgets, guardrails, rate limits &amp; billing all real &middot; non-streaming &middot; every run audited</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1.3fr 1.3fr .6fr .6fr auto;gap:8px;align-items:end;margin-bottom:12px">
+        <label class="fld">Model
+          <select id="pg-model"></select>
+        </label>
+        <label class="fld" title="Impersonate this key: its allowlists, budgets, residency, guardrail scopes and rate limits bind, and its spend accrues. Empty = the calling admin's own (unrestricted) context.">Run as key
+          <select id="pg-key"></select>
+        </label>
+        <label class="fld">Max tokens
+          <input id="pg-max-tokens" type="number" min="1" step="1" placeholder="default">
+        </label>
+        <label class="fld">Temperature
+          <input id="pg-temp" type="number" min="0" max="2" step="0.1" placeholder="default">
+        </label>
+        <button class="primary" id="pg-send">Send</button>
+      </div>
+      <div style="display:grid;grid-template-columns:3fr 2fr;gap:14px">
+        <div>
+          <div class="muted" style="font-size:12px;margin-bottom:6px">Conversation (kept client-side; each Send posts the whole list — a real multi-turn chat body)</div>
+          <div id="pg-messages" style="border:1px solid var(--border);border-radius:8px;padding:10px;min-height:220px;max-height:340px;overflow-y:auto;display:grid;gap:8px;align-content:start"></div>
+          <input id="pg-input" placeholder="Type a message and press Enter (or Send)" style="margin-top:8px">
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button class="ghost small" id="pg-clear">Clear conversation</button>
+          </div>
+        </div>
+        <div>
+          <div class="muted" style="font-size:12px;margin-bottom:6px">Diagnostics — the request-log row the run just wrote (the same one Request logs shows and usage export bills)</div>
+          <div id="pg-diagnostics" style="border:1px solid var(--border);border-radius:8px;padding:10px;min-height:220px;overflow-y:auto"><span class="muted">Nothing run yet.</span></div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -774,6 +813,7 @@ async function refresh() {
     else if (state.tab === "logs") await loadLogs();
     else if (state.tab === "routing") await loadRouting();
     else if (state.tab === "guardrails") await loadGuardrails();
+    else if (state.tab === "playground") await loadPlayground();
     else if (state.tab === "system") await loadSystem();
     setConn(true, "connected");
   } catch (e) {
@@ -2028,6 +2068,125 @@ async function loadWatch() {
   }
   box.innerHTML = html + "</tbody>";
 }
+
+// ---------- playground (tier 41) -----------------------------------------
+// The dashboard's own chat client: POST /admin/playground/chat runs one
+// completion through the REAL pipeline as the admin or an impersonated
+// key — the same guardrails, budgets, routing, cache and billing a
+// live request would get — and returns the client-facing completion
+// beside the request-log row it just wrote. The conversation is kept
+// client-side; each Send posts the whole list, so the upstream sees a
+// real multi-turn body. Errors render in the diagnostics panel with
+// the envelope the real client would receive.
+
+const pg = { messages: [], busy: false };
+
+function pgRenderMessages() {
+  const box = $("#pg-messages");
+  box.innerHTML = pg.messages.length
+    ? pg.messages.map(m => {
+        const mine = m.role === "user";
+        return `<div style="border:1px solid var(--border);border-radius:8px;padding:8px;${mine ? "background:rgba(127,127,127,.06)" : ""}">
+          <span class="b ${mine ? "b-blue" : "b-green"}">${esc(m.role)}</span>
+          <div style="margin-top:4px;white-space:pre-wrap">${esc(m.content)}</div></div>`;
+      }).join("")
+    : '<span class="muted">No messages yet — type below.</span>';
+  box.scrollTop = box.scrollHeight;
+}
+
+function pgDiagnosticsRow(label, value) {
+  return `<span>${esc(label)}</span><span class="mono" style="word-break:break-all">${value == null ? "—" : esc(String(value))}</span>`;
+}
+
+function pgRenderDiagnostics(d, err) {
+  const box = $("#pg-diagnostics");
+  if (err) {
+    box.innerHTML = `<div><span class="b b-red">error</span>
+      <div class="mono" style="margin-top:6px;font-size:12px;word-break:break-all">${esc(err.message || String(err))}</div>
+      <div class="muted" style="margin-top:6px;font-size:12px">The envelope a real client would receive — the request still ran (and was billed) as far as the pipeline took it.</div></div>`;
+    return;
+  }
+  if (!d) { box.innerHTML = '<span class="muted">—</span>'; return; }
+  const actions = (d.guardrail_actions || []).map(a =>
+    `<div><span class="b ${a.action === "block" ? "b-red" : a.action === "modify" ? "b-amber" : "b-green"}">${esc(a.action)}</span> ` +
+    `<b>${esc(a.guardrail)}</b> <span class="muted">(${esc(a.phase)}${a.mode ? ", " + esc(a.mode) : ""})</span>` +
+    (a.reason ? `<div class="muted" style="margin:2px 0 6px">${esc(a.reason)}</div>` : "") + "</div>"
+  ).join("");
+  box.innerHTML = `
+    <div class="kv" style="grid-template-columns:auto 1fr">
+      ${pgDiagnosticsRow("request id", d.request_id)}
+      ${pgDiagnosticsRow("key", d.key ? d.key + (d.auth_method ? ` (${d.auth_method})` : "") : "—")}
+      ${pgDiagnosticsRow("model", d.model)}
+      ${pgDiagnosticsRow("route / status", (d.route || "—") + " / " + (d.status || "—"))}
+      ${pgDiagnosticsRow("deployment", d.deployment)}
+      ${pgDiagnosticsRow("provider", d.provider)}
+      ${pgDiagnosticsRow("cache", d.cache_hit ? "HIT" : "miss")}
+      ${pgDiagnosticsRow("tokens", d.prompt_tokens != null ? `${d.prompt_tokens} prompt · ${d.completion_tokens ?? 0} completion${d.cached_tokens ? " · " + d.cached_tokens + " cached" : ""}` : "—")}
+      ${pgDiagnosticsRow("cost", fmtUsd(d.cost_usd))}
+      ${pgDiagnosticsRow("latency", fmtMs(d.latency_ms))}
+    </div>
+    <h4 style="margin-top:12px">Guardrail actions</h4>
+    ${actions || '<span class="muted">none</span>'}
+    ${d.logged === false ? '<div class="muted" style="margin-top:8px;font-size:12px">No request-log row was found for this run.</div>' : ""}`;
+}
+
+async function pgSend() {
+  const input = $("#pg-input");
+  const content = input.value.trim();
+  const model = $("#pg-model").value;
+  if (!content || pg.busy) return;
+  if (!model) { toast("Pick a model first.", true); return; }
+  pg.messages.push({ role: "user", content });
+  input.value = "";
+  pgRenderMessages();
+  pg.busy = true;
+  const btn = $("#pg-send");
+  btn.disabled = true;
+  $("#pg-diagnostics").innerHTML = '<span class="muted">Running…</span>';
+  try {
+    const body = { model, messages: pg.messages.slice() };
+    if ($("#pg-key").value) body.key = $("#pg-key").value;
+    const mt = Number($("#pg-max-tokens").value);
+    if (mt > 0) body.max_tokens = mt;
+    const temp = $("#pg-temp").value;
+    if (temp !== "" && !isNaN(Number(temp))) body.temperature = Number(temp);
+    const r = await api("/admin/playground/chat", { method: "POST", body: JSON.stringify(body) });
+    const text = ((r.response || {}).choices || [])
+      .map(c => (c.message || {}).content).filter(Boolean).join("\n");
+    pg.messages.push({ role: "assistant", content: text || JSON.stringify(r.response) });
+    pgRenderMessages();
+    pgRenderDiagnostics(r.diagnostics);
+  } catch (err) {
+    pgRenderDiagnostics(null, err);
+  } finally {
+    pg.busy = false;
+    btn.disabled = false;
+  }
+}
+
+async function loadPlayground() {
+  const [routing, keys] = await Promise.all([
+    api("/admin/routing"),
+    api("/admin/keys"),
+  ]);
+  const prevModel = $("#pg-model").value;
+  $("#pg-model").innerHTML = (routing.models || [])
+    .map(m => `<option value="${esc(m.name)}"${m.name === prevModel ? " selected" : ""}>${esc(m.name)}</option>`)
+    .join("");
+  const prevKey = $("#pg-key").value;
+  $("#pg-key").innerHTML = '<option value="">(admin — unrestricted)</option>' +
+    (keys.data || []).map(k =>
+      `<option value="${esc(k.name)}"${k.name === prevKey ? " selected" : ""}>${esc(k.name)}${k.is_active ? "" : " (inactive)"}</option>`
+    ).join("");
+  pgRenderMessages();
+}
+$("#pg-send").addEventListener("click", pgSend);
+$("#pg-input").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); pgSend(); } });
+$("#pg-clear").addEventListener("click", () => {
+  pg.messages = [];
+  pgRenderMessages();
+  $("#pg-diagnostics").innerHTML = '<span class="muted">Nothing run yet.</span>';
+});
 
 // ---------- candidate trials (tier 36) ----------------------------------
 

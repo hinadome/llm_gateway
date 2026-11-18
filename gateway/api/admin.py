@@ -6,6 +6,8 @@ import csv
 import io
 import json
 import secrets
+import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -20,6 +22,12 @@ from fastapi.responses import (
 from sqlalchemy import func, select, update
 
 from ..core.alerts import BudgetAlertManager
+from ..core.auth import (  # noqa: F401 — _is_expired re-exported for the playground's key-resolution mirror
+    _is_expired,
+    auth_context_from_key,
+    get_key_by_name,
+    load_tenant_for_key,
+)
 from ..core.context import AuthContext
 from ..config import GatewayConfig
 from ..core.prompt_library import PromptLibrary
@@ -34,8 +42,10 @@ from ..errors import GatewayError
 from ..models import Feedback, RequestLog, Tenant, Trial, VirtualKey
 from ..observability.metrics import PII_FINDINGS
 from ..schemas import (
+    ChatCompletionRequest,
     KeyCreateRequest,
     KeyUpdateRequest,
+    PlaygroundChatRequest,
     PromotionRequest,
     PromptCreateRequest,
     PromptPatchRequest,
@@ -2439,6 +2449,191 @@ async def migration_watch(
                 )
     data.sort(key=lambda row: (row["model"], row["deployment"]))
     return {"data": data, "thresholds": config.migration.model_dump()}
+
+
+# -- admin playground (tier 41) ---------------------------------------------
+# The dashboard's own chat client: a request typed into the UI, run
+# through the REAL pipeline — the same auth-context snapshot, the same
+# guardrails, budgets, residency, rate limits, routing, cache and
+# billing a live request from that key would get — so "what does this
+# key actually experience?" has an answer that IS the thing, never a
+# simulation of it. Platform-admin-only: the caller may impersonate any
+# key (its budgets bind, its spend accrues), which is exactly why the
+# attempt is audited as clearly as it is granted.
+
+
+@router.post("/admin/playground/chat")
+async def playground_chat(
+    body: PlaygroundChatRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """One chat completion through the real pipeline, from the admin
+    dashboard — the completion a client would receive (verbatim, the
+    response body itself) beside the diagnostics of what happened
+    while producing it.
+
+    ``key`` names a virtual key (the human label from /admin/keys) to
+    run the request as: resolved through the same chain the JWT auth
+    step uses — name -> active/expiry checks -> tenant -> the
+    ``auth_context_from_key`` snapshot — so the request gets the
+    impersonated key's full policy reality: its model/tool allowlists,
+    its budgets and residency, its guardrail scopes and rate limits,
+    and its BILLING (spend, log rows and everything downstream accrue
+    to the key, indistinguishable from its live traffic except that
+    each row's ``auth_method`` says ``playground``). Omitted, the
+    calling platform admin's own context runs the chat — the
+    unrestricted operator view. In both cases the context is relabeled
+    ``auth_method="playground"``: log rows and audit events say how the
+    request was issued, whatever key carried it.
+
+    The request runs the exact pipeline a ``/v1/chat/completions``
+    call rides — same ``route="chat"`` (so guardrail route-scopes
+    behave identically), same guardrails, same router, same response
+    cache (a repeat request can hit it and say so in its
+    diagnostics). Errors pass through verbatim: a guardrail block, an
+    exhausted budget, a rate-limit refusal or an upstream failure
+    surfaces as the standard error envelope the real client would
+    see. Non-streaming only (``stream: true`` is an explicit 400 —
+    one request, one answer, one diagnostics panel).
+
+    The response wraps the client-facing completion in
+    ``{"response": ..., "diagnostics": ...}`` — the diagnostics are
+    the request-log row the pipeline just wrote (the same one
+    /admin/logs shows and usage export bills): request id, key,
+    model/deployment/provider, status, tokens, cost, latency,
+    cache-hit and the guardrail verdicts (``guardrail_actions``) the
+    run produced. Every playground chat is audited as
+    ``playground.chat`` with the calling admin as the actor and the
+    impersonated key, model, request id and outcome in the details —
+    an admin impersonating tenant keys is a sensitive probe, and the
+    trail is the price of the grant.
+    """
+    if body.stream:
+        raise GatewayError(
+            400,
+            "The playground is non-streaming only — one request, one "
+            "answer, one diagnostics panel (omit stream or set it false).",
+            "invalid_request_error",
+            code="stream_not_supported",
+        )
+
+    # The calling context: the impersonated key's snapshot (built by
+    # the same chain the JWT step uses) or the platform admin's own,
+    # relabeled so the row says where the request was issued.
+    if body.key is None:
+        effective_auth = replace(admin, auth_method="playground")
+    else:
+        vkey = await get_key_by_name(body.key)
+        if vkey is None:
+            raise GatewayError(
+                404, f"Key '{body.key}' not found.", "invalid_request_error"
+            )
+        if not vkey.is_active:
+            raise GatewayError(
+                400,
+                f"Key '{body.key}' is inactive — the playground runs as a "
+                "key a live request could actually use.",
+                "invalid_request_error",
+                code="key_inactive",
+            )
+        if _is_expired(vkey.expires_at):
+            raise GatewayError(
+                400, f"Key '{body.key}' has expired.", "invalid_request_error"
+            )
+        tenant = await load_tenant_for_key(vkey)
+        effective_auth = auth_context_from_key(
+            vkey, tenant=tenant, auth_method="playground"
+        )
+
+    request_id = (
+        getattr(raw_request.state, "request_id", None) or f"req_{uuid.uuid4().hex}"
+    )
+    chat_request = ChatCompletionRequest(
+        model=body.model,
+        messages=body.messages,
+        temperature=body.temperature,
+        max_tokens=body.max_tokens,
+        stream=False,
+    )
+    pipeline = raw_request.app.state.pipeline
+    try:
+        response = await pipeline.handle_chat(
+            chat_request, effective_auth, request_id=request_id, route="chat"
+        )
+    except GatewayError as exc:
+        # The error itself passes through verbatim (the real client's
+        # envelope, unchanged); the ATTEMPT is still audited — an
+        # impersonated probe that failed is as much a fact as one that
+        # succeeded.
+        raw_request.app.state.audit.record(
+            "playground.chat",
+            actor=admin,
+            key=body.key,
+            model=body.model,
+            request_id=request_id,
+            outcome="error",
+            error=exc.message,
+        )
+        raise
+
+    # The diagnostics: the row the pipeline just wrote — one honest
+    # source (the same one the logs show and the export bills). A
+    # missing row (logging off, or an exotic path) degrades to the ids
+    # we know rather than a fabricated panel.
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        log = (
+            await session.execute(
+                select(RequestLog).where(RequestLog.request_id == request_id)
+            )
+        ).scalar_one_or_none()
+    if log is None:
+        diagnostics: dict[str, Any] = {
+            "request_id": request_id,
+            "key": effective_auth.key_name,
+            "model": body.model,
+            "status": "success",
+            "guardrail_actions": [],
+            "logged": False,
+        }
+    else:
+        diagnostics = {
+            "request_id": log.request_id,
+            "key": log.key_name,
+            "key_id": log.key_id,
+            "auth_method": log.auth_method,
+            "model": log.model,
+            "deployment": log.deployment,
+            "provider": log.provider,
+            "route": log.route,
+            "status": log.status,
+            "error_message": log.error_message,
+            "prompt_tokens": log.prompt_tokens,
+            "completion_tokens": log.completion_tokens,
+            "cached_tokens": log.cached_tokens,
+            "cost_usd": log.cost_usd,
+            "latency_ms": log.latency_ms,
+            "ttft_ms": log.ttft_ms,
+            "cache_hit": bool(log.cache_hit),
+            "guardrail_actions": log.guardrail_actions or [],
+            "logged": True,
+        }
+
+    raw_request.app.state.audit.record(
+        "playground.chat",
+        actor=admin,
+        key=body.key,
+        model=body.model,
+        request_id=request_id,
+        outcome=diagnostics.get("status", "success"),
+        cost_usd=diagnostics.get("cost_usd"),
+        cache_hit=diagnostics.get("cache_hit", False),
+    )
+    return {
+        "response": json.loads(response.body),
+        "diagnostics": diagnostics,
+    }
 
 
 # -- candidate trials (tier 36) -------------------------------------------

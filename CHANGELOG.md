@@ -8,6 +8,50 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Admin playground (tier 41) — the dashboard's own chat client.
+  "What does a request from this key actually experience?" now has
+  an answer that IS the thing, not a simulation of it:
+  `POST /admin/playground/chat` (platform-admin-only) runs one chat
+  completion through the **real pipeline** and returns the
+  client-facing completion verbatim beside the diagnostics of what
+  happened while producing it.
+  - **Impersonation, not simulation.** The body's optional `key`
+    names a virtual key (the human label from `/admin/keys`),
+    resolved through the same chain the JWT auth step uses — name →
+    active/expiry checks → tenant → the `auth_context_from_key`
+    snapshot — so the request carries that key's full policy
+    reality: model/tool allowlists, budgets, residency, guardrail
+    scopes, rate limits, and **billing** (spend, log rows and usage
+    exports accrue to the key exactly as live traffic would).
+    Omitted, the calling platform admin's own (unrestricted)
+    context runs the chat. In both cases every row and audit event
+    carries `auth_method: "playground"` — the one thing separating
+    playground traffic from the key's live traffic.
+  - **The real pipeline, unchanged.** Same `route="chat"` surface as
+    `/v1/chat/completions` (guardrail route-scopes behave
+    identically), same guardrails, router, retries, response cache
+    (an identical repeat hits it — and says so) and accounting.
+    Errors pass through verbatim — a guardrail block, exhausted
+    budget, rate-limit refusal or upstream failure surfaces as the
+    exact envelope a real client would receive. Non-streaming only:
+    `stream: true` is an explicit 400.
+  - **The diagnostics are the request-log row the run just wrote** —
+    the same one `/admin/logs` shows and the usage export bills:
+    request id, key, model/deployment/provider, status (including
+    `blocked`), tokens, cost, latency, cache-hit and the
+    `guardrail_actions` verdicts. One honest source.
+  - **The trail is the price of the grant.** Every attempt —
+    success, blocked or failed — is audited as `playground.chat`
+    with the calling admin as the actor and the impersonated key,
+    model, request id and outcome in the details.
+  The admin dashboard gains a Playground tab: model dropdown (from
+  `/admin/routing`), key dropdown (from `/admin/keys`, empty =
+  admin), max-tokens/temperature knobs, a client-side conversation
+  where each Send posts the whole history (a real multi-turn body),
+  and the diagnostics panel — errors render there as the envelope
+  the real client would see. 12 tests + a UI-surface pin
+  (`tests/test_playground.py`, `tests/test_admin_ui.py`); the suite
+  stands at 1167.
 - Post-promotion watch (tier 40) — the migration story continued
   after the promotion flips the candidate live. Promotion ended the
   mirrors: the candidate serves, the pair-shaped evidence stops, and
