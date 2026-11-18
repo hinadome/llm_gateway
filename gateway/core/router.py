@@ -23,7 +23,7 @@ import httpx
 from opentelemetry import trace
 
 from ..config import DeploymentConfig, GatewayConfig, ProviderConfig
-from ..errors import ModelNotFoundError, ProviderError
+from ..errors import GatewayError, ModelNotFoundError, ProviderError
 from ..schemas import (
     ChatCompletionRequest,
     EmbeddingRequest,
@@ -82,11 +82,21 @@ def embed_fn_for(router: "Router", model: str) -> Callable[[str], Awaitable[list
     to the gateway's provider key, not the caller's virtual key, and it
     bypasses the response cache by design (``Router.embed`` never
     consults it, so there is no recursion).
+
+    The embedder accepts an optional ``residencies`` argument (the
+    CALLER's effective data-residency requirement) so a restricted
+    caller's prompt is only embedded compliantly: the router filters
+    to residency-tagged deployments, and a model with no compliant
+    deployment raises — which the semantic cache treats as a miss
+    (restricted callers simply lose semantic-cache hits, never
+    correctness).
     """
 
-    async def embed(text: str) -> list[float]:
+    async def embed(
+        text: str, residencies: frozenset[str] | None = None
+    ) -> list[float]:
         request = EmbeddingRequest(model=model, input=text)
-        _, response = await router.embed(request)
+        _, response = await router.embed(request, residencies)
         data = response.get("data") or [{}]
         embedding = (data[0] or {}).get("embedding")
         if not embedding:
@@ -147,18 +157,41 @@ class Router:
 
     # -- selection -------------------------------------------------------------
 
-    def resolve(self, public_model: str) -> list[DeploymentConfig]:
+    def resolve(
+        self, public_model: str, residencies: frozenset[str] | None = None
+    ) -> list[DeploymentConfig]:
         """Serving deployments for a public model, priority-sorted.
 
         Shadow deployments are excluded: they never serve client traffic
         (use ``shadow_deployments`` to find the mirroring targets for a
         model). A model whose deployments are *all* shadow cannot serve
         and fails loudly with a 503 rather than a confusing 404.
+
+        ``residencies`` (the caller's effective data-residency
+        requirement, None = unrestricted) filters the list to
+        deployments whose ``residency`` tag is in the set — BEFORE the
+        priority ladder, retries and fallbacks, so a constrained
+        request can never escape to a non-compliant deployment mid-
+        failover. An untagged deployment satisfies no requirement
+        (fail closed: no claim, no compliance). A model with no
+        compliant deployment fails with 404 residency_not_satisfied.
         """
         deployments = self._groups.get(public_model)
         if not deployments:
             raise ModelNotFoundError(public_model)
         serving = [d for d in deployments if not d.shadow]
+        if residencies is not None:
+            serving = [d for d in serving if d.residency in residencies]
+            if not serving:
+                raise GatewayError(
+                    404,
+                    f"Model '{public_model}' has no deployment satisfying "
+                    f"the data-residency requirement "
+                    f"({', '.join(sorted(residencies)) or 'none'}).",
+                    "invalid_request_error",
+                    code="residency_not_satisfied",
+                    param="model",
+                )
         if not serving:
             raise ProviderError(
                 503,
@@ -168,12 +201,21 @@ class Router:
             )
         return serving
 
-    def shadow_deployments(self, public_model: str) -> list[DeploymentConfig]:
-        """Shadow (mirroring-target) deployments attached to a model."""
+    def shadow_deployments(
+        self, public_model: str, residencies: frozenset[str] | None = None
+    ) -> list[DeploymentConfig]:
+        """Shadow (mirroring-target) deployments attached to a model —
+        filtered by the caller's residency requirement too: a mirror is
+        a copy of the caller's data, so it may only land on compliant
+        deployments. Non-compliant shadows silently receive nothing (the
+        mirror is best-effort by design)."""
         deployments = self._groups.get(public_model)
         if not deployments:
             return []
-        return [d for d in deployments if d.shadow]
+        shadows = [d for d in deployments if d.shadow]
+        if residencies is not None:
+            shadows = [d for d in shadows if d.residency in residencies]
+        return shadows
 
     def find_deployment(self, name: str) -> DeploymentConfig | None:
         """A deployment by its config name, across all models (used by the
@@ -255,13 +297,20 @@ class Router:
     # -- non-streaming -----------------------------------------------------------
 
     async def _dispatch(
-        self, model: str, call: Callable[..., Awaitable]
+        self,
+        model: str,
+        call: Callable[..., Awaitable],
+        residencies: frozenset[str] | None = None,
     ) -> tuple[DeploymentConfig, Any]:
         """Shared non-streaming executor for every modality: resolve →
         breaker filter → retry/backoff per deployment → fallback across
         deployments. ``call(adapter, deployment, provider_cfg, timeout)``
-        performs the provider call and returns its response."""
-        deployments = self.resolve(model)
+        performs the provider call and returns its response.
+        ``residencies`` is the caller's effective data-residency
+        requirement (None = unrestricted) — it filters the candidate
+        list before anything else, so retries and fallbacks can never
+        escape to a non-compliant deployment."""
+        deployments = self.resolve(model, residencies)
         remaining = await self._available(deployments)
         last_error: ProviderError | None = None
         tried: set[str] = set()
@@ -308,68 +357,109 @@ class Router:
 
         raise last_error or ProviderError(502, "All deployments failed", "api_error")
 
-    async def complete(self, request: ChatCompletionRequest) -> tuple[DeploymentConfig, dict]:
+    async def complete(
+        self,
+        request: ChatCompletionRequest,
+        residencies: frozenset[str] | None = None,
+    ) -> tuple[DeploymentConfig, dict]:
         return await self._dispatch(
-            request.model, lambda a, d, pc, t: a.complete(d, request, pc, t)
+            request.model,
+            lambda a, d, pc, t: a.complete(d, request, pc, t),
+            residencies,
         )
 
-    async def embed(self, request: EmbeddingRequest) -> tuple[DeploymentConfig, dict]:
+    async def embed(
+        self,
+        request: EmbeddingRequest,
+        residencies: frozenset[str] | None = None,
+    ) -> tuple[DeploymentConfig, dict]:
         """Route an embeddings request — same retry/fallback/breaker
-        contract as ``complete`` (embeddings are never streamed)."""
+        contract as ``complete`` (embeddings are never streamed).
+        ``residencies``: the caller's effective data-residency
+        requirement (None = unrestricted) — filters the candidate
+        deployments before the priority ladder."""
         return await self._dispatch(
-            request.model, lambda a, d, pc, t: a.embed(d, request, pc, t)
+            request.model,
+            lambda a, d, pc, t: a.embed(d, request, pc, t),
+            residencies,
         )
 
     async def generate_image(
-        self, request: ImageGenerationRequest
+        self,
+        request: ImageGenerationRequest,
+        residencies: frozenset[str] | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         """Route an image-generation request (same contract as embed)."""
         return await self._dispatch(
-            request.model, lambda a, d, pc, t: a.generate_image(d, request, pc, t)
+            request.model,
+            lambda a, d, pc, t: a.generate_image(d, request, pc, t),
+            residencies,
         )
 
     async def edit_image(
-        self, request: ImageEditRequest
+        self,
+        request: ImageEditRequest,
+        residencies: frozenset[str] | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         """Route an image-edit request (uploaded image(s) + prompt)."""
         return await self._dispatch(
-            request.model, lambda a, d, pc, t: a.edit_image(d, request, pc, t)
+            request.model,
+            lambda a, d, pc, t: a.edit_image(d, request, pc, t),
+            residencies,
         )
 
     async def vary_image(
-        self, request: ImageVariationRequest
+        self,
+        request: ImageVariationRequest,
+        residencies: frozenset[str] | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         """Route an image-variation request (uploaded image, no prompt)."""
         return await self._dispatch(
-            request.model, lambda a, d, pc, t: a.vary_image(d, request, pc, t)
+            request.model,
+            lambda a, d, pc, t: a.vary_image(d, request, pc, t),
+            residencies,
         )
 
     async def transcribe(
-        self, request: TranscriptionRequest
+        self,
+        request: TranscriptionRequest,
+        residencies: frozenset[str] | None = None,
     ) -> tuple[DeploymentConfig, tuple[dict | str, str]]:
         """Route an audio transcription/translation request."""
         return await self._dispatch(
-            request.model, lambda a, d, pc, t: a.transcribe(d, request, pc, t)
+            request.model,
+            lambda a, d, pc, t: a.transcribe(d, request, pc, t),
+            residencies,
         )
 
-    async def speak(self, request: SpeechRequest) -> tuple[DeploymentConfig, tuple[bytes, str]]:
+    async def speak(
+        self,
+        request: SpeechRequest,
+        residencies: frozenset[str] | None = None,
+    ) -> tuple[DeploymentConfig, tuple[bytes, str]]:
         """Route a text-to-speech request (buffered; audio is not streamed
         through the gateway in this version)."""
         return await self._dispatch(
-            request.model, lambda a, d, pc, t: a.speak(d, request, pc, t)
+            request.model,
+            lambda a, d, pc, t: a.speak(d, request, pc, t),
+            residencies,
         )
 
     # -- streaming ---------------------------------------------------------------
 
     async def complete_stream(
-        self, request: ChatCompletionRequest
+        self,
+        request: ChatCompletionRequest,
+        residencies: frozenset[str] | None = None,
     ) -> tuple[DeploymentConfig, AsyncIterator[dict]]:
         """Start a streamed completion.
 
         Failover happens until the *first chunk* has been received; once the
         stream is committed, upstream errors surface to the client.
+        ``residencies`` filters the candidate ladder before anything
+        else — same fail-closed contract as ``_dispatch``.
         """
-        deployments = self.resolve(request.model)
+        deployments = self.resolve(request.model, residencies)
         remaining = await self._available(deployments)
         last_error: ProviderError | None = None
         tried: set[str] = set()

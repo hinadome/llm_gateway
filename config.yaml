@@ -32,6 +32,19 @@ models:
     # unmanaged. Declare it once here, not in guardrail params.
     context_window: 128000
     deployments:
+      # Each deployment may carry a `residency` tag (lowercase slug,
+      # e.g. "eu"): the operator's assertion of where it processes
+      # data. Keys/tenants with required_residencies (POST/PATCH
+      # /admin/keys, /admin/tenants, admin UI) may only be served —
+      # and shadow-mirrored — by deployments whose tag is in their
+      # effective set; an untagged deployment satisfies NO requirement
+      # (fail closed: no claim, no compliance), and a model with no
+      # compliant deployment answers 404 residency_not_satisfied.
+      # The requirement intersects key and tenant (tenant can only
+      # narrow), filters the priority ladder BEFORE retries/fallbacks,
+      # and rides the cache policy token so residency classes never
+      # share entries. No deployments are tagged here: where YOUR
+      # providers actually process data is yours to assert.
       - name: openai/gpt-4o
         provider: openai
         model: gpt-4o

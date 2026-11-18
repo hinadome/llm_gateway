@@ -136,11 +136,21 @@ class GuardrailManager:
             if not can_touch_response:
                 continue
             parts.append([g.name, g.params])
-        payload = json.dumps(
-            {"tenant_id": ctx.auth.tenant_id, "response_guardrails": parts},
-            sort_keys=True,
-            default=repr,
-        )
+        payload_dict: dict[str, Any] = {
+            "tenant_id": ctx.auth.tenant_id,
+            "response_guardrails": parts,
+        }
+        # Data-residency requirement (tier 28): an entry produced by an
+        # unrestricted call may have been generated on a deployment a
+        # restricted caller may not use — serving it would hand them
+        # content of non-compliant origin. Residency classes therefore
+        # never share entries. Only added when a requirement exists, so
+        # unrestricted callers keep their exact pre-tier-28 tokens
+        # (existing cache entries stay valid).
+        residencies = ctx.auth.effective_residencies()
+        if residencies is not None:
+            payload_dict["required_residencies"] = sorted(residencies)
+        payload = json.dumps(payload_dict, sort_keys=True, default=repr)
         return hashlib.sha256(payload.encode()).hexdigest()
 
     # -- scoping ----------------------------------------------------------------

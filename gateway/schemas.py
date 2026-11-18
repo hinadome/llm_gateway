@@ -9,7 +9,9 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+
+from .config import normalize_residencies
 
 
 # --------------------------------------------------------------------------
@@ -322,7 +324,21 @@ class ChatCompletionChunk(BaseModel):
 # --------------------------------------------------------------------------
 
 
-class KeyCreateRequest(BaseModel):
+class _ResidencyRequirement(BaseModel):
+    """Shared field + normalization for the data-residency requirement
+    (tier 28): deployment tags that may serve the caller's traffic.
+    Tags are lowercased slugs; None or [] = no requirement (an
+    explicit empty list on PATCH clears it, exactly like null)."""
+
+    required_residencies: list[str] | None = None
+
+    @field_validator("required_residencies")
+    @classmethod
+    def _normalize_residency_tags(cls, value: list[str] | None) -> list[str] | None:
+        return normalize_residencies(value)
+
+
+class KeyCreateRequest(_ResidencyRequirement):
     name: str
     # Admin grants access to the admin API. With no tenant: a platform
     # admin (deliberate delegation, same power as the operator). Inside
@@ -340,9 +356,13 @@ class KeyCreateRequest(BaseModel):
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None  # UTC calendar-day cap
     monthly_budget_usd: float | None = None  # UTC calendar-month cap
-    expires_at: str | None = None  # ISO-8601
+    expires_at: str | None = None
     metadata: dict[str, Any] | None = None
     disabled_guardrails: list[str] | None = None  # guardrail names to skip
+    # Data-residency requirement: deployment tags that may serve this
+    # key's traffic (None = unrestricted). Lowercased slugs; intersected
+    # with the tenant's requirement — the tenant can only narrow.
+    # (Field + normalization inherited from _ResidencyRequirement.)
     # Per-key model routing: requested-name -> public-model (applied before
     # global aliases, wins even over real public names), plus this key's
     # default-model catch-all.
@@ -369,7 +389,7 @@ class KeyCreateRequest(BaseModel):
     tenant_id: str | None = None
 
 
-class KeyUpdateRequest(BaseModel):
+class KeyUpdateRequest(_ResidencyRequirement):
     allowed_models: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
@@ -393,7 +413,7 @@ class KeyUpdateRequest(BaseModel):
     tenant_id: str | None = None
 
 
-class TenantCreateRequest(BaseModel):
+class TenantCreateRequest(_ResidencyRequirement):
     """POST /admin/tenants — create a tenant (platform admins only)."""
 
     # Slug: it surfaces in API responses, log filters and the
@@ -414,12 +434,16 @@ class TenantCreateRequest(BaseModel):
     # requests (None = tenant sets none; a member must pass both its
     # own cap and the tenant's).
     max_concurrency: int | None = Field(default=None, ge=1)
+    # Data-residency requirement, pooled across every member key:
+    # deployment tags that may serve member traffic. Intersected with
+    # each key's own requirement — the tenant can only narrow.
+    # (Field + normalization inherited from _ResidencyRequirement.)
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None  # UTC calendar-day cap
     monthly_budget_usd: float | None = None  # UTC calendar-month cap
 
 
-class TenantUpdateRequest(BaseModel):
+class TenantUpdateRequest(_ResidencyRequirement):
     """PATCH /admin/tenants/{id} — every field optional, like keys."""
 
     display_name: str | None = Field(default=None, max_length=128)

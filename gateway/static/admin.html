@@ -377,6 +377,9 @@
         <label class="fld">TPM limit <input id="k-tpm" type="number" min="0" placeholder="unlimited"></label>
         <label class="fld" title="Concurrency admission: max requests this key may hold in-flight against the upstream at once (RPM/TPM bound the rate, this bounds the parallelism). Requests past the cap queue for concurrency.wait_seconds, then 429. Empty = unlimited.">Max concurrent <input id="k-conc" type="number" min="1" placeholder="unlimited"></label>
         <label class="fld" title="QoS class under concurrency contention: when a cap (the key's or its tenant's) is contended, waiters are admitted highest-priority-first, FIFO within a class. Only matters when a cap is set somewhere. Empty = 0.">Priority <input id="k-priority" type="number" min="-1000" max="1000" placeholder="0"></label>
+        <label class="fld" title="Data-residency requirement: comma-separated deployment tags (lowercase slugs, e.g. eu, eu-west) that may serve this key's traffic. Intersected with the tenant's requirement — the tenant can only narrow. Untagged deployments satisfy no requirement (fail closed: 404 when nothing complies). Empty = unrestricted.">Residency tags (comma-separated; empty = any)
+          <input id="k-res" placeholder="eu, eu-west" autocomplete="off">
+        </label>
         <label class="fld">Max budget (USD) <input id="k-budget" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld">Expires at <input id="k-expires" type="datetime-local"></label>
         <label class="fld" title="Spend cap per UTC calendar day; resets at 00:00 UTC">
@@ -418,6 +421,9 @@
         <label class="fld" title="Pooled spend cap per UTC calendar month; resets on the 1st at 00:00 UTC">Monthly budget (USD) <input id="t-monthly" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld" title="Cost-plus billing: percent markup on provider cost for every member-key request (20 = bill 1.2x). Spend, budgets, logs and exports record the billed cost; gateway_cost_usd_total stays actual. Empty = no markup.">Markup % <input id="t-markup" type="number" min="0" max="1000" step="0.1" placeholder="none"></label>
         <label class="fld" title="Pooled concurrency ceiling: max simultaneous upstream requests across every member key (each member still passes its own cap too; the tenant can only narrow). Empty = the tenant sets none.">Max concurrent <input id="t-conc" type="number" min="1" placeholder="unlimited"></label>
+        <label class="fld" title="Pooled data-residency requirement: comma-separated deployment tags that may serve member traffic, intersected with each key's own requirement — the tenant can only narrow. Untagged deployments satisfy no requirement (fail closed: 404 when nothing complies). Empty = the tenant sets none.">Residency tags (comma-separated; empty = any)
+          <input id="t-res" placeholder="eu" autocomplete="off">
+        </label>
       </div>
       <label class="fld" style="grid-template-columns:auto 1fr;display:grid;gap:8px;align-items:center;color:var(--text)" id="t-active-row" title="Kill switch: while disabled, every member key fails closed (401) until re-enabled — spend state and keys are untouched.">
         <input type="checkbox" id="t-active" checked style="width:16px;height:16px;accent-color:var(--accent)"> Active
@@ -749,6 +755,9 @@ async function loadKeys() {
     const concBadge = k.max_concurrency != null
       ? ` <span class="b b-blue" title="Concurrency cap: at most ${k.max_concurrency} in-flight upstream request${k.max_concurrency === 1 ? "" : "s"}; past it, requests queue then 429. Priority ${k.priority || 0} under contention.">⇶${k.max_concurrency}${k.priority ? " p" + k.priority : ""}</span>`
       : "";
+    const resBadge = (k.required_residencies || []).length
+      ? ` <span class="b b-purple" title="Data-residency requirement: only deployments tagged ${(k.required_residencies || []).map(esc).join(" or ")} may serve this key (intersected with its tenant's requirement); untagged deployments never qualify.">⌖ ${(k.required_residencies || []).map(esc).join(",")}</span>`
+      : "";
     const expired = k.expires_at && new Date(k.expires_at) < new Date();
     const tenantBadge = k.tenant_id
       ? ` <span class="b b-purple" title="Tenant: must also pass this tenant's pooled policy ceiling (models, RPM/TPM, budgets)">${esc(state.tenantNames[k.tenant_id] || k.tenant_id)}</span>`
@@ -760,7 +769,7 @@ async function loadKeys() {
       <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
-      <td>${models}${grOff}${scoped}${ipLock}${promptPolicy}${concBadge}</td>
+      <td>${models}${grOff}${scoped}${ipLock}${promptPolicy}${concBadge}${resBadge}</td>
       <td class="num">${k.rpm_limit == null ? "—" : fmtInt(k.rpm_limit)} / ${k.tpm_limit == null ? "—" : fmtInt(k.tpm_limit)}</td>
       <td>${budgetCell}</td>
       <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
@@ -820,6 +829,7 @@ function openKeyDialog(k) {
   $("#k-tpm").value = k && k.tpm_limit != null ? k.tpm_limit : "";
   $("#k-conc").value = k && k.max_concurrency != null ? k.max_concurrency : "";
   $("#k-priority").value = k && k.priority != null && k.priority !== 0 ? k.priority : "";
+  $("#k-res").value = k && k.required_residencies ? k.required_residencies.join(", ") : "";
   $("#k-budget").value = k && k.max_budget_usd != null ? k.max_budget_usd : "";
   $("#k-daily").value = k && k.daily_budget_usd != null ? k.daily_budget_usd : "";
   $("#k-monthly").value = k && k.monthly_budget_usd != null ? k.monthly_budget_usd : "";
@@ -868,6 +878,8 @@ async function submitKeyDialog() {
       ? $("#k-endpoints").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     allowed_ips: $("#k-ips").value.trim()
       ? $("#k-ips").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    required_residencies: $("#k-res").value.trim().toLowerCase()
+      ? $("#k-res").value.split(",").map(s => s.trim().toLowerCase()).filter(Boolean) : null,
     rpm_limit: num("k-rpm"),
     tpm_limit: num("k-tpm"),
     max_concurrency: num("k-conc"),
@@ -896,6 +908,7 @@ async function submitKeyDialog() {
       if (body.prompt_variables == null) delete body.prompt_variables;
       if (body.allowed_endpoints == null) delete body.allowed_endpoints;
       if (body.allowed_ips == null) delete body.allowed_ips;
+      if (body.required_residencies == null) delete body.required_residencies;
       if (body.rpm_limit == null) delete body.rpm_limit;
       if (body.tpm_limit == null) delete body.tpm_limit;
       if (body.max_concurrency == null) delete body.max_concurrency;
@@ -990,13 +1003,16 @@ async function loadTenants() {
     const concBadge = t.max_concurrency != null
       ? ` <span class="b b-blue" title="Pooled concurrency cap: at most ${t.max_concurrency} simultaneous upstream requests across every member key; past it, requests queue then 429.">⇶${t.max_concurrency}</span>`
       : "";
+    const resBadge = (t.required_residencies || []).length
+      ? ` <span class="b b-purple" title="Pooled data-residency requirement: member traffic may only be served by deployments tagged ${(t.required_residencies || []).map(esc).join(" or ")} (intersected with each key's own requirement); untagged deployments never qualify.">⌖ ${(t.required_residencies || []).map(esc).join(",")}</span>`
+      : "";
     return `<tr>
       <td>${nameCell}</td>
       <td>${stateBadge}</td>
       <td class="num">${fmtInt(keyCounts[t.id] || 0)}</td>
       <td>${models}</td>
       <td class="num">${t.rpm_limit == null ? "—" : fmtInt(t.rpm_limit)} / ${t.tpm_limit == null ? "—" : fmtInt(t.tpm_limit)}</td>
-      <td>${markupBadge}${concBadge}</td>
+      <td>${markupBadge}${concBadge}${resBadge}</td>
       <td>${budgetCellHtml(t)}</td>
       <td class="muted" style="font-size:12px">${fmtWhen(t.created_at)}</td>
       <td style="white-space:nowrap">
@@ -1039,6 +1055,7 @@ function openTenantDialog(t) {
   $("#t-rpm").value = t && t.rpm_limit != null ? t.rpm_limit : "";
   $("#t-tpm").value = t && t.tpm_limit != null ? t.tpm_limit : "";
   $("#t-conc").value = t && t.max_concurrency != null ? t.max_concurrency : "";
+  $("#t-res").value = t && t.required_residencies ? t.required_residencies.join(", ") : "";
   $("#t-budget").value = t && t.max_budget_usd != null ? t.max_budget_usd : "";
   $("#t-daily").value = t && t.daily_budget_usd != null ? t.daily_budget_usd : "";
   $("#t-monthly").value = t && t.monthly_budget_usd != null ? t.monthly_budget_usd : "";
@@ -1059,6 +1076,8 @@ async function submitTenantDialog() {
     tpm_limit: num("t-tpm"),
     pricing_markup_pct: num("t-markup"),
     max_concurrency: num("t-conc"),
+    required_residencies: $("#t-res").value.trim().toLowerCase()
+      ? $("#t-res").value.split(",").map(s => s.trim().toLowerCase()).filter(Boolean) : null,
     max_budget_usd: num("t-budget"),
     daily_budget_usd: num("t-daily"),
     monthly_budget_usd: num("t-monthly"),

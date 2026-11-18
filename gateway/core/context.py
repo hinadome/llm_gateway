@@ -74,6 +74,16 @@ class AuthContext:
     # Guardrail names disabled for this key (admin API, no restart needed).
     # Wins over config scoping; None/empty = no overrides.
     disabled_guardrails: list[str] | None = None
+    # Data-residency requirement (tier 28): deployment tags this
+    # caller's traffic may be served (and mirrored) by — a
+    # deployment qualifies only if its `residency` tag is in the
+    # effective set. None = no requirement (unrestricted). The
+    # effective set is the intersection of the key's and the
+    # tenant's requirements: a member must satisfy both, so the
+    # tenant can only narrow (an empty intersection means nothing
+    # can serve — fail closed, at routing time).
+    required_residencies: list[str] | None = None
+    tenant_required_residencies: list[str] | None = None
     # Per-key model routing (admin API, no restart needed): requested-name
     # -> public-model map applied before global aliases (wins even over
     # real public names — per-team steering), plus this key's default-model
@@ -98,6 +108,24 @@ class AuthContext:
     # a custom authenticator's name) — recorded on request logs and audit
     # events. None for contexts built outside the auth chain.
     auth_method: str | None = None
+
+    def effective_residencies(self) -> frozenset[str] | None:
+        """The deployment-residency tags this caller's traffic may be
+        served by: the intersection of the key's and the tenant's
+        requirements (a member must satisfy both — the tenant can only
+        narrow). None = unrestricted (no filtering; the overwhelmingly
+        common case). An EMPTY set means "a requirement exists that
+        nothing can satisfy" — routing then fails closed with 404
+        residency_not_satisfied."""
+        key = self.required_residencies
+        tenant = self.tenant_required_residencies
+        if key is None and tenant is None:
+            return None
+        if key is None:
+            return frozenset(tenant)
+        if tenant is None:
+            return frozenset(key)
+        return frozenset(key) & frozenset(tenant)
 
 
 @dataclass

@@ -38,7 +38,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Audit log** | Security-relevant admin actions (key create/update/revoke, breaker reset) POSTed as JSON webhooks to your SIEM/audit trail — who (key + auth method), what, when; best-effort background delivery, counted on `gateway_audit_events_total` |
 | **Token scoping** | Per-key `allowed_endpoints` (`chat` / `embeddings` / `images` / `audio` / `models`; `chat` covers the native formats and the Responses bridge) and `allowed_ips` (plain IPs or CIDR blocks) — defense in depth beyond model allowlists; admins are never scoped |
 | **Budget alerts** | Webhook fired when a key's spend crosses a threshold of its budget (default 50/80/90/100%, configurable); once per level per key, survives restarts, raising the budget re-arms; best-effort delivery with retry, counted on `gateway_alerts_total` |
-| **Routing** | Weighted load balancing, retries with exponential backoff, cross-provider fallbacks, per-deployment circuit breakers (failing deployments are skipped, probed after a cooldown; state visible in `/admin/routing` and on `gateway_circuit_state`; per-process by default, or **shared across replicas via Redis** with `routing.breaker.backend: redis`). **Canary** = a deployment's `weight` within a tier (raise it gradually to shift traffic); **shadow** = mirror a fraction of successful requests to a non-serving deployment for comparison; **cost-aware** = rank same-priority deployments by their upstream model's input price — cheapest first, the price ladder doubling as the failover ladder (`routing.cost_aware`) |
+| **Routing** | Weighted load balancing, retries with exponential backoff, cross-provider fallbacks, per-deployment circuit breakers (failing deployments are skipped, probed after a cooldown; state visible in `/admin/routing` and on `gateway_circuit_state`; per-process by default, or **shared across replicas via Redis** with `routing.breaker.backend: redis`). **Canary** = a deployment's `weight` within a tier (raise it gradually to shift traffic); **shadow** = mirror a fraction of successful requests to a non-serving deployment for comparison; **cost-aware** = rank same-priority deployments by their upstream model's input price — cheapest first, the price ladder doubling as the failover ladder (`routing.cost_aware`); **residency-constrained** = deployment `residency` tags + key/tenant `required_residencies` filter the ladder before anything else (see [Data-residency routing](#data-residency-routing)) |
 | **Usage export** | `GET /admin/usage/export` (CSV or JSON): billing / chargeback extract of request rows with cost/tokens/latency, time-window + key/model/status filters, and per-key / per-model / per-status aggregates; mirrored shadow calls excluded by default |
 | **Batch API** | OpenAI-style `/v1/files` + `/v1/batches`: upload a JSONL of chat requests, execute them in the background — each line through the *full* pipeline (guardrails, cache, routing, spend, request logs) — then fetch per-line results as output/error JSONL. Rate limits and budgets defer a batch instead of failing lines; the 24h completion window bounds retries (see [Batch API](#batch-api)) |
 | **Lifecycle events** | Subscribe your own handlers to the request-stage boundaries (`request.received` / `routed` / `cache_hit` / `rejected` / `failed`, `response.completed`, `stream.started` / `completed`, `auth.rejected`, `key.*`, `budget.threshold`, `batch.*`) — **observers** are fire-and-forget on a background queue (a slow or crashing handler can never affect a request), **interceptors** run in-band with veto power at the two pre-irreversible events; with no handlers the bus is inert (see [Lifecycle events](#lifecycle-events)) |
@@ -49,6 +49,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Capture-replay harness** | Config-change safety net built on the request log: `GET /admin/logs/export` captures real traffic as JSONL (bodies + the recorded baseline: caller, route, model, status, deployment, guardrail verdicts), `POST /admin/replay` re-executes those requests through the request-policy phases ONLY — resolution, prompt policy, permissions, guardrails, routing selection — with no upstream calls, no counters, no spend, no log rows, then **diffs** each line against the record. Replays run as the recorded caller's *current* key (edited/revoked keys replay under what they are *now* — a revoked key shows up as would-now-401), guardrail counters are suppressed so a harness run can never trip block alerts, and tenant admins replay only their own tenant's traffic (see [Capture-replay harness](#capture-replay-harness)) |
 | **Runaway-agent protection** | Identical-request loop detection with an escalating cooldown jail: an agent stuck in a retry/tool loop sends the *same* request over and over — every one individually legal, so RPM/TPM can't see it. The fingerprint (the cache's normalized request identity — stable across chat/Responses/native routes, stream or not) repeated `threshold` times inside the window trips, and the *key* answers 429 + `Retry-After` for everything until the cooldown expires — would-be cache hits and idempotent replays included. Re-trips escalate (30s → 60s → ... capped), a quiet period decays the offense count, `GET /admin/runaway` shows the jail and `POST /admin/runaway/{key_id}/release` is the escape hatch; `runaway.trip` event + `gateway_runaway_trips_total{key}` (see [Runaway-agent protection](#runaway-agent-protection)) |
 | **Concurrency admission control & QoS** | Per-key and pooled per-tenant `max_concurrency` caps bound how many requests may be **in-flight against the upstream at once** — RPM/TPM bound the rate, this bounds the parallelism (protects a provider quota or a small deployment fleet). The slot wraps the upstream call: cache hits and idempotent replays never hold one, a streamed response holds it until its body completes, and every error path releases it. At the cap, requests **queue** (no extra upstream pressure) admitted **highest-`priority`-first** (the key's QoS class, FIFO within a class; a waiter on one key never blocks behind an unrelated saturated one); a wait past `concurrency.wait_seconds` answers 429 + `Retry-After` (`0` = fail fast). `GET /admin/concurrency` shows live in-flight/queued counts; `gateway_concurrency_inflight{key}` / `gateway_concurrency_queued{key}` / `gateway_concurrency_rejected_total{key}` + a `concurrency.timeout` event (see [Concurrency admission control](#concurrency-admission-control)) |
+| **Data-residency routing** | Deployment-tag-constrained routing, fail closed: each deployment carries an operator-asserted `residency` tag (lowercase slug, e.g. `eu`), and keys/tenants carry `required_residencies` — a caller's traffic (chat, native formats, embeddings, images, audio, *and shadow mirrors*) may only be served by deployments whose tag is in the caller's **effective set** (key ∩ tenant; the tenant can only narrow). The filter runs inside the router **before** the priority ladder, retries and fallbacks, so a constrained request can never escape to a non-compliant deployment mid-failover; an untagged deployment satisfies **no** requirement (no claim, no compliance), and a model with nothing compliant answers 404 `residency_not_satisfied` naming the model and the tags. Cache entries never cross residency classes (the requirement salts the chat response-policy token and the embeddings cache key — unrestricted callers keep their exact pre-existing keys); the semantic cache degrades away rather than embed a restricted prompt non-compliantly (see [Data-residency routing](#data-residency-routing)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model — including **provider prompt-cache discounts**: cached input tokens (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, Gemini `cachedContentTokenCount`) bill at the `cached_input` price, default 50% of input |
@@ -223,7 +224,7 @@ Things to know when pointing a framework at the gateway:
 | `GET /admin/logs/{id}` | One log row in full, including the stored request/response bodies (cross-tenant ids 404 for tenant admins) |
 | `GET /admin/stats` | Requests, error rate, tokens, cost, latency + TTFT percentiles (client traffic only — shadow mirrors are excluded); tenant admins see their own tenant's traffic, platform admins additionally get a `by_tenant` breakdown |
 | `GET /admin/usage/export` | Billing / chargeback export: `format=csv\|json`, `since`/`until` (ISO-8601, default last 30 days), `key_name`/`model`/`status`/`tenant_id` filters, `include_shadow`; JSON adds totals + per-key/model/status aggregates (+ per-tenant for platform admins); tenant admins export their own tenant only |
-| `GET /admin/routing` | The routing table (public models → deployments, with each deployment's circuit-breaker state; shadow deployments flagged with their mirror fraction) |
+| `GET /admin/routing` | The routing table (public models → deployments, with each deployment's circuit-breaker state; shadow deployments flagged with their mirror fraction; each deployment's `residency` claim visible — `null` means "no claim, satisfies no residency requirement") |
 | `POST /admin/routing/breakers/{deployment}/reset` | Force-close a deployment's circuit (next request probes it again) |
 | `GET /admin/runaway` | Runaway-agent protection view: keys currently in the loop-detection cooldown jail (remaining cooldown, offense count, key name), the live `runaway:` config echo and the `enabled` flag. In-process state — a multi-replica fleet reports its own jail here (platform admin) |
 | `POST /admin/runaway/{key_id}/release` | Release a key from the runaway jail (escape hatch): clears the jail, the offense history and the loop windows — the key serves again immediately, and a still-looping agent re-trips from a *first-offense* cooldown. Audited as `runaway.released` |
@@ -651,6 +652,48 @@ concurrency:
 ```
 
 15 tests pin the contract (`tests/test_concurrency.py`).
+
+## Data-residency routing
+
+Some traffic must never leave some jurisdictions — a German customer's prompts on EU-deployed models only, a healthcare tenant's data in-region. That is a *routing* constraint, not a guardrail: the decision is about **where** the request runs, and it must hold even when things fail. This tier makes it explicit, operator-asserted, and fail closed.
+
+Two sides, both in your control:
+
+- **Deployments claim** — `residency` on each deployment in `config.yaml`: a lowercase slug (`eu`, `us`, `eu-west`) asserting where that deployment processes data. The operator asserts it; the gateway never guesses. **None = NO CLAIM** — an untagged deployment satisfies no requirement, because it can never *prove* compliance.
+- **Callers require** — `required_residencies` on a virtual key and/or its tenant (admin API, admin UI): the tags that may serve that caller's traffic. A tenant's requirement binds every member key; the effective set is the **intersection** (key ∩ tenant — the tenant can only narrow), and an empty intersection means nothing can serve: fail closed, 404.
+
+```yaml
+models:
+  - name: gpt-4o
+    deployments:
+      - name: azure/eu-gpt-4o
+        provider: azure
+        model: gpt-4o-prod
+        residency: eu          # operator-asserted: processes data in the EU
+      - name: openai/gpt-4o
+        provider: openai
+        model: gpt-4o
+        priority: 200
+        residency: us          # a fallback for us-restricted and unrestricted callers
+```
+
+The filter lives inside `Router.resolve` — **before** the priority ladder, retries and fallbacks. That placement is the whole feature:
+
+- A constrained request can never escape to a non-compliant deployment mid-failover: the us fallback is not "tried last", it is *not on the ladder*.
+- Failures still fail over — **within** the compliant class. Residency narrows the ladder; it does not disable it.
+- No compliant deployment → `404 residency_not_satisfied`, naming the model and the required tags — distinguishable from a missing model. Nothing is ever consulted upstream.
+- Every modality routes through the same `resolve`: chat (all inbound formats, stream and not), embeddings, images, audio. And **shadow mirrors too** — a mirror is a copy of the caller's data, so it may only land on compliant deployments; non-compliant shadows silently receive nothing (the mirror is best-effort by design).
+
+Caches respect the boundary without losing reuse:
+
+- The requirement salts the chat **response-policy token** and the **embeddings cache key** — residency classes never share entries, in either direction, because an entry produced under one requirement may have been generated on a deployment another class may not use. Only salted in when a requirement exists: unrestricted callers keep their exact pre-tier-28 keys, so existing cache entries stay valid.
+- The **semantic cache degrades, never violates**: a restricted caller's prompt is only embedded through the router's residency filter, and a model with no compliant embedder deployment is treated as a plain miss — the request still serves, it just loses semantic hits.
+
+Semantics details: tags are matched **exactly** after normalization (lowercase slugs `^[a-z0-9][a-z0-9_-]*$`; `EU` and `eu` are the same tag, `not a slug!` is a 400), PATCH `[]` and `null` both clear a requirement, admin/env-key traffic carries no key so it is exempt (like every key-layer ceiling), and `GET /admin/routing` shows every deployment's residency claim — `null` visible as "no claim".
+
+Honest boundary: the gateway enforces the *tags you assert*; it cannot verify a provider's actual physical location. The assertion is yours — the enforcement is exact.
+
+14 tests pin the contract (`tests/test_residency.py`).
 
 ## Architecture
 

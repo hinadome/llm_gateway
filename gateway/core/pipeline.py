@@ -81,7 +81,9 @@ def _sse(obj: Any) -> str:
 
 
 def embedding_cache_key_for(
-    request: EmbeddingRequest, tenant_id: str | None = None
+    request: EmbeddingRequest,
+    tenant_id: str | None = None,
+    residencies: frozenset[str] | None = None,
 ) -> str:
     """Cache key for embeddings: model + input + dimensions (+ tenant).
 
@@ -92,6 +94,14 @@ def embedding_cache_key_for(
     so the salt is the tenant alone: data isolation between tenants,
     sharing preserved for everyone else (platform keys, same-tenant
     keys — an embedding is an embedding).
+
+    ``residencies`` (tier 28): the caller's effective data-residency
+    requirement. An entry produced under one requirement may have been
+    computed on a deployment another class may not use, so residency
+    classes never share entries — the same rule the chat path's
+    response-policy token applies. Only salted in when a requirement
+    exists: unrestricted callers keep their exact pre-tier-28 keys and
+    existing entries stay valid.
     """
     payload = {
         "kind": "embedding",
@@ -99,6 +109,7 @@ def embedding_cache_key_for(
         "input": [request.input] if isinstance(request.input, str) else request.input,
         "dimensions": request.dimensions,
         **({"tenant_id": tenant_id} if tenant_id else {}),
+        **({"required_residencies": sorted(residencies)} if residencies else {}),
     }
     serialized = json.dumps(payload, sort_keys=True, default=repr)
     return hashlib.sha256(serialized.encode()).hexdigest()
@@ -367,7 +378,12 @@ class GatewayPipeline:
         # request would draw from (a 404/503 here is a prediction too —
         # an unknown model or all-shadow deployments).
         try:
-            ladder = [d.name for d in self.router.resolve(request.model)]
+            ladder = [
+                d.name
+                for d in self.router.resolve(
+                    request.model, ctx.auth.effective_residencies()
+                )
+            ]
         except GatewayError as exc:
             return {
                 "model": ctx.model,
@@ -580,7 +596,13 @@ class GatewayPipeline:
         cached = await self.cache.get(key) if key is not None else None
         hit_kind = "hit" if cached is not None else None
         if cached is None and self.semantic is not None:
-            semantic_embedding = await self.semantic.embed(request)
+            # The caller's residency requirement rides along: a
+            # restricted caller's prompt is only embedded compliantly,
+            # and a model with no compliant deployment is a miss here
+            # (the semantic cache degrades away, never violates).
+            semantic_embedding = await self.semantic.embed(
+                request, ctx.auth.effective_residencies()
+            )
             if semantic_embedding is not None:
                 cached = await self.semantic.get(
                     request.model, semantic_embedding, policy_token
@@ -620,9 +642,15 @@ class GatewayPipeline:
         # _serve_simple, which never acquires a slot.
         await self._acquire_slot(ctx)
 
-        # 6. + 7. Route to provider (with retries/fallbacks)
+        # 6. + 7. Route to provider (with retries/fallbacks). The
+        # caller's residency requirement filters the candidate ladder
+        # inside resolve — before retries and fallbacks, so a
+        # constrained request can never escape to a non-compliant
+        # deployment mid-failover.
         if request.stream:
-            deployment, chunk_iterator = await self.router.complete_stream(request)
+            deployment, chunk_iterator = await self.router.complete_stream(
+                request, ctx.auth.effective_residencies()
+            )
             ctx.provider = deployment.provider
             ctx.deployment = deployment.name
             ctx.native_model = deployment.model
@@ -648,7 +676,9 @@ class GatewayPipeline:
                 headers,
             )
 
-        deployment, response = await self.router.complete(request)
+        deployment, response = await self.router.complete(
+            request, ctx.auth.effective_residencies()
+        )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
@@ -932,9 +962,13 @@ class GatewayPipeline:
         # 3. Budget (pre-flight)
         self._check_budget(ctx)
 
-        # 4. Cache lookup — embeddings are deterministic per model+input
+        # 4. Cache lookup — embeddings are deterministic per model+input.
+        #    Salted by the caller's residency requirement like the chat
+        #    path's policy token: residency classes never share entries.
         key = (
-            embedding_cache_key_for(request, ctx.auth.tenant_id)
+            embedding_cache_key_for(
+                request, ctx.auth.tenant_id, ctx.auth.effective_residencies()
+            )
             if self.cache.enabled
             else None
         )
@@ -955,8 +989,11 @@ class GatewayPipeline:
                 )
             metrics.CACHE.labels("miss").inc()
 
-        # 5. Route to provider (retries/fallbacks/breakers as for chat)
-        deployment, response = await self.router.embed(request)
+        # 5. Route to provider (retries/fallbacks/breakers as for chat).
+        #    Residency requirement filters the ladder, same as chat.
+        deployment, response = await self.router.embed(
+            request, ctx.auth.effective_residencies()
+        )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
@@ -1019,7 +1056,9 @@ class GatewayPipeline:
             lambda ctx: self._serve_image(
                 ctx,
                 request,
-                lambda r: self.router.generate_image(r),
+                lambda r: self.router.generate_image(
+                    r, residencies=ctx.auth.effective_residencies()
+                ),
                 request.prompt,
                 "image generation completed",
             ),
@@ -1044,7 +1083,9 @@ class GatewayPipeline:
             lambda ctx: self._serve_image(
                 ctx,
                 request,
-                lambda r: self.router.edit_image(r),
+                lambda r: self.router.edit_image(
+                    r, residencies=ctx.auth.effective_residencies()
+                ),
                 request.prompt,
                 "image edit completed",
             ),
@@ -1068,7 +1109,9 @@ class GatewayPipeline:
             lambda ctx: self._serve_image(
                 ctx,
                 request,
-                lambda r: self.router.vary_image(r),
+                lambda r: self.router.vary_image(
+                    r, residencies=ctx.auth.effective_residencies()
+                ),
                 None,
                 "image variation completed",
             ),
@@ -1175,7 +1218,9 @@ class GatewayPipeline:
         await self._check_rate_limit(ctx, estimate_tokens(request.prompt or ""))
         self._check_budget(ctx)
 
-        deployment, (content, media_type) = await self.router.transcribe(request)
+        deployment, (content, media_type) = await self.router.transcribe(
+            request, ctx.auth.effective_residencies()
+        )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
@@ -1242,7 +1287,9 @@ class GatewayPipeline:
         await self._check_rate_limit(ctx, estimate_tokens(request.input))
         self._check_budget(ctx)
 
-        deployment, (audio, media_type) = await self.router.speak(request)
+        deployment, (audio, media_type) = await self.router.speak(
+            request, ctx.auth.effective_residencies()
+        )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
@@ -2165,7 +2212,9 @@ class GatewayPipeline:
         """
         import asyncio
 
-        shadows = self.router.shadow_deployments(ctx.model)
+        shadows = self.router.shadow_deployments(
+            ctx.model, ctx.auth.effective_residencies()
+        )
         if not shadows:
             return
         for deployment in shadows:

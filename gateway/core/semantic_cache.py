@@ -40,7 +40,13 @@ from .cache import cache_key_for, cache_payload_for
 logger = logging.getLogger("gateway.semantic_cache")
 
 # Embeds the normalized request text -> vector.
-EmbedFn = Callable[[str], Awaitable[list[float]]]
+# The embedder closure built by router.embed_fn_for: takes the text and
+# the caller's effective residency requirement (None = unrestricted).
+# The second argument is only supplied when a requirement exists —
+# single-argument embedders (the pre-tier-28 shape) keep working for
+# unrestricted callers, and a restricted caller whose embedder cannot
+# accept it degrades to a cache miss (never a residency violation).
+EmbedFn = Callable[..., Awaitable[list[float]]]
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -84,14 +90,27 @@ class SemanticCache:
 
     # -- lookup ---------------------------------------------------------
 
-    async def embed(self, request: ChatCompletionRequest) -> list[float] | None:
+    async def embed(
+        self,
+        request: ChatCompletionRequest,
+        residencies: frozenset[str] | None = None,
+    ) -> list[float] | None:
         """Embed the normalized request; None (never an exception) on failure.
 
         The embedding is computed once per request and reused for both
-        the lookup and (on a miss) the store.
+        the lookup and (on a miss) the store. ``residencies`` is the
+        caller's effective data-residency requirement — it is passed to
+        the embedder ONLY when a requirement exists (None callers call
+        single-argument embedders, the pre-tier-28 shape, so external
+        embed fns keep working unchanged). An embedder that cannot
+        accept the argument raises, which lands here as a miss: a
+        restricted caller's prompt simply loses semantic-cache hits —
+        degrade, never violate.
         """
         try:
-            return await self._embed_fn(cache_payload_for(request))
+            if residencies is None:
+                return await self._embed_fn(cache_payload_for(request))
+            return await self._embed_fn(cache_payload_for(request), residencies)
         except Exception as exc:  # noqa: BLE001
             logger.warning("semantic cache embed failed, treating as miss: %s", exc)
             return None

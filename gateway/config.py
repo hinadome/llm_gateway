@@ -136,10 +136,54 @@ class ProviderConfig(BaseModel):
         return None
 
 
+# Data-residency vocabulary (tier 28): tags are lowercase slugs the
+# operator asserts on deployments and requires on keys/tenants — no
+# enum on purpose (the vocabulary is deployment-specific), but the
+# format is strict so both sides match exactly. Shared by
+# DeploymentConfig (config.yaml) and the key/tenant schemas (admin API).
+_RESIDENCY_TAG = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def normalize_residency_tag(tag: str) -> str:
+    """Strip + lowercase one residency tag; ValueError on anything that
+    is not a plain slug. Tags are matched EXACTLY, so the format must
+    be unambiguous ('EU' and 'eu' are the same tag)."""
+    normalized = tag.strip().lower()
+    if not _RESIDENCY_TAG.match(normalized):
+        raise ValueError(
+            f"invalid residency tag {tag!r} — use lowercase slugs "
+            "like 'eu' or 'eu-west'"
+        )
+    return normalized
+
+
+def normalize_residencies(tags: list[str] | None) -> list[str] | None:
+    """Normalize a residency requirement list: strip + lowercase each
+    tag, drop duplicates, drop empties. None or an empty list means
+    "no requirement" and returns None (PATCH semantics: an explicit
+    [] clears the requirement, exactly like null)."""
+    if not tags:
+        return None
+    seen: list[str] = []
+    for tag in tags:
+        normalized = normalize_residency_tag(tag)
+        if normalized not in seen:
+            seen.append(normalized)
+    return seen or None
+
+
 class DeploymentConfig(BaseModel):
     name: str
     provider: str
     model: str  # provider-native model id
+    # Data-residency claim (tier 28): where this deployment processes
+    # data, as a tag the operator asserts (e.g. "eu", "us", "eu-west").
+    # A caller with a residency requirement may only be served by (and
+    # mirrored to) deployments whose tag is in their effective set;
+    # None = NO CLAIM — which satisfies no requirement (fail closed:
+    # an untagged deployment can never prove compliance). Tags are
+    # lowercased slugs ("eu", "eu-west"); requirements match exactly.
+    residency: str | None = None
     priority: int = 100  # lower = tried first
     weight: int = 1  # weighted pick among same-priority deployments
     timeout_seconds: float | None = None
@@ -169,6 +213,17 @@ class DeploymentConfig(BaseModel):
     @classmethod
     def _clamp_shadow_fraction(cls, value: float) -> float:
         return min(1.0, max(0.0, value))
+
+    @field_validator("residency")
+    @classmethod
+    def _normalize_residency(cls, value: str | None) -> str | None:
+        # An empty string is "no claim", same as null.
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        return normalize_residency_tag(value)
 
 
 class ModelConfig(BaseModel):

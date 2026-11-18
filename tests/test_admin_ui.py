@@ -54,6 +54,8 @@ async def test_admin_ui_tenants_surface(env):
         'id="t-markup"',
         'id="k-conc"',
         'id="k-priority"',
+        'id="k-res"',
+        'id="t-res"',
         'id="btn-newtenant"',
         'id="k-tenant"',
         'id="k-admin"',

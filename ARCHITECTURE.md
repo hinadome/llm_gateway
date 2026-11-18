@@ -441,7 +441,26 @@ gateway/
 │   │                       hot-reloads apply): cheapest first, the price ladder
 │   │                       doubles as the failover ladder, weight breaks price
 │   │                       ties, unpriced models sort last, and priority still
-│   │                       rules across tiers
+│   │                       rules across tiers. Tier 28 adds the residency
+│   │                       filter: resolve(model, residencies) /
+│   │                       shadow_deployments(model, residencies) /
+│   │                       _dispatch(..., residencies) and all eight
+│   │                       public methods accept the caller's EFFECTIVE
+│   │                       data-residency requirement (AuthContext.
+│   │                       effective_residencies(): key ∩ tenant,
+│   │                       None = unrestricted) and filter the candidate
+│   │                       list to deployments whose operator-asserted
+│   │                       residency tag is in the set BEFORE the
+│   │                       priority ladder, retries and fallbacks —
+│   │                       a constrained request can never escape to a
+│   │                       non-compliant deployment mid-failover; an
+│   │                       untagged deployment satisfies NO requirement
+│   │                       (no claim, no compliance), and no
+│   │                       compliant deployment is 404
+│   │                       residency_not_satisfied (model + tags
+│   │                       named). Shadow mirrors are filtered too: a
+│   │                       mirror is a copy of the caller's data, so it
+│   │                       only lands on compliant deployments
 │   ├── breaker.py         Per-deployment circuit breakers: closed → open (skip) → half-open (probe);
 │   │                       request-level failure counting, Prometheus state gauge,
 │   │                       admin reset; register() is idempotent — a config
@@ -716,7 +735,12 @@ gateway/
 │   │                       verdicts (response/stream verdicts are
 │   │                       unpredictable — replay stops at the
 │   │                       request phase) and deployment-ladder
-│   │                       membership; error-recorded rows are
+│   │                       membership — the ladder is resolved with
+│   │                       the CURRENT key's effective residency
+│   │                       requirement, so a key whose requirement
+│   │                       changed since capture honestly diffs a
+│   │                       different ladder (or residency_
+│   │                       not_satisfied); error-recorded rows are
 │   │                       exported but not comparable (their
 │   │                       outcome was state, not policy); outcomes
 │   │                       count on gateway_replay_total{result}.
@@ -1152,7 +1176,7 @@ sequenceDiagram
 
     Note over P: 5.5 concurrency admission (after the cache miss:<br/>hits and idempotent replays never hold a slot).<br/>Per-key max_concurrency + pooled tenant cap,<br/>snapshotted at auth time. At the cap: queue<br/>up to wait_seconds, highest priority first,<br/>then 429 + Retry-After. Released wherever the<br/>in-flight gauge decrements — streams hold their<br/>slot until the body completes. Capless callers<br/>skip admission entirely
     P->>R: complete(request)
-    R->>R: resolve deployments by priority (weighted pick)
+    R->>R: resolve deployments: residency filter first<br/>(caller's effective key∩tenant requirement —<br/>untagged satisfies nothing, no compliant<br/>deployment = 404 residency_not_satisfied),<br/>then priority (weighted pick)
     loop retries w/ exponential backoff (retryable errors)
         R->>PR: complete(deployment, request, cfg, timeout)
         PR->>U: native request (translated)
@@ -1160,7 +1184,7 @@ sequenceDiagram
         PR-->>R: OpenAI-format response
     end
     alt still failing → fallback tier
-        R->>R: next deployment (e.g. OpenAI → Anthropic)
+        R->>R: next COMPLIANT deployment (residency narrows the<br/>ladder — a constrained request never escapes to a<br/>non-compliant fallback, e.g. OpenAI-EU → Azure-EU)
     end
     R-->>P: (deployment, response)
 
@@ -1279,6 +1303,9 @@ erDiagram
         float monthly_spend_usd "stale monthly_bucket => counts as 0"
         str monthly_bucket "YYYY-MM of monthly_spend_usd"
         json budget_alerts_fired "tenant alert threshold levels (%) already fired"
+        float pricing_markup_pct "cost-plus billing percent, NULL = none"
+        int max_concurrency "pooled in-flight upstream cap, NULL = unlimited"
+        json required_residencies "deployment residency tags that may serve members, NULL = unrestricted"
         datetime created_at
         datetime updated_at
     }
@@ -1293,6 +1320,8 @@ erDiagram
         json allowed_models "fnmatch patterns, NULL = all"
         int rpm_limit "requests/min, NULL = unlimited"
         int tpm_limit "tokens/min, NULL = unlimited"
+        int max_concurrency "in-flight upstream cap, NULL = unlimited"
+        int priority "QoS class under cap contention, default 0"
         float max_budget_usd
         float spend_usd "accumulated by async post-response task"
         float daily_budget_usd "UTC calendar-day cap, NULL = unlimited"
@@ -1303,6 +1332,7 @@ erDiagram
         str monthly_bucket "YYYY-MM of monthly_spend_usd"
         json budget_alerts_fired "alert threshold levels (%) already fired"
         json disabled_guardrails "guardrail names skipped for this key (runtime override)"
+        json required_residencies "deployment residency tags that may serve this key, NULL = unrestricted"
         json model_mappings "per-key requested name to public model routing table"
         str default_model "this key's catch-all for unknown names"
         json allowed_endpoints "data-plane scopes (chat/embeddings/images/audio/models/batch), NULL = all"

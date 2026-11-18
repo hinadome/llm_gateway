@@ -63,6 +63,13 @@ class VirtualKey(Base):
     priority: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     spend_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    # Data-residency requirement (tier 28): deployment tags that may
+    # serve (and mirror) this key's traffic. JSON list of slugs, None =
+    # no requirement. Intersected with the tenant's requirement at auth
+    # time — the tenant can only narrow.
+    required_residencies: Mapped[list | None] = mapped_column(
+        JSONColumn, nullable=True
+    )
     # Budget windows: daily/monthly caps alongside the total. Spend and its
     # bucket id live on the row — when the stored bucket differs from the
     # current one the window has rolled and the stored spend counts as 0
@@ -138,6 +145,7 @@ class VirtualKey(Base):
             "monthly_bucket": self.monthly_bucket,
             "budget_alerts_fired": self.budget_alerts_fired,
             "disabled_guardrails": self.disabled_guardrails,
+            "required_residencies": self.required_residencies,
             "model_mappings": self.model_mappings,
             "default_model": self.default_model,
             "system_prompt": self.system_prompt,
@@ -190,6 +198,12 @@ class Tenant(Base):
     # visible beside tenant economics. NULL = no markup (bill at
     # actual — the platform default; auto-upgrade adds the column).
     pricing_markup_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Data-residency requirement, pooled across every member key: the
+    # deployment tags that may serve member traffic. Intersected with
+    # each member key's own requirement — the tenant can only narrow.
+    required_residencies: Mapped[list | None] = mapped_column(
+        JSONColumn, nullable=True
+    )
     # Pooled concurrency ceiling: max simultaneous UPSTREAM requests
     # across every member key (None = tenant sets none). A member key
     # must pass both its own cap and the tenant's — the tenant can
@@ -223,6 +237,7 @@ class Tenant(Base):
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "pricing_markup_pct": self.pricing_markup_pct,
+            "required_residencies": self.required_residencies,
             "max_concurrency": self.max_concurrency,
             "max_budget_usd": self.max_budget_usd,
             "spend_usd": self.spend_usd,

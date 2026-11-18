@@ -8,6 +8,49 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Data-residency routing — deployment-tag-constrained routing, fail
+  closed. Each deployment may carry an operator-asserted `residency`
+  tag (lowercase slug, e.g. "eu" — config.yaml; None = NO CLAIM,
+  which satisfies no requirement: no claim, no compliance), and
+  virtual keys / tenants carry `required_residencies` (admin API +
+  UI: comma-separated tag fields on the key/tenant dialogs, badges
+  on the rows). The caller's EFFECTIVE set is the intersection
+  key ∩ tenant (the tenant can only narrow; an empty intersection
+  means nothing can serve). The filter lives inside Router.resolve
+  — BEFORE the priority ladder, retries and fallbacks — so a
+  constrained request can never escape to a non-compliant
+  deployment mid-failover; failures still fail over WITHIN the
+  compliant class (residency narrows the ladder, never disables
+  it); no compliant deployment answers 404 residency_not_satisfied
+  naming the model and the required tags, and nothing is ever
+  consulted upstream. Threaded through every modality: chat (all
+  inbound formats, stream and not), embeddings, images, audio —
+  and SHADOW MIRRORS too (a mirror is a copy of the caller's data:
+  non-compliant shadows silently receive nothing). Caches respect
+  the boundary without losing reuse: the requirement salts the chat
+  response-policy token and the embeddings cache key ONLY when one
+  exists (residency classes never share entries; unrestricted
+  callers keep their exact pre-tier-28 keys, existing entries stay
+  valid) — this fixed a real leak found by the new tests, where the
+  tenant-salt-only embeddings cache key could serve a restricted
+  caller an entry generated on a non-compliant deployment. The
+  semantic cache degrades, never violates: a restricted caller's
+  prompt is only embedded through the router's residency filter
+  (the residencies argument is passed to the embedder only when a
+  requirement exists, so external single-argument embed fns keep
+  working for unrestricted callers, and a restricted caller whose
+  embedder cannot accept it is a plain miss). Semantics: exact
+  matching after normalization (^[a-z0-9][a-z0-9_-]*$; EU and eu are
+  the same tag, anything else is a 400 at the API and a load error
+  in config), PATCH [] and null both clear, admin/env-key traffic
+  exempt, GET /admin/routing shows each deployment's residency
+  claim. 14 new tests (tests/test_residency.py); full suite 956
+  passing. Docs: README features/routing/admin-API rows + a
+  dedicated section; ARCHITECTURE router module-map extension, ER
+  diagram (also backfilled pricing_markup_pct / max_concurrency /
+  priority — a tier-25/27 doc gap), replay-harness note (the
+  ladder prediction resolves with the CURRENT key's residency) and
+  lifecycle-diagram routing step.
 - Concurrency admission control + QoS — per-key and pooled
   per-tenant in-flight caps with priority queueing. RPM/TPM bound
   the rate of requests; max_concurrency (VirtualKey, and the pooled
