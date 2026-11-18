@@ -8,6 +8,44 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Idempotency keys: retry-safe chat completions on every chat-family
+  surface (OpenAI chat, /v1/responses, native Anthropic /v1/messages,
+  native Gemini :generateContent). A client sends an Idempotency-Key
+  header; the *successful* response is stored under (caller, client
+  key) and replays on retry — no double generation, no double billing
+  (the stored usage was billed at first execution; replays are
+  zero-cost cache_hit log rows answering X-Gateway-Cache: IDEMPOTENT,
+  streams re-synthesized from the stored completion). Only successes
+  are stored: errors and guardrail blocks re-execute, which is what a
+  transient failure needs. Reusing a key with different request
+  parameters is a 400 (idempotency_key_reuse) — the fingerprint is
+  the original request as received, the same normalized identity the
+  response cache keys on, stashed on the request context before
+  guardrails can rebind the request. In-flight duplicates (the
+  canonical case: retrying a timed-out request while the original
+  still runs) wait bounded by inflight_wait_seconds for the original
+  — shielded, so a waiter's timeout never kills it — then replay it,
+  or execute themselves if it failed or wedged (last writer wins);
+  the map is in-process, so the Redis backend dedups only completed
+  entries cross-replica (documented). Phase 2b in the pipeline:
+  rate-limit → idempotency → budget, deliberately — a retry must
+  still serve even if the caller's ceiling was crossed after the
+  original was authorized; new requests still hit the ceiling.
+  Entries are private per caller (store key "idem:<key id>:<client
+  key>"); keys are 1-255 non-whitespace chars (400
+  invalid_idempotency_key). Embeddings/images/audio and batch lines
+  ignore the header. No header = zero behavior change;
+  idempotency.enabled=false ignores the header entirely. Backend
+  selection mirrors the response cache (memory LRU / Redis — its
+  keys namespaced at <prefix>:idem:cache:* with their own TTL/LRU);
+  config: idempotency section (ttl_seconds=86400 — Stripe's window —
+  max_entries=10000, inflight_wait_seconds=30, backend). Outcomes
+  count on gateway_idempotency_total{outcome=replayed|stored|
+  rejected}; replays emit request.cache_hit with kind=idempotency.
+  Idempotency joins restart_required on reload (backend is shared
+  state, like the cache). conftest.make_config grows idempotency=
+  and a proper cache= override. 14 new tests
+  (tests/test_idempotency.py).
 - PII/secret scan over stored bodies: an on-demand audit that
   answers "did secrets or PII land in the request log?" Clients
   paste API keys into prompts; guardrails may be off, in observe

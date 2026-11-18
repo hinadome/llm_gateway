@@ -26,6 +26,7 @@ from gateway.config import (
     EventsConfig,
     GatewayConfig,
     GuardrailConfig,
+    IdempotencyConfig,
     JWTAuthConfig,
     LoggingConfig,
     MetricsConfig,
@@ -102,6 +103,10 @@ def make_config(**cache_overrides) -> GatewayConfig:
     batch = cache_overrides.pop("batch", None) or BatchConfig()
     canary = cache_overrides.pop("canary", None) or CanaryConfig()
     pii_scan = cache_overrides.pop("pii_scan", None) or PIIScanConfig()
+    idempotency = cache_overrides.pop("idempotency", None) or IdempotencyConfig()
+    cache = cache_overrides.pop("cache", None) or CacheConfig(
+        enabled=True, ttl_seconds=300, max_entries=128
+    )
     events = cache_overrides.pop("events", None) or EventsConfig()
     guardrails = cache_overrides.pop("guardrails", None) or [
         GuardrailConfig(
@@ -148,7 +153,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         default_model=default_model,
         logging=logging_cfg,
         guardrails=guardrails,
-        cache=CacheConfig(enabled=True, ttl_seconds=300, max_entries=128, **cache_overrides),
+        cache=cache,
         routing=routing,
         alerts=alerts,
         auth=auth,
@@ -160,11 +165,15 @@ def make_config(**cache_overrides) -> GatewayConfig:
         batch=batch,
         canary=canary,
         pii_scan=pii_scan,
+        idempotency=idempotency,
         events=events,
     )
     if redis_backends:
         config.cache.backend = "redis"
         config.rate_limit.backend = "redis"
+        # Idempotency follows the response cache's backend selection
+        # (its store is built the same way, namespaced apart).
+        config.idempotency.backend = "redis"
     return config
 
 

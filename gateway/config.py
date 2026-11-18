@@ -530,6 +530,41 @@ class PIIScanConfig(BaseModel):
         return value
 
 
+class IdempotencyConfig(BaseModel):
+    """Idempotency-Key replay for the chat-family surfaces (OpenAI
+    chat, the Responses bridge, native Anthropic/Gemini inbound —
+    everything that routes through the completions machinery).
+
+    A client supplies an ``Idempotency-Key`` header; the *successful*
+    response is stored under (caller, key) and replays on retry — no
+    double generation, no double billing (the stored usage was
+    billed at first execution; replay rows log as cache hits with
+    zero cost). Only successes are stored: errors and guardrail
+    blocks re-execute on retry, which is what a transient failure
+    needs. Reuse of a key with different request parameters is
+    rejected (400 ``idempotency_key_reuse``) — the fingerprint is
+    the original request as received, the same identity the response
+    cache uses.
+
+    In-flight duplicates (the canonical case: retrying a timed-out
+    request while the original still runs) wait up to
+    ``inflight_wait_seconds`` for the original, then replay it —
+    or execute themselves if it never finishes. In-process wait;
+    cross-replica dedup covers only completed entries (Redis
+    backend). Replays answer ``X-Gateway-Cache: IDEMPOTENT``.
+
+    No header = zero behavior change; ``enabled: false`` = the
+    header is ignored entirely. Same backend selection as the
+    response cache (memory LRU / Redis) with its own TTL and size.
+    """
+
+    enabled: bool = True
+    ttl_seconds: float = 86400.0  # 24h, Stripe's idempotency window
+    max_entries: int = 10_000
+    inflight_wait_seconds: float = 30.0
+    backend: str = "memory"  # memory | redis
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -619,6 +654,7 @@ class GatewayConfig(BaseModel):
     batch: BatchConfig = Field(default_factory=BatchConfig)
     canary: CanaryConfig = Field(default_factory=CanaryConfig)
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
+    idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 

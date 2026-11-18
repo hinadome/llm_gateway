@@ -826,6 +826,10 @@ async def create_response(
     pipeline = raw_request.app.state.pipeline
     request_id = getattr(raw_request.state, "request_id", None)
     response = await pipeline.handle_chat(
-        internal, auth, request_id=request_id, route="responses"
+        internal,
+        auth,
+        request_id=request_id,
+        route="responses",
+        idempotency_key=raw_request.headers.get("Idempotency-Key"),
     )
     return translate_response(response, internal.model, echo)

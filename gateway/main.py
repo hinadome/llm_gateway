@@ -47,6 +47,7 @@ from .core.auth import AuthChain
 from .core.audit import AuditLogger
 from .core.batch_worker import BatchWorker
 from .core.canary import CanaryProber
+from .core.idempotency import IdempotencyStore
 from .core.pii_scan import PIIScanner
 from .core.cache import ResponseCache
 from .core.events import EventBus
@@ -195,6 +196,7 @@ def create_app(
         config.cache.backend == "redis"
         or config.rate_limit.backend == "redis"
         or config.routing.breaker.backend == "redis"
+        or config.idempotency.backend == "redis"
     ):
         redis_client = aioredis.from_url(config.redis.resolve_url())
     breakers = None
@@ -219,6 +221,28 @@ def create_app(
         )
     else:
         cache = ResponseCache(**config.cache.model_dump(exclude={"backend"}))
+    # Idempotency-Key replay store: the same backend selection as the
+    # response cache (see core/idempotency.py). A distinct prefix
+    # namespaces entries + LRU index away from content-cache keys, so
+    # the two TTLs/LRU sizes never fight over one namespace.
+    if config.idempotency.backend == "redis":
+        idempotency_backend = RedisResponseCache(
+            redis_client,
+            enabled=config.idempotency.enabled,
+            ttl_seconds=config.idempotency.ttl_seconds,
+            max_entries=config.idempotency.max_entries,
+            prefix=f"{config.redis.prefix}:idem",
+        )
+    else:
+        idempotency_backend = ResponseCache(
+            **config.idempotency.model_dump(
+                exclude={"backend", "inflight_wait_seconds"}
+            )
+        )
+    idempotency = IdempotencyStore(
+        idempotency_backend,
+        inflight_wait_seconds=config.idempotency.inflight_wait_seconds,
+    )
     if config.rate_limit.backend == "redis":
         rate_limiter = RedisRateLimiter(redis_client, prefix=config.redis.prefix)
     else:
@@ -305,6 +329,7 @@ def create_app(
             cache_seconds=config.prompts.library_cache_seconds
         ),
         events=events_bus,
+        idempotency=idempotency,
     )
     # Batch API worker: drives /v1/batches lines in waves (app.state so
     # tests can tick it manually; the lifespan loop is the only driver

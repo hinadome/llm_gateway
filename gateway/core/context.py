@@ -133,6 +133,17 @@ class RequestContext:
     # The library prompt this request was served with (set at step 0.5
     # when the key references one) — drives prompt A/B mirroring.
     library_prompt: Any | None = None
+    # Idempotency store key ("idem:<key id>:<client key>") when THIS
+    # request is the executing original for a caller-supplied
+    # Idempotency-Key (waiters leave it None). Held on the ctx so the
+    # error paths in handle_chat can release in-flight waiters.
+    idempotency_key: str | None = None
+    # Fingerprint of the ORIGINAL request (sha256 of the same payload
+    # the response cache keys on), computed at phase 2b before
+    # guardrails can rebind the request. Stored with the entry so a
+    # later retry with different parameters under the same
+    # Idempotency-Key is rejected instead of served the wrong answer.
+    idempotency_fingerprint: str | None = None
     # OpenTelemetry span for this request (None when tracing is disabled)
     otel_span: "Span | None" = None
     # Trace correlation ids (hex strings; None when tracing is disabled)

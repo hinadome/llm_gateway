@@ -45,6 +45,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Feedback capture** | `POST /v1/feedback` lets clients rate any logged request (by `X-Request-Id`, rating 1–5) — the missing half of the quality story: shadow mirroring and prompt A/B compare *outputs*, feedback says which one was good. Admin list + per-model/per-key quality aggregates; counted on `gateway_feedback_total`; `feedback.recorded` event (see [Feedback](#feedback)) |
 | **Synthetic canary probes** | A background loop sends a tiny chat request straight to every configured deployment's provider on a schedule (`canary:` config, disabled by default) — upstream health is *measured*, not inferred from traffic. Direct adapter calls: no pipeline, no log rows, no spend, no breaker accounting. `GET /admin/canaries` fleet view, `POST /admin/canaries/probe` for on-demand waves; `canary.failed` / `canary.recovered` events; `gateway_canary_probes_total{deployment,provider,outcome}` (see [Canary probes](#canary-probes)) |
 | **PII/secret scan** | On-demand audit over *stored* request bodies (`GET /admin/pii-scan` bulk, `GET /admin/logs/{id}/pii-scan` per row): the log keeps the original as received, so this is where exposure actually shows — clients paste API keys into prompts; guardrails may be off or only masking the upstream copy. Detectors mirror the `pii_redaction` guardrail plus jwt/private-key shapes, extendable via `pii_scan.extra_patterns`; findings are kind + count only, never the matched text (see [PII scan](#pii-scan)) |
+| **Idempotency keys** | Retry-safe chat completions: send an `Idempotency-Key` header on any chat-family surface (OpenAI chat, `/v1/responses`, native Anthropic/Gemini) and retried POSTs replay the stored successful response instead of re-executing — no double generation, no double billing (replays are zero-cost `cache_hit` log rows, `X-Gateway-Cache: IDEMPOTENT`). Only successes are stored; key reuse with different parameters is a 400; in-flight duplicates wait for the original. Same backend selection as the response cache, namespaced apart (see [Idempotency](#idempotency)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model |
@@ -139,7 +140,7 @@ To terminate TLS in front of the gateway instead (nginx, Caddy, a load balancer)
 | `POST /v1/batches/{id}/cancel` | Cancel an in-progress batch |
 | `POST /v1/feedback` | Rate a request the calling key made (by its `X-Request-Id`; rating 1–5, optional comment) — see [Feedback](#feedback) |
 
-Diagnostic response headers on every data-plane response (completions, embeddings, images, audio): `X-Request-Id`, `X-Gateway-Model`, `X-Gateway-Provider`, `X-Gateway-Deployment`, `X-Gateway-Cache` (HIT/SEMANTIC/MISS; NONE on the non-cacheable surfaces), `X-Gateway-Cost-Usd`, `X-Gateway-Latency-Ms`.
+Diagnostic response headers on every data-plane response (completions, embeddings, images, audio): `X-Request-Id`, `X-Gateway-Model`, `X-Gateway-Provider`, `X-Gateway-Deployment`, `X-Gateway-Cache` (HIT/SEMANTIC/MISS/IDEMPOTENT; NONE on the non-cacheable surfaces), `X-Gateway-Cost-Usd`, `X-Gateway-Latency-Ms`.
 
 ### Native client formats (Anthropic & Gemini)
 
@@ -343,7 +344,7 @@ Event catalog:
 | `request.received` | after auth+parse, before any policy check — *interceptable* | `model`, `stream`, `key_name` |
 | `request.rejected` | blocked — 4xx (policy, guardrail, rate limit, budget, interceptor veto) | `error`, `status_code` |
 | `request.failed` | errored — 5xx / upstream exhaustion | `error`, `status_code` |
-| `request.cache_hit` | exact or semantic cache replay | `kind` (`hit` / `semantic`) |
+| `request.cache_hit` | exact or semantic cache replay, or an idempotency-key replay | `kind` (`hit` / `semantic` / `idempotency`) |
 | `request.routed` | deployment selected (stream and non-stream) | `deployment`, `provider`, `native_model`, `stream` |
 | `response.completed` | final non-streaming response, post-guardrails, pre-client — *interceptable* | `response`, `usage`, `cost_usd`, `surface` (embedding / images / transcription) |
 | `stream.started` / `stream.completed` | first chunk / end of a streamed body (any outcome) | `model` / `status` |
@@ -423,6 +424,31 @@ curl -H "Authorization: Bearer sk-gw-admin-..." \
 - **Caveats**: stored bodies are truncated at `logging.max_body_chars` — a secret past the boundary is invisible; and `store_bodies: false` is the only mode where nothing can leak into storage in the first place (this audit is for the mode where bodies are kept).
 
 10 tests pin the contract (`tests/test_pii_scan.py`).
+
+## Idempotency
+
+Networks drop responses, clients time out, retries happen — and without idempotency a retried POST generates (and bills) twice. Send an `Idempotency-Key` header on any chat-family surface and the *successful* response is stored under (caller, key); retries replay it instead of re-executing:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-gw-..." \
+  -H "Idempotency-Key: checkout-order-42" \
+  -d '{"model": "gpt-4o", "messages": [...]}'
+# first call:  X-Gateway-Cache: MISS        (billed normally)
+# retry:      X-Gateway-Cache: IDEMPOTENT   (same body, zero cost, no upstream call)
+```
+
+- **Only successes are stored** — errors and guardrail blocks re-execute on retry, which is exactly what a transient failure needs. Streamed successes store the synthesized full response; a stream that dies mid-flight stores nothing.
+- **No double billing**: the stored usage was billed at first execution; replays are zero-cost `cache_hit` log rows (same contract as content-cache hits — `status: "success"` + `cache_hit: true`) and don't touch the caller's spend.
+- **Key reuse with different parameters is a 400** (`idempotency_key_reuse`): the fingerprint is the original request as received — the same normalized identity the response cache keys on. Changing the request under the same key gets a refusal, not a wrong answer.
+- **In-flight duplicates dedup**: the canonical case is retrying while the original still runs (client-side timeout). The retry waits for the original — bounded by `inflight_wait_seconds`, never cancelling it — then replays it; a wedged original times out and the retry executes itself (last writer wins). This map is in-process: with the Redis backend, *completed* entries dedup across workers/replicas, but two requests racing simultaneously on different replicas both execute.
+- **Entries are private per caller** — keyed by (calling key, client-chosen key); two clients may independently use the same key value. Keys are 1–255 non-whitespace characters (invalid → 400 `invalid_idempotency_key`).
+- **Runs before budget**: a retry serves even if the caller's ceiling was crossed after the original was authorized — the original execution was already permitted. New requests under the same key still hit the ceiling.
+- **Scope**: every chat-family surface — `/v1/chat/completions`, `/v1/responses`, native `/v1/messages`, native Gemini `:generateContent` — the replay comes back in the surface's own wire format. Embeddings/images/audio and batch lines ignore the header. No header = zero behavior change; `idempotency.enabled: false` ignores the header entirely.
+
+Config lives in the `idempotency:` section: TTL (default 24h — Stripe's idempotency window), LRU size, in-flight wait, and the backend (`memory` or `redis`, same selection switch as the response cache — Redis entries are namespaced apart at `<prefix>:idem:cache:*`). Outcomes count on `gateway_idempotency_total{outcome}` — `replayed` / `stored` / `rejected` — and replays emit `request.cache_hit` with `kind: "idempotency"`.
+
+14 tests pin the contract (`tests/test_idempotency.py`).
 
 ## Architecture
 

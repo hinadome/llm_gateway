@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import asyncio
 import random
 import time
 import uuid
@@ -59,7 +60,8 @@ from ..schemas import (
     TranscriptionRequest,
 )
 from ..utils import content_to_text, daily_bucket, estimate_tokens, monthly_bucket
-from .cache import ResponseCache, cache_key_for
+from .cache import ResponseCache, cache_payload_for, cache_key_for
+from .idempotency import IdempotencyStore
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
 from .cost import CostCalculator
@@ -160,6 +162,7 @@ class GatewayPipeline:
         semantic: SemanticCache | None = None,
         prompt_library: PromptLibrary | None = None,
         events: EventBus | None = None,
+        idempotency: IdempotencyStore | None = None,
     ) -> None:
         self.config = config
         # Per-key metric series (metrics.per_key — opt-in; the labeler's
@@ -184,6 +187,10 @@ class GatewayPipeline:
         # passes the app-wide bus, where no handlers configured means
         # emit() is an inert lookup.
         self.events = events
+        # Idempotency-Key replay store (None = the header is ignored
+        # entirely). Wraps a response-cache backend with caller-keyed
+        # entries + in-flight dedup — see core/idempotency.py.
+        self.idempotency = idempotency
         # OTel API is a no-op until a provider is installed (spans are then
         # invalid and cost ~nothing), so this is safe unconditionally.
         self._tracer = tracer or trace.get_tracer("gateway")
@@ -210,6 +217,7 @@ class GatewayPipeline:
         auth: AuthContext,
         request_id: str | None = None,
         route: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Response:
         ctx = RequestContext(
             request_id=request_id or f"req_{uuid.uuid4().hex}",
@@ -243,10 +251,15 @@ class GatewayPipeline:
             set_status_on_exception=False,
         ):
             try:
-                response = await self._handle(request, ctx)
+                response = await self._handle(request, ctx, idempotency_key)
             except GatewayError as exc:
                 ctx.status = "blocked" if isinstance(exc, GuardrailBlocked) else "error"
                 ctx.error_message = exc.message
+                # A failed execution is never stored, and its waiters
+                # must not sit out their in-flight timeout — release
+                # them to re-execute (the retry semantics for errors).
+                if ctx.idempotency_key is not None and self.idempotency is not None:
+                    self.idempotency.finish(ctx.idempotency_key)
                 self._request_metric(ctx)
                 await self._log(ctx)
                 self._finish_span(ctx, exc)
@@ -262,6 +275,8 @@ class GatewayPipeline:
             except Exception as exc:  # noqa: BLE001
                 ctx.status = "error"
                 ctx.error_message = f"internal error: {exc}"
+                if ctx.idempotency_key is not None and self.idempotency is not None:
+                    self.idempotency.finish(ctx.idempotency_key)
                 self._request_metric(ctx)
                 await self._log(ctx)
                 self._finish_span(ctx, exc)
@@ -274,7 +289,12 @@ class GatewayPipeline:
             self._finish_span(ctx)
             return response
 
-    async def _handle(self, request: ChatCompletionRequest, ctx: RequestContext) -> Response:
+    async def _handle(
+        self,
+        request: ChatCompletionRequest,
+        ctx: RequestContext,
+        idempotency_key: str | None = None,
+    ) -> Response:
         # Lifecycle event: authenticated + parsed, before any policy. The
         # one in-band veto point before the request starts — an
         # interceptor raising here aborts through the normal error path.
@@ -351,6 +371,35 @@ class GatewayPipeline:
             estimate_tokens(content_to_text(m.content)) for m in request.messages
         )
         await self._check_rate_limit(ctx, estimated_tokens)
+
+        # 2b. Idempotency-Key: a replay returns the stored successful
+        # response for (caller, client key) without re-executing — no
+        # double generation, no double billing (the stored usage was
+        # billed at first execution). Runs BEFORE budget on purpose:
+        # a retry must still serve even if the ceiling was hit in
+        # between — the original execution was already authorized.
+        # Only chat-family surfaces pass a key (embeddings/images/
+        # audio ignore the header; batch lines have none); disabled
+        # config ignores the header entirely.
+        if (
+            idempotency_key is not None
+            and self.idempotency is not None
+            and self.idempotency.enabled
+        ):
+            idempotency_key = idempotency_key.strip()
+            if not idempotency_key or len(idempotency_key) > 255:
+                metrics.IDEMPOTENCY.labels("rejected").inc()
+                raise GatewayError(
+                    400,
+                    "Idempotency-Key must be 1-255 non-whitespace characters.",
+                    "invalid_request_error",
+                    code="invalid_idempotency_key",
+                )
+            replayed = await self._idempotent_replay(ctx, request, idempotency_key)
+            if replayed is not None:
+                return replayed
+        # else: fall through and execute; ctx.idempotency_key marks the
+        # executor for the store sites + the error paths in handle_chat.
 
         # 3. Budget (pre-flight)
         self._check_budget(ctx)
@@ -490,6 +539,23 @@ class GatewayPipeline:
                 request.model, request, semantic_embedding, response, policy_token
             )
 
+        # 10.5 Idempotency: store the successful completion under
+        # (caller, client key) so retries replay instead of re-executing.
+        # Blocked requests flow on through here too (a response-phase
+        # block doesn't raise) — never stored, and their in-flight
+        # waiters are still released: a retry SHOULD re-execute a block.
+        if ctx.idempotency_key is not None and self.idempotency is not None:
+            if ctx.status == "success":
+                await self.idempotency.store(
+                    ctx.idempotency_key,
+                    {
+                        "response": response,
+                        "fingerprint": ctx.idempotency_fingerprint,
+                    },
+                )
+                metrics.IDEMPOTENCY.labels("stored").inc()
+            self.idempotency.finish(ctx.idempotency_key)
+
         self._request_metric(ctx)
         metrics.LATENCY.labels(provider=ctx.provider or "none").observe(
             ctx.latency_ms() / 1000
@@ -506,6 +572,86 @@ class GatewayPipeline:
             cost_usd=ctx.cost_usd,
         )
         return JSONResponse(content=response, headers=self._headers(ctx, "MISS"))
+
+    async def _idempotent_replay(
+        self,
+        ctx: RequestContext,
+        request: ChatCompletionRequest,
+        idempotency_key: str,
+    ) -> Response | None:
+        """Phase 2b worker: replay-or-mark for a caller-supplied
+        Idempotency-Key (already validated + store enabled).
+
+        Returns the replayed Response when a stored (or in-flight, then
+        stored) completion exists; None when this request must execute —
+        with ``ctx.idempotency_key`` then marking it the executor for
+        the store sites and ``handle_chat``'s error paths.
+
+        The fingerprint is the ORIGINAL request — the same normalized
+        payload the response cache keys on — computed here, before the
+        guardrail phase can rebind ``request``. A client retrying sends
+        the same bytes; a client *changing* parameters under the same key
+        gets a 400 rather than the wrong answer.
+        """
+        store = self.idempotency
+        assert store is not None  # the 2b gate checked
+        store_key = store.key_for(ctx.auth.key_id, idempotency_key)
+        fingerprint = hashlib.sha256(cache_payload_for(request).encode()).hexdigest()
+
+        entry = await store.lookup(store_key)
+        if entry is None:
+            in_flight = store.begin(store_key)
+            if in_flight is not None:
+                # A duplicate while the original executes (the canonical
+                # case: the client timed out and retried). Wait for it —
+                # bounded, and shielded so our timeout can never cancel
+                # the original — then re-check the store.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(in_flight), store.inflight_wait_seconds
+                    )
+                except asyncio.TimeoutError:
+                    pass  # wedged original: execute ourselves (last writer wins)
+                entry = await store.lookup(store_key)
+                if entry is None:
+                    # The original failed — errors are never stored, and a
+                    # retry SHOULD re-execute them. Re-mark in flight so a
+                    # third duplicate waits for us instead of triple-firing.
+                    store.begin(store_key)
+        if entry is not None:
+            if entry.get("fingerprint") != fingerprint:
+                metrics.IDEMPOTENCY.labels("rejected").inc()
+                raise GatewayError(
+                    400,
+                    "Idempotency-Key was already used with different request "
+                    "parameters.",
+                    "invalid_request_error",
+                    code="idempotency_key_reuse",
+                )
+            # Replay: the cache-hit semantics, private to this caller.
+            # Zero cost — the stored usage was billed at first execution.
+            metrics.IDEMPOTENCY.labels("replayed").inc()
+            ctx.cache_hit = True
+            await self._emit("request.cache_hit", ctx, kind="idempotency")
+            usage = entry["response"].get("usage") or {}
+            ctx.prompt_tokens = usage.get("prompt_tokens")
+            ctx.completion_tokens = usage.get("completion_tokens")
+            ctx.provider = "idempotency"
+            ctx.status = "success"
+            self._request_metric(ctx)
+            await self._log(ctx)
+            headers = self._headers(ctx, "IDEMPOTENT")
+            if request.stream:
+                return self._streaming_response(
+                    self._replay_cached_stream(entry["response"]), ctx, headers
+                )
+            return JSONResponse(content=entry["response"], headers=headers)
+        # Miss: this request is the executor. The store sites put the
+        # successful completion here; every error path releases the
+        # in-flight waiters via finish().
+        ctx.idempotency_key = store_key
+        ctx.idempotency_fingerprint = fingerprint
+        return None
 
     # ------------------------------------------------------------------
     # Embeddings
@@ -1242,6 +1388,23 @@ class GatewayPipeline:
                         full_response,
                         policy_token or "",
                     )
+                # Idempotency: same success rule as the cache (a complete,
+                # unblocked stream with usage) — a client that retries a
+                # disconnected stream re-executes rather than replaying
+                # a half-finished one.
+                if ctx.idempotency_key is not None and self.idempotency is not None:
+                    await self.idempotency.store(
+                        ctx.idempotency_key,
+                        {
+                            "response": full_response,
+                            "fingerprint": ctx.idempotency_fingerprint,
+                        },
+                    )
+                    metrics.IDEMPOTENCY.labels("stored").inc()
+            # Release in-flight idempotency waiters on every stream exit —
+            # success, block, mid-stream error, client disconnect alike.
+            if ctx.idempotency_key is not None and self.idempotency is not None:
+                self.idempotency.finish(ctx.idempotency_key)
             await self._log(ctx)
 
     async def _replay_cached_stream(self, cached: dict) -> AsyncIterator[str]:
@@ -1591,6 +1754,7 @@ class GatewayPipeline:
                 "providers",
                 "auth",
                 "cache",
+                "idempotency",
                 "rate_limit",
                 "routing",
                 "redis",

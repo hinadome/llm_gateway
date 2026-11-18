@@ -22,5 +22,9 @@ async def create_chat_completion(
     request_id = getattr(raw_request.state, "request_id", None)
     pipeline = raw_request.app.state.pipeline
     return await pipeline.handle_chat(
-        request_body, auth, request_id=request_id, route="chat"
+        request_body,
+        auth,
+        request_id=request_id,
+        route="chat",
+        idempotency_key=raw_request.headers.get("Idempotency-Key"),
     )

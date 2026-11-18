@@ -474,6 +474,28 @@ pii_scan:
   extra_patterns: {}
   exclude_kinds: []
 
+# Idempotency-Key replay for the chat-family surfaces (OpenAI chat,
+# /v1/responses, native Anthropic /v1/messages, native Gemini). A client
+# supplies an "Idempotency-Key" header; the *successful* response is
+# stored under (caller, key) and replays on retry — no double
+# generation, no double billing (replays log as cache hits, zero cost,
+# X-Gateway-Cache: IDEMPOTENT). Only successes are stored: errors and
+# guardrail blocks re-execute on retry, which is what a transient
+# failure needs. Reusing a key with different request parameters is a
+# 400 (idempotency_key_reuse). Duplicates racing while the original is
+# still in flight wait up to inflight_wait_seconds for it (in-process
+# wait; the Redis backend dedups only completed entries
+# cross-replica). No header = no behavior change; enabled: false =
+# the header is ignored entirely. Same backend selection as the
+# response cache, namespaced apart ("idem:") with its own TTL/size.
+# Outcomes count on gateway_idempotency_total{outcome=replayed|stored|rejected}.
+idempotency:
+  enabled: true
+  ttl_seconds: 86400        # 24h — Stripe's idempotency window
+  max_entries: 10000
+  inflight_wait_seconds: 30
+  backend: memory           # memory | redis
+
 # Lifecycle events: subscribe handlers to the request-stage boundaries
 # (request.received / request.routed / response.completed / stream.* /
 # auth.rejected / key.* / budget.threshold / batch.* ...). Two kinds:

@@ -85,6 +85,12 @@ PII_FINDINGS = Counter(
     ["kind"],
 )
 
+IDEMPOTENCY = Counter(
+    "gateway_idempotency_total",
+    "Idempotency-Key outcomes for requests carrying one (replayed / stored / rejected).",
+    ["outcome"],
+)
+
 TTFT = Histogram(
     "gateway_stream_ttft_seconds",
     "Time from request start to the first streamed chunk delivered to the client.",
