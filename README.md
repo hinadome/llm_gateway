@@ -34,6 +34,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Admin UI** | Built-in dashboard at `/admin/ui`: key management (create/edit/revoke, budget bars, alert badges, tenant placement, admin-key grants), tenant management (create/edit/delete with pooled budget bars and the kill switch; platform admins only — tenant admins land on a scoped note), request-log browsing with full request/response inspection, routing table with live circuit-breaker state, guardrail inventory, and a System tab (health, config reload, backups) — one self-contained HTML file, no build step, no external resources (works offline) |
 | **Virtual keys** | Per-key model allowlists (fnmatch patterns), **tool allowlists** (`allowed_tools`, fnmatch patterns over the tool *names* a request may declare — see [Design notes](#design-notes--limitations-mvp)), RPM/TPM rate limits, **in-flight concurrency caps with priority queueing** (QoS: max simultaneous upstream requests per key — cache hits and idempotent replays bypass; waiters queue highest-priority-first, then 429 + `Retry-After`), USD budgets with spend tracking — total plus **daily / monthly windows** (UTC calendar caps, e.g. "no more than $5/day") |
 | **Multi-tenancy** | Tenants (organizations) group virtual keys under a shared policy ceiling — model allowlist, RPM/TPM, and total/daily/monthly budgets that apply to *every* member key, tenant admins included (they manage their own tenant's keys, not its policy; a member must pass both its own checks and the tenant's — the tenant can only narrow). **`pricing_markup_pct`** bills member traffic at cost-plus (20.0 = +20% on provider cost): spend, budgets, logs, exports and the per-key metrics record the *billed* cost while `gateway_cost_usd_total{model}` keeps the actual, and `gateway_markup_usd_total{tenant}` counts the revenue (see [Tenant pricing markup](#tenant-pricing-markup)). **Tenant admins** (`is_admin` key inside a tenant) see only their tenant's keys/logs/stats/usage (a cross-tenant id is a 404, not a 403 — no existence leaks) and are 403 on platform endpoints (tenants, prompts, routing, guardrails, reload, backups). `is_active: false` is a kill switch for every member key (re-enable restores them); pooled spend and budget alerts fire per tenant too (`kind: "tenant"` in the payload); responses carry `X-Gateway-Tenant`; caches are isolated per tenant |
+| **BYOK vault** | Tenants bring their **own provider credentials**: store one encrypted key per (tenant, provider) — `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every request from that tenant rides *their* provider account instead of the platform's configured key, through every retry and fallback leg (per-candidate resolution; an unkeyed fallback provider rides the platform's). Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (MultiFernet list = rotation), the raw key exists only in the PUT body and the upstream auth header — the API speaks a hint (`…1234`), audit records the same, log rows record only the provider name (`byok_provider`) plus `X-Gateway-Byok-Provider` and `gateway_byok_requests_total`. Undecryptable entries fail closed (`byok_key_unreadable` — never a silent platform-key fallback); without a master key the vault is off and every caller is served exactly as before (see [BYOK vault](#byok-vault)) |
 | **Pluggable auth chain** | `auth.chain` lists the strategies that may authenticate a caller, in order: built-in `admin_key` / `virtual_key` / `jwt`, or your own `"pkg.module:ClassName"` step. A **JWT/OAuth bearer token** authenticates the virtual key named by its `sub` claim (HS256 secret or a JWKS with rotation) — budgets, limits and spend accrue to that key exactly as its raw key would |
 | **Audit log** | Security-relevant admin actions (key create/update/revoke, breaker reset) POSTed as JSON webhooks to your SIEM/audit trail — who (key + auth method), what, when; best-effort background delivery, counted on `gateway_audit_events_total` |
 | **Token scoping** | Per-key `allowed_endpoints` (`chat` / `embeddings` / `images` / `audio` / `models`; `chat` covers the native formats and the Responses bridge) and `allowed_ips` (plain IPs or CIDR blocks) — defense in depth beyond model allowlists; admins are never scoped |
@@ -209,6 +210,9 @@ Things to know when pointing a framework at the gateway:
 | `GET /admin/tenants` / `GET /admin/tenants/{id}` | List/inspect tenants, with pooled spend and fired alert levels (platform admin) |
 | `PATCH /admin/tenants/{id}` | Update a tenant's policy ceiling (slug immutable) — `is_active: false` disables every member key at once; budget changes re-arm tenant alerts; `pricing_markup_pct` applies from the next request (auth-time snapshot) |
 | `DELETE /admin/tenants/{id}` | Delete a tenant — refused with 409 while any key still references it (a dangling `tenant_id` fails closed at auth time, so re-home or revoke first) |
+| `GET /admin/tenants/{id}/provider-keys` | List a tenant's stored provider credentials (BYOK vault) — metadata only: provider, label, `key_hint` (last characters, never the key), timestamps. Tenant admins see their own tenant's only; cross-tenant ids 404 |
+| `PUT /admin/tenants/{id}/provider-keys/{provider}` | Store (or replace) a tenant's credential for one provider — from the next request on, that tenant's traffic through that provider rides their account. Requires the vault (`GATEWAY_VAULT_MASTER_KEY`, else 400 `vault_unavailable`); the response carries only the hint; audited with the hint, never the key |
+| `DELETE /admin/tenants/{id}/provider-keys/{provider}` | Remove a stored credential — the next request rides the platform's configured key again (404 when nothing is stored) |
 | `POST /admin/prompts` | Append a version to a named prompt (first version of a name auto-activates) |
 | `GET /admin/prompts` | One summary per prompt name: active version, A/B candidate, version count |
 | `GET /admin/prompts/{name}` | All versions of one name, newest first |
@@ -623,6 +627,85 @@ The rules, so the accounting is never surprising:
 - Rounding matches the calculator's (8 decimals), so `billed = cost × (1 + pct/100)` reconciles exactly against the log.
 
 10 tests pin the contract (`tests/test_tenant_markup.py`).
+
+## BYOK vault
+
+Bring-your-own-key in one PUT: a tenant stores *their* provider credential
+once and every request from that tenant rides **their** provider account
+instead of the platform's configured key — chat (stream and not),
+embeddings, images, audio, through every retry and fallback leg. The
+provider sees the same traffic; the bill lands on the tenant's account;
+the platform's quota is untouched.
+
+```bash
+# Enable the vault (a Fernet key — env only, never config.yaml):
+export GATEWAY_VAULT_MASTER_KEY="$(python -c \
+  'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+
+# Store acme's own OpenAI key (tenant admin or platform admin):
+curl -X PUT http://localhost:8000/admin/tenants/acme/provider-keys/openai \
+  -H "Authorization: Bearer $TENANT_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"key": "sk-acme...", "label": "acme-prod"}'
+# → {"id": "...", "provider": "openai", "key_hint": "…9911", "label": "acme-prod", ...}
+
+# List / delete (metadata only — the key is never returned, not even
+# to the caller that just sent it):
+curl http://localhost:8000/admin/tenants/acme/provider-keys \
+  -H "Authorization: Bearer $TENANT_ADMIN_KEY"
+curl -X DELETE http://localhost:8000/admin/tenants/acme/provider-keys/openai \
+  -H "Authorization: Bearer $TENANT_ADMIN_KEY"
+```
+
+The security posture, in one breath: the raw key exists exactly **twice** —
+in the caller's `PUT` body and in the upstream `Authorization` header. At
+rest it is Fernet-encrypted (AES128-CBC + HMAC-SHA256, authenticated) under
+`GATEWAY_VAULT_MASTER_KEY`, which the process reads from env and never
+persists. Every API surface speaks only a *hint* (`…1234`, the last
+characters — enough to tell stored keys apart, never enough to use); audit
+records carry the hint, never the key; log rows record only **that** BYOK
+was used (`byok_provider` = the provider name) plus the
+`X-Gateway-Byok-Provider` response header and
+`gateway_byok_requests_total{provider}` — the chargeback-compatibility
+metric.
+
+Semantics worth knowing:
+
+- **Per (tenant, provider) granularity** — a tenant keys exactly the
+  providers they use. Nothing else changes: platform callers, other
+  tenants, and keyless callers are byte-for-byte unaffected.
+- **Per-candidate failover resolution** — retries and fallbacks resolve
+  the vault *per candidate deployment*: the openai leg rides the tenant's
+  stored key, an azure fallback leg (unkeyed) rides the platform's azure
+  key. The tenant's key never leaks onto a leg it doesn't belong to.
+- **Fail closed** — an entry that exists but cannot be decrypted (the
+  master key was rotated away without re-storing) fails the request with
+  500 `byok_key_unreadable` instead of silently spending the platform's
+  key. A tenant that deliberately brought their own key must never be
+  silently re-billed to yours. Platform callers are unaffected (the
+  corruption is scoped to the tenant + provider that owns the entry).
+- **Rotation** — `GATEWAY_VAULT_MASTER_KEY` accepts a comma-separated
+  list: the **first** key encrypts new entries, **all** decrypt
+  (MultiFernet). Rotate by prepending the new key, restarting,
+  re-PUTting entries at leisure, then dropping the old key.
+- **Hot path** — decrypted entries are cached in process memory for
+  `vault.ttl_seconds` (30 by default), so serving adds a dict read, not
+  a DB round trip. Admin writes invalidate the local cache immediately;
+  other replicas of a multi-process fleet see writes within the TTL.
+- **Authz** — tenant admins manage *their own* tenant's credentials only
+  (a cross-tenant id is a 404, the same anti-leak semantics as key
+  management); platform admins manage any tenant's.
+- **Platform machinery rides platform keys** — shadow mirrors, canary
+  probes and the semantic-cache embedder authenticate with the
+  platform's configured credentials (they are the gateway's own
+  traffic, not the caller's).
+- **Off by default** — no master key, no vault: the provider-key
+  endpoints answer 400 `vault_unavailable` naming exactly what is
+  missing (never a silent plaintext store), and every caller is served
+  exactly as before. The vault requires
+  `pip install 'llm-gateway[vault]'` (cryptography).
+
+11 tests pin the contract (`tests/test_byok_vault.py`).
 
 ## Runaway-agent protection
 
@@ -1071,6 +1154,10 @@ audit:                 # webhook for security-relevant admin actions (key CRUD, 
   webhook_url: https://siem.example.com/collect   # or url_env: AUDIT_WEBHOOK_URL
   timeout_seconds: 5
   max_attempts: 2
+vault:                 # BYOK vault: tenants store their OWN provider credentials (encrypted).
+                       # ENABLED by GATEWAY_VAULT_MASTER_KEY (env only — it encrypts secrets,
+                       # so it is not itself committed). Requires pip install 'llm-gateway[vault]'.
+  ttl_seconds: 30      # per-(tenant, provider) cache of decrypted keys in process memory
 auth:                  # the authentication chain, in order (default: admin_key + virtual_key)
   chain: [admin_key, virtual_key]
   # jwt:                       # add "jwt" to the chain to accept OAuth/JWT bearer tokens
@@ -1142,6 +1229,7 @@ Because the OpenAI adapter is a passthrough, you can point `providers.openai.api
 | `gateway_alerts_total` | counter | kind, outcome — budget-threshold alerts (sent / failed / skipped-when-no-URL) |
 | `gateway_auth_total` | counter | authenticator, result (authenticated / rejected) — per auth-chain step |
 | `gateway_audit_events_total` | counter | event, outcome — admin-action audit records (sent / failed / skipped-when-no-URL) |
+| `gateway_byok_requests_total` | counter | provider — requests whose upstream call authenticated with the **tenant's** stored credential (BYOK vault) instead of the platform's key; this traffic does not bill the platform's provider accounts |
 | `gateway_logs_pruned_total` | counter | request log rows deleted by the retention task (`logging.retention_days`) |
 | `gateway_logs_dropped_total` | counter | request log rows dropped because the background write queue (`logging.background_write`) was full |
 | `gateway_key_requests_total` | counter | key, status — requests per virtual key (`metrics.per_key`; shadow mirrors excluded) |
@@ -1299,6 +1387,7 @@ CI (`.github/workflows/ci.yml`) runs the suite on Python 3.12–3.14 against SQL
 - **Shadow deployments** — a deployment with `shadow: true` never serves clients (the router excludes it; a model whose deployments are all shadow answers 503). After a *successful* primary response, `shadow_fraction` (default 1.0, clamped) of requests is mirrored to it in the background: always non-streaming `complete()` (even for streamed requests, for comparable latency/status/content), never affecting the client. Mirrors skip guardrails, rate limits, budgets and the caches; results land in `gateway_shadow_requests_total` / `gateway_shadow_latency_seconds`, on the deployment's circuit breaker, and in request-log rows flagged `shadow` (own cost and bodies, sharing the primary's request id) which are excluded from `/admin/stats` and never add to key spend. Mirroring is chat-only (embeddings are not mirrored). **Canary** rollouts use `weight` instead: real traffic, shifted gradually within a same-priority tier.
 - **Budget alerts** — when a key's spend crosses a threshold of its `max_budget_usd` (default 50/80/90/100%), a JSON webhook (`type: budget_alert`, with key, spend, budget, percent and a human message) is POSTed once per level per key. Fired levels persist on the key row, so alerts survive restarts and stay correct across workers; raising a key's budget re-arms the thresholds below the new spend. Evaluation and delivery run in the background spend task — they never block or fail requests — and delivery is best-effort: one retry with backoff, failures logged and counted on `gateway_alerts_total{outcome="failed"}`. With no `webhook_url`/`ALERT_WEBHOOK_URL` configured, crossings are only counted as `outcome="skipped"`.
 - **Multi-tenancy** — tenants are organizations of virtual keys carrying their own policy ceiling (`allowed_models`, `allowed_tools`, RPM/TPM, total/daily/monthly budgets — the same budget machinery as keys, pooled across every member). A member key must pass **both** its own checks and the tenant's; the tenant can only narrow, and there is deliberately **no admin bypass** at the tenant layer — a tenant admin (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but is still a member of it. Tenant scoping is 404-based for cross-tenant ids (confirming another tenant's key exists would leak it) and 403-based for platform endpoints (tenants CRUD, prompts, routing, guardrail inspection, reload, backups — `require_platform_admin`); keys are re-homed only by platform admins (tenant admins' creates are forced into their own tenant, a mismatching explicit `tenant_id` is a 400). Auth fails closed: a dangling `tenant_id` (corrupt state) or `is_active: false` (the platform admin's kill switch) rejects every member key with 401 — a disabled tenant's keys are never served as unrestricted platform keys. Spend accounting writes both rows (key and tenant) in separate transactions; rate limits are two windows (the key's own and the shared `tenant:{id}` one, TPM included); budget alerts fire per level on either, with `kind: "key" | "tenant"` in the payload and fired levels persisted on the matching row. Data-plane responses carry `X-Gateway-Tenant` (the slug); log rows and the usage export carry `tenant_id` (NULL = platform key). Cache identity is tenant-salted: the exact/semantic chat caches fold in a **response-policy token** (the tenant plus every response-capable guardrail active for the caller, so a key's `disabled_guardrails` or a scoped guardrail splits entries) — a hit skips response guardrails, so callers share entries only when the policy that shaped them matches; the embeddings cache is salted by tenant alone (no guardrails run there).
+- **BYOK vault** — tenants can store their *own* provider credentials (encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` — env only, never config.yaml, since it encrypts secrets) and their requests then ride their account instead of the platform's configured key: one credential per (tenant, provider), resolved per candidate inside the retry/fallback loop (so the tenant's key never leaks onto a fallback provider they didn't key). The raw key exists exactly twice — the `PUT` body and the upstream auth header; every management surface speaks a hint (`…1234`), audit records carry the hint, log rows only the provider name (`byok_provider`, `X-Gateway-Byok-Provider`, `gateway_byok_requests_total`). Fail closed on undecryptable entries (`byok_key_unreadable` — a rotated-away master key is a 500, never a silent platform-key fallback); fail honest when disabled (no master key → `PUT` 400s `vault_unavailable`, reads stay empty, callers unchanged). Decrypted entries are cached in process memory for `vault.ttl_seconds` with invalidate-on-write — other replicas converge within the TTL (a documented bound, not a guarantee; Redis-shared invalidation would be a follow-up). Not covered yet: a `vault.strict` mode (platform credentials refused for tenants that keyed a provider) and an admin-UI surface for stored keys.
 - **Usage export** — `GET /admin/usage/export` is a billing/chargeback extract over the request log: rows in `[since, until]` (ISO-8601, naive timestamps read as UTC, default the last 30 days), filterable by `key_name`/`model`/`status`. CSV (stable column order, attachment download) or JSON (rows + a `summary` with totals and by-status/by-key/by-model aggregates, most-expensive-first). Mirrored shadow calls are excluded by default — they never cost the client anything — and included flagged with `include_shadow=true`; cache-hit rows appear with their cached token counts and 0 cost. The row list is capped by `limit` (default 100k, max 250k; the `truncated` flag says so) while aggregates always cover the whole window. The admin UI's "Export usage (CSV)" button downloads the selected window.
 - **Circuit breakers** are per-process by default (each worker/replica trips and recovers on its own evidence); `routing.breaker.backend: redis` shares the state so one replica's trip skips the deployment fleet-wide, with `/metrics` scrapes and admin views re-syncing from shared state. If Redis is down, the breaker fails *open* (routes anyway) — protection, not correctness. For streams, only failures *before the first chunk* trip the breaker: once a stream is committed, later upstream errors surface to the client per the failover contract.
 - **Admin UI** — a read-mostly operations tool, not an audit console: it edits keys, resets breakers and expands log rows (including stored request/response bodies) on top of the JSON admin API. The shell itself needs no auth because it contains no data; the admin key is pasted into a login overlay, kept in the browser tab's `sessionStorage` and sent as a bearer token. The page is fully self-contained (no CDN, fonts or scripts fetched — enforced by a test) so it works in air-gapped deployments, at the cost of hand-rolled vanilla JS in one file.

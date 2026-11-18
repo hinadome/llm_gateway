@@ -452,6 +452,25 @@ audit:
   # timeout_seconds: 5
   # max_attempts: 2
 
+# BYOK vault: tenants store their OWN provider credentials (encrypted,
+# admin API: PUT /admin/tenants/{id}/provider-keys/{provider}) and their
+# requests ride their account instead of the platform's configured key —
+# chat, embeddings, images and audio, through every retry and fallback.
+# The vault is ENABLED by GATEWAY_VAULT_MASTER_KEY (env, never here: it
+# encrypts secrets, so it is not itself committed):
+#   export GATEWAY_VAULT_MASTER_KEY="$(python -c \
+#     'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+# (pip install 'llm-gateway[vault]'). Without it the provider-key
+# endpoints answer 400 and nothing else changes. Rotation: the setting
+# accepts a comma-separated list — the FIRST key encrypts, all decrypt;
+# prepend the new key, restart, re-store entries at leisure, drop the old.
+vault:
+  # How long a decrypted credential is cached in process memory per
+  # (tenant, provider) — the hot path is a dict read, not a DB round
+  # trip. Admin writes invalidate the local cache immediately; other
+  # replicas of a multi-process fleet see writes within the TTL.
+  ttl_seconds: 30
+
 # The authentication chain: which strategies may authenticate a caller,
 # in order (first match wins; a step can also reject outright → 401).
 # Entries are built-in names (admin_key, virtual_key, jwt) or

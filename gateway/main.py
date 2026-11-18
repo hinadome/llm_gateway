@@ -58,6 +58,7 @@ from .core.pipeline import GatewayPipeline
 from .core.ratelimit import RateLimiter
 from .core.runaway import RunawayProtector
 from .core.concurrency import ConcurrencyLimiter
+from .core.vault import VaultService
 from .core.redis_backends import (
     RedisCircuitBreakerRegistry,
     RedisRateLimiter,
@@ -206,7 +207,14 @@ def create_app(
         breakers = RedisCircuitBreakerRegistry(
             redis_client, config.routing, prefix=config.redis.prefix
         )
-    router = Router(config, providers, breakers=breakers)
+    # BYOK vault (tier 31): enabled iff GATEWAY_VAULT_MASTER_KEY is set
+    # and the encryption package is importable — otherwise it sits
+    # disabled (provider-key endpoints 400 honestly; callers route with
+    # the platform's configured keys, exactly as before).
+    vault = VaultService(
+        settings.vault_master_key, ttl_seconds=config.vault.ttl_seconds
+    )
+    router = Router(config, providers, breakers=breakers, vault=vault)
     guardrails = GuardrailManager.from_config(config.guardrails, tracer=tracer)
     # Lifecycle events: the stage-boundary pub/sub layer (see
     # core/events.py). Inert until handlers are configured — emission
@@ -347,6 +355,7 @@ def create_app(
         idempotency=idempotency,
         runaway=runaway,
         concurrency=concurrency,
+        vault=vault,
     )
     # Batch API worker: drives /v1/batches lines in waves (app.state so
     # tests can tick it manually; the lifespan loop is the only driver
@@ -525,6 +534,9 @@ def create_app(
     app.state.pii_scanner = pii_scanner
     # Prompt library (admin-plane CRUD routes live in api/admin.py).
     app.state.prompt_library = pipeline.prompt_library
+    # BYOK vault (admin-plane provider-key CRUD; the serving side lives
+    # on the router/pipeline references).
+    app.state.vault = vault
     app.state.config = config
     # Env settings (DB URL, config path, ...): the reload path re-reads
     # config.yaml from settings.config_path; endpoints under /admin use
@@ -589,6 +601,7 @@ def create_app(
                 "X-Gateway-Provider",
                 "X-Gateway-Deployment",
                 "X-Gateway-Cache",
+                "X-Gateway-Byok-Provider",
                 "X-Gateway-Cost-Usd",
                 "X-Gateway-Latency-Ms",
             ],

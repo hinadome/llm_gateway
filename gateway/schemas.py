@@ -468,6 +468,21 @@ class TenantUpdateRequest(_ResidencyRequirement):
     monthly_budget_usd: float | None = None
 
 
+class ProviderKeyUpsertRequest(BaseModel):
+    """PUT /admin/tenants/{id}/provider-keys/{provider} — store (or
+    replace) a tenant's credential for one provider (BYOK vault).
+
+    The key exists in this request body and in the vault's encrypted
+    storage — nowhere else. It is never echoed back, not even to the
+    caller that just sent it: the response carries only the hint (last
+    characters), the audit record the same."""
+
+    key: str = Field(min_length=1)
+    # Free-form label so an operator managing many stored keys can tell
+    # them apart ("acme-prod", "acme-eu", ...).
+    label: str | None = Field(default=None, max_length=128)
+
+
 class PromptCreateRequest(BaseModel):
     """POST /admin/prompts — append a version to a (new or existing)
     named prompt. The first version of a name auto-activates."""

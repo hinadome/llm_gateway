@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     # --host/--port on its own command line).
     host: str = "127.0.0.1"  # GATEWAY_HOST
     port: int = 8000  # GATEWAY_PORT
+    # BYOK vault master key (tier 31): a Fernet key (urlsafe-base64,
+    # 32 bytes — python -c "from cryptography.fernet import Fernet;
+    # print(Fernet.generate_key().decode())"). Comma-separated list =
+    # rotation support: the FIRST key encrypts new entries, all keys
+    # decrypt (MultiFernet). Never in config.yaml — secrets live in
+    # env, and this one encrypts other secrets. None = the vault is
+    # disabled: provider-key endpoints answer 400, callers route with
+    # the platform's configured keys (nothing changes).
+    vault_master_key: str | None = None
 
 
 @lru_cache
@@ -448,6 +457,25 @@ class AuditConfig(BaseModel):
         return self.webhook_url
 
 
+class VaultConfig(BaseModel):
+    """BYOK vault knobs. The vault is ENABLED by the master key
+    (GATEWAY_VAULT_MASTER_KEY — env, never config.yaml: it encrypts
+    secrets, so it is not itself committed); without a master key the
+    provider-key endpoints answer 400 and every request routes with
+    the platform's configured keys.
+
+    ``ttl_seconds`` is how long a decrypted credential is cached in
+    process memory per (tenant, provider): the hot path is a dict
+    read, not a DB round trip. Admin writes invalidate the local
+    cache immediately; other replicas of a multi-process fleet see
+    writes within the TTL (and a key ROTATED OUT of the master-key
+    list simply starts failing decryption — fail closed — until
+    entries are re-stored).
+    """
+
+    ttl_seconds: int = 30
+
+
 class PromptsConfig(BaseModel):
     """Gateway-managed prompt policy (applied before guardrails/cache).
 
@@ -821,6 +849,7 @@ class GatewayConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    vault: VaultConfig = Field(default_factory=VaultConfig)
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)

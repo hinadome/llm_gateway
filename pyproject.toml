@@ -33,6 +33,9 @@ auth = [
 postgres = [
     "asyncpg>=0.30",
 ]
+vault = [
+    "cryptography>=42.2",
+]
 
 [dependency-groups]
 dev = [
@@ -43,6 +46,7 @@ dev = [
     "openai>=3.49.0",
     "pyjwt[crypto]>=2.9",
     "asyncpg>=0.30",
+    "cryptography>=42.2",
 ]
 
 [build-system]

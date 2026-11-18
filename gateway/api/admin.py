@@ -23,6 +23,7 @@ from ..core.alerts import BudgetAlertManager
 from ..core.context import AuthContext
 from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
+from ..core.vault import VaultService
 from ..db import get_sessionmaker
 from ..errors import GatewayError
 from ..models import Feedback, RequestLog, Tenant, VirtualKey
@@ -32,6 +33,7 @@ from ..schemas import (
     KeyUpdateRequest,
     PromptCreateRequest,
     PromptPatchRequest,
+    ProviderKeyUpsertRequest,
     ReplayRequest,
     TenantCreateRequest,
     TenantUpdateRequest,
@@ -496,6 +498,112 @@ async def delete_tenant(
 
 
 # ----------------------------------------------------------------------
+# BYOK vault: tenant-owned provider credentials (tier 31)
+# ----------------------------------------------------------------------
+
+
+async def _vault_tenant_guard(
+    session, tenant_id: str, admin: AuthContext
+) -> Tenant:
+    """Shared guard for the vault endpoints: the tenant must exist, and
+    a *tenant admin* may only touch their own tenant (cross-tenant ids
+    404 — same anti-leak semantics as key management; platform admins
+    are not restricted)."""
+    tenant = await session.get(Tenant, tenant_id)
+    if tenant is None:
+        raise GatewayError(
+            404, f"Tenant '{tenant_id}' not found.", "invalid_request_error"
+        )
+    if admin.tenant_id is not None and admin.tenant_id != tenant_id:
+        raise GatewayError(
+            404, f"Tenant '{tenant_id}' not found.", "invalid_request_error"
+        )
+    return tenant
+
+
+@router.get("/admin/tenants/{tenant_id}/provider-keys")
+async def list_provider_keys(
+    tenant_id: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Metadata for every provider credential a tenant stored: provider,
+    label, key hint (last characters — never the key), timestamps. The
+    vault being disabled is not an error for reads: an empty list is an
+    empty list."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        tenant = await _vault_tenant_guard(session, tenant_id, admin)
+        vault: VaultService = raw_request.app.state.vault
+        data = await vault.list_for_tenant(tenant.id)
+    return {"object": "list", "tenant_id": tenant.id, "data": data}
+
+
+@router.put("/admin/tenants/{tenant_id}/provider-keys/{provider}")
+async def upsert_provider_key(
+    tenant_id: str,
+    provider: str,
+    body: ProviderKeyUpsertRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Store (or replace) a tenant's credential for one provider. From
+    the next request on (within the cache TTL), every request from that
+    tenant through that provider rides the tenant's account instead of
+    the platform's configured key — chat, embeddings, images and audio
+    included. The key itself is encrypted at rest and never returned,
+    not even to the caller that just sent it; the response and the
+    audit record carry only the hint."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        tenant = await _vault_tenant_guard(session, tenant_id, admin)
+        vault: VaultService = raw_request.app.state.vault
+        result = await vault.put(tenant.id, provider, body.key, label=body.label)
+    raw_request.app.state.audit.record(
+        "vault.provider_key.upsert",
+        actor=admin,
+        tenant_id=tenant.id,
+        tenant_name=tenant.name,
+        provider=provider,
+        key_hint=result["key_hint"],
+    )
+    return result
+
+
+@router.delete("/admin/tenants/{tenant_id}/provider-keys/{provider}")
+async def delete_provider_key(
+    tenant_id: str,
+    provider: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Remove a tenant's stored credential. The next request (within
+    the cache TTL) rides the platform's configured key again. Deleting
+    a nonexistent entry is a 404, not a silent success — an operator
+    deserves to know the stored key they thought was there is not."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        tenant = await _vault_tenant_guard(session, tenant_id, admin)
+        vault: VaultService = raw_request.app.state.vault
+        deleted = await vault.delete(tenant.id, provider)
+        if not deleted:
+            raise GatewayError(
+                404,
+                f"No stored provider key for tenant '{tenant.name}' / "
+                f"provider '{provider}'.",
+                "invalid_request_error",
+            )
+    raw_request.app.state.audit.record(
+        "vault.provider_key.delete",
+        actor=admin,
+        tenant_id=tenant.id,
+        tenant_name=tenant.name,
+        provider=provider,
+    )
+    return {"tenant_id": tenant.id, "provider": provider, "deleted": True}
+
+
+# ----------------------------------------------------------------------
 # Prompt library (prompt ops)
 # ----------------------------------------------------------------------
 
@@ -652,6 +760,10 @@ def _log_row(row: RequestLog) -> dict:
         "cache_hit": row.cache_hit,
         "shadow": bool(row.shadow),
         "prompt_variant": row.prompt_variant,
+        # BYOK vault: the provider whose upstream call used the TENANT'S
+        # stored credential (None = platform credential). Observability
+        # only — the credential itself is never stored anywhere.
+        "byok_provider": row.byok_provider,
         "trace_id": row.trace_id,
         "span_id": row.span_id,
         "auth_method": row.auth_method,

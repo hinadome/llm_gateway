@@ -1007,10 +1007,14 @@ guardrails = [
 postgres = [
     { name = "asyncpg" },
 ]
+vault = [
+    { name = "cryptography" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "asyncpg" },
+    { name = "cryptography" },
     { name = "fakeredis" },
     { name = "openai" },
     { name = "presidio-analyzer" },
@@ -1023,6 +1027,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30" },
+    { name = "cryptography", marker = "extra == 'vault'", specifier = ">=42.2" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "opentelemetry-api", specifier = ">=1.28" },
@@ -1041,11 +1046,12 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.30" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
-provides-extras = ["guardrails", "auth", "postgres"]
+provides-extras = ["guardrails", "auth", "postgres", "vault"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "cryptography", specifier = ">=42.2" },
     { name = "fakeredis", specifier = ">=2.23" },
     { name = "openai", specifier = ">=3.49.0" },
     { name = "presidio-analyzer", specifier = ">=2.2" },

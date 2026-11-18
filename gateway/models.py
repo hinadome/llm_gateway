@@ -5,7 +5,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -262,6 +271,53 @@ class Tenant(Base):
         }
 
 
+class ProviderKey(Base):
+    """BYOK vault (tier 31): one *encrypted* provider credential per
+    (tenant, provider). The tenant's stored key replaces the platform's
+    configured provider key for every request that tenant makes through
+    that provider (see core/vault.py for the security posture). The raw
+    key is Fernet-encrypted under GATEWAY_VAULT_MASTER_KEY and exists in
+    this row only as ``encrypted_key``; ``to_public_dict`` never exposes
+    it (the API speaks ``key_hint`` — the last characters, enough to
+    tell stored keys apart, never enough to use)."""
+
+    __tablename__ = "provider_keys"
+    __table_args__ = (UniqueConstraint("tenant_id", "provider"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    # Provider id as in config.yaml's providers: section (openai, azure,
+    # anthropic, ...) — the same string deployment.provider carries.
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Fernet token (base64). Decrypt with the vault master key.
+    encrypted_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # Last characters of the credential — display only, never a secret.
+    key_hint: Mapped[str] = mapped_column(String(12), default="")
+    # Free-form label ("acme-prod-openai"), for operators managing many.
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    def to_public_dict(self) -> dict:
+        """Metadata only — the encrypted key is deliberately absent, and
+        so is anything derived from the raw key beyond the hint."""
+        return {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            "provider": self.provider,
+            "key_hint": self.key_hint,
+            "label": self.label,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class RequestLog(Base):
     __tablename__ = "request_logs"
 
@@ -330,6 +386,13 @@ class RequestLog(Base):
     # tested ("name vN"). Such rows are shadow rows sharing the primary's
     # request_id; the column is what comparison queries group on.
     prompt_variant: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # BYOK vault (tier 31): the provider whose upstream call was made
+    # with the TENANT'S stored credential instead of the platform's
+    # configured key (None = platform credential, incl. every row from
+    # platform/admin callers and cache hits). Observability only: it
+    # answers "why did upstream 401 — because YOUR stored key was
+    # rejected" without ever recording the key itself.
+    byok_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # OpenTelemetry correlation (hex strings; null when tracing is disabled)
     trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     span_id: Mapped[str | None] = mapped_column(String(16), nullable=True)

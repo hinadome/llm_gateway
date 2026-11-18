@@ -91,6 +91,15 @@ PROMPT_COMPRESSION_SAVED = Counter(
     ["model"],
 )
 
+BYOK_REQUESTS = Counter(
+    "gateway_byok_requests_total",
+    "Requests whose upstream call authenticated with the TENANT'S "
+    "stored provider credential (BYOK vault) instead of the platform's "
+    "configured key, by provider. The chargeback-compatibility metric: "
+    "this traffic does not bill the platform's provider accounts.",
+    ["provider"],
+)
+
 CACHE = Counter(
     "gateway_cache_hits_total",
     "Response cache lookups.",

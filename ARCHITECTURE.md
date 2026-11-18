@@ -374,6 +374,15 @@ gateway/
 │   │                       them to the library prompt's candidate version (same
 │   │                       deployment, candidate swapped into the system slot;
 │   │                       background tasks, like spend accounting);
+│   │                       _note_byok (tier 31) marks the ctx right after
+│   │                       every dispatch when the upstream call rode
+│   │                       the TENANT'S stored vault credential —
+│   │                       cache-only peek, provider NAME only
+│   │                       (X-Gateway-Byok-Provider, RequestLog.
+│   │                       byok_provider, gateway_byok_requests_total),
+│   │                       and all eight router call sites pass
+│   │                       auth=ctx.auth so the vault resolves
+│   │                       per candidate inside retries/fallbacks;
 │   │                       per-key series (metrics.per_key) emit beside the
 │   │                       global ones in _request_metric/_account_usage — the
 │   │                       same call sites the mirrors never reach
@@ -477,7 +486,28 @@ gateway/
 │   │                       residency_not_satisfied (model + tags
 │   │                       named). Shadow mirrors are filtered too: a
 │   │                       mirror is a copy of the caller's data, so it
-│   │                       only lands on compliant deployments
+│   │                       only lands on compliant deployments. Tier 31
+│   │                       adds BYOK: _resolve_provider_cfg(deployment,
+│   │                       auth) — called per candidate inside _dispatch
+│   │                       and complete_stream — copies the provider
+│   │                       config with the TENANT'S stored vault key
+│   │                       (api_key set, api_key_env cleared) when the
+│   │                       caller's tenant keyed that provider, so
+│   │                       resolve_key() — the single place adapters
+│   │                       read credentials — returns the tenant's key
+│   │                       with ZERO adapter changes, and the stored
+│   │                       key follows the request through every
+│   │                       retry/fallback leg (per-candidate: an
+│   │                       unkeyed fallback provider rides the
+│   │                       platform's own). Platform traffic, keyless
+│   │                       tenants and disabled vaults get the config
+│   │                       untouched; an undecryptable entry raises
+│   │                       BEFORE the retry try/except — fail closed
+│   │                       (byok_key_unreadable), never a silent
+│   │                       platform-key fallback. Shadow mirrors,
+│   │                       canary probes and embed_fn_for keep the sync
+│   │                       _provider_cfg: the platform's machinery
+│   │                       rides platform credentials by design
 │   ├── breaker.py         Per-deployment circuit breakers: closed → open (skip) → half-open (probe);
 │   │                       request-level failure counting, Prometheus state gauge,
 │   │                       admin reset; register() is idempotent — a config
@@ -499,6 +529,31 @@ gateway/
 │   │                       are (model, policy token) so near-duplicates never
 │   │                       cross tenants or policies; TTL + LRU
 │   │                       bounded, embedder failures degrade to a miss
+│   ├── vault.py            BYOK vault (tier 31): tenant-owned provider
+│   │                       credentials, encrypted at rest. VaultService
+│   │                       wraps Fernet/MultiFernet under
+│   │                       GATEWAY_VAULT_MASTER_KEY (comma-separated =
+│   │                       rotation: first encrypts, all decrypt) with
+│   │                       a per-(tenant,provider) TTL cache of
+│   │                       decrypted keys + a negative cache, both
+│   │                       invalidated on admin writes (other replicas
+│   │                       converge within the TTL — documented bound);
+│   │                       double-checked lock around the DB read.
+│   │                       put/get/peek/delete/list_for_tenant; peek is
+│   │                       cache-only (observability after dispatch —
+│   │                       a dict read, never a second query). The raw
+│   │                       key exists exactly twice: the caller's PUT
+│   │                       body and the upstream auth header — every
+│   │                       management surface speaks key_hint (last
+│   │                       chars), audit records the same, log rows
+│   │                       only byok_provider (the name). Disabled
+│   │                       (no master key / no cryptography): admin
+│   │                       PUT 400s vault_unavailable naming what is
+│   │                       missing, serving skips lookups entirely —
+│   │                       byte-for-byte neutral. Undecryptable
+│   │                       (rotated-away key) 500s byok_key_unreadable
+│   │                       — fail closed, never a silent platform-key
+│   │                       fallback
 │   ├── cost.py             CostCalculator: per-1M-token pricing, longest-prefix lookup;
 │   │                       unit prices for non-token modalities (image_usd,
 │   │                       audio_usd_per_minute, speech_usd_per_1m_chars —
@@ -1290,7 +1345,8 @@ flowchart TD
     REQ["request.model = public name"] --> RESOLVE["Router.resolve: sorted deployments by priority<br/>(shadow deployments are never returned)"]
     RESOLVE --> FILTER["drop deployments with open circuits<br/>(if all are open: keep everything)"]
     FILTER --> PICK["weighted-random pick within the top priority tier"]
-    PICK --> CALL["call adapter.complete / adapter.stream"]
+    PICK --> BYOK["resolve provider cfg PER CANDIDATE (tier 31): the<br/>tenant's stored vault key replaces the platform's<br/>when the caller's tenant keyed this provider — so<br/>retries and unkeyed fallback legs each resolve<br/>their own; undecryptable = fail closed here,<br/>before any upstream call"]
+    BYOK --> CALL["call adapter.complete / adapter.stream"]
     CALL --> ERR{"ProviderError?"}
     ERR -->|no| OK["return response / stream<br/>+ breaker.record_success"]
     ERR -->|"retryable (429, 5xx, network)"| RETRY{"attempts left?"}
@@ -1323,6 +1379,7 @@ Emits enqueue observers *before* an interceptor's abort propagates — subscribe
 ```mermaid
 erDiagram
     TENANT ||--o{ VIRTUAL_KEY : "tenant_id"
+    TENANT ||--o{ PROVIDER_KEY : "tenant_id (BYOK vault: one encrypted credential per tenant+provider)"
     VIRTUAL_KEY ||--o{ REQUEST_LOG : "key_name (denormalized)"
     REQUEST_LOG ||--o{ FEEDBACK : "request_id (no FK — ownership enforced in the API layer)"
     TENANT {
@@ -1406,7 +1463,18 @@ erDiagram
         str trace_id "indexed; OTel trace (32 hex), NULL when tracing off"
         str span_id "OTel span (16 hex), NULL when tracing off"
         str auth_method "which chain step authenticated (virtual_key/jwt/...)"
+        str byok_provider "BYOK: provider whose upstream call used the TENANT'S stored credential, NULL = platform key — the name only, never the key"
         datetime created_at "indexed"
+    }
+    PROVIDER_KEY {
+        str id PK "uuid hex"
+        str tenant_id "indexed; whose credential this is"
+        str provider "config.yaml providers: id (openai, azure, ...); unique per (tenant, provider)"
+        text encrypted_key "Fernet token under GATEWAY_VAULT_MASTER_KEY — the raw key is never stored"
+        str key_hint "last chars, display only (…1234)"
+        str label "free-form operator label (acme-prod)"
+        datetime created_at
+        datetime updated_at
     }
     FEEDBACK {
         str id PK "uuid hex"
@@ -1475,7 +1543,7 @@ erDiagram
     BATCH ||--o{ BATCH_RESULT : "batch_id"
 ```
 
-**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays.
+**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays. **BYOK vault (tier 31):** a tenant can additionally store its *own* provider credentials — one encrypted entry per (tenant, provider), `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every member request through that provider then authenticates with the tenant's key instead of the platform's configured one (see `core/vault.py`; the swap happens in `Router._resolve_provider_cfg`, per candidate inside the retry/fallback loop, so the stored key follows every leg and an unkeyed fallback provider rides the platform's credential alone). Raw keys are Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (env only; MultiFernet list = rotation), exist only in the PUT body and the upstream auth header, and are never echoed, logged or audited — the API and audit records speak `key_hint`, log rows `byok_provider` (the provider name). Undecryptable entries (a rotated-away master key) fail closed with `byok_key_unreadable` — a tenant that deliberately brought its own key is never silently re-billed to the platform's; platform callers are untouched. Tenant admins manage their own tenant's credentials only (cross-tenant 404, like everything tenant-scoped); without a master key the vault is simply off — endpoints 400 honestly, serving unchanged.
 
 Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` (the `postgres` extra, asyncpg) with no code changes — only async SQLAlchemy is used. JSON columns compile to JSONB on PostgreSQL via a shared variant type (`JSONColumn` in `models.py`), which keeps the budget-alert compare-and-swap meaningful there (semantic JSONB equality; plain `json` has no `=` operator); PostgreSQL engines also pre-ping pooled connections so server-side drops recycle instead of surfacing as 500s. The whole test suite runs against either backend — `GATEWAY_TEST_DATABASE_URL` points `conftest` at a live PostgreSQL server, where each test gets its own database (created and dropped around the run; the `VACUUM INTO` backup tests skip, and a test pins the `pg_dump`-pointing 400 refusal). Online backups stay SQLite-only by construction.
 

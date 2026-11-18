@@ -68,6 +68,7 @@ from .context import AuthContext, RequestContext
 from .cost import CostCalculator, cached_tokens_from_usage
 from .runaway import RunawayProtector
 from .concurrency import ConcurrencyLimiter
+from .vault import VaultService
 from .events import EventBus
 from .logging_svc import LoggingService
 from .router import Router
@@ -179,6 +180,7 @@ class GatewayPipeline:
         idempotency: IdempotencyStore | None = None,
         runaway: RunawayProtector | None = None,
         concurrency: ConcurrencyLimiter | None = None,
+        vault: "VaultService | None" = None,
     ) -> None:
         self.config = config
         # Per-key metric series (metrics.per_key — opt-in; the labeler's
@@ -219,6 +221,14 @@ class GatewayPipeline:
         # constructions): per-key/tenant in-flight caps with priority
         # queueing — see core/concurrency.py.
         self.concurrency = concurrency
+        # BYOK vault (tier 31). None = standalone constructions get a
+        # DISABLED service (lookups no-op, platform credentials); the
+        # real one is built in create_app from GATEWAY_VAULT_MASTER_KEY.
+        # Serving paths consult it for the tenant's stored provider key
+        # (inside the router's _resolve_provider_cfg); here it is only
+        # peeked — after dispatch — to mark the ctx when the call rode
+        # the tenant's credential (log row, header, metric).
+        self.vault = vault or VaultService(None)
         # OTel API is a no-op until a provider is installed (spans are then
         # invalid and cost ~nothing), so this is safe unconditionally.
         self._tracer = tracer or trace.get_tracer("gateway")
@@ -661,11 +671,12 @@ class GatewayPipeline:
         # deployment mid-failover.
         if request.stream:
             deployment, chunk_iterator = await self.router.complete_stream(
-                request, ctx.auth.effective_residencies()
+                request, ctx.auth.effective_residencies(), auth=ctx.auth
             )
             ctx.provider = deployment.provider
             ctx.deployment = deployment.name
             ctx.native_model = deployment.model
+            await self._note_byok(ctx, deployment)
             await self._emit(
                 "request.routed",
                 ctx,
@@ -689,11 +700,12 @@ class GatewayPipeline:
             )
 
         deployment, response = await self.router.complete(
-            request, ctx.auth.effective_residencies()
+            request, ctx.auth.effective_residencies(), auth=ctx.auth
         )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
+        await self._note_byok(ctx, deployment)
         await self._emit(
             "request.routed",
             ctx,
@@ -1004,11 +1016,12 @@ class GatewayPipeline:
         # 5. Route to provider (retries/fallbacks/breakers as for chat).
         #    Residency requirement filters the ladder, same as chat.
         deployment, response = await self.router.embed(
-            request, ctx.auth.effective_residencies()
+            request, ctx.auth.effective_residencies(), auth=ctx.auth
         )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
+        await self._note_byok(ctx, deployment)
 
         # 6. Accounting
         usage = response.get("usage") or {}
@@ -1069,7 +1082,7 @@ class GatewayPipeline:
                 ctx,
                 request,
                 lambda r: self.router.generate_image(
-                    r, residencies=ctx.auth.effective_residencies()
+                    r, residencies=ctx.auth.effective_residencies(), auth=ctx.auth
                 ),
                 request.prompt,
                 "image generation completed",
@@ -1096,7 +1109,7 @@ class GatewayPipeline:
                 ctx,
                 request,
                 lambda r: self.router.edit_image(
-                    r, residencies=ctx.auth.effective_residencies()
+                    r, residencies=ctx.auth.effective_residencies(), auth=ctx.auth
                 ),
                 request.prompt,
                 "image edit completed",
@@ -1122,7 +1135,7 @@ class GatewayPipeline:
                 ctx,
                 request,
                 lambda r: self.router.vary_image(
-                    r, residencies=ctx.auth.effective_residencies()
+                    r, residencies=ctx.auth.effective_residencies(), auth=ctx.auth
                 ),
                 None,
                 "image variation completed",
@@ -1158,6 +1171,7 @@ class GatewayPipeline:
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
+        await self._note_byok(ctx, deployment)
 
         images = len(response.get("data") or []) or max(1, request.n)
         cost = self.cost_calculator.calculate_images(
@@ -1231,11 +1245,12 @@ class GatewayPipeline:
         self._check_budget(ctx)
 
         deployment, (content, media_type) = await self.router.transcribe(
-            request, ctx.auth.effective_residencies()
+            request, ctx.auth.effective_residencies(), auth=ctx.auth
         )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
+        await self._note_byok(ctx, deployment)
 
         duration = content.get("duration") if isinstance(content, dict) else None
         minutes = float(duration) / 60.0 if duration else 0.0
@@ -1300,11 +1315,12 @@ class GatewayPipeline:
         self._check_budget(ctx)
 
         deployment, (audio, media_type) = await self.router.speak(
-            request, ctx.auth.effective_residencies()
+            request, ctx.auth.effective_residencies(), auth=ctx.auth
         )
         ctx.provider = deployment.provider
         ctx.deployment = deployment.name
         ctx.native_model = deployment.model
+        await self._note_byok(ctx, deployment)
 
         cost = self.cost_calculator.calculate_speech(
             deployment.model, len(request.input)
@@ -2669,6 +2685,24 @@ class GatewayPipeline:
             span.set_status(Status(StatusCode.OK))
         span.end()
 
+    async def _note_byok(self, ctx: RequestContext, deployment) -> None:
+        """Mark the ctx when the upstream call rode the TENANT'S stored
+        credential (BYOK vault): the provider name only — the key itself
+        is never recorded anywhere. Flows to the request-log row, the
+        X-Gateway-Byok-Provider header and the byok metric.
+
+        Cache-only peek: right after a dispatch the entry is always hot
+        (the dispatch resolved it), so this is a dict read, never a DB
+        query. A cold miss just means no marker — never a wrong
+        credential. Shadow mirrors skip this note entirely (they ride
+        platform credentials by design)."""
+        if not self.vault.enabled or ctx.auth.tenant_id is None:
+            return
+        provider = await self.vault.peek(ctx.auth.tenant_id, deployment.provider)
+        ctx.byok_provider = provider
+        if provider is not None:
+            metrics.BYOK_REQUESTS.labels(provider=provider).inc()
+
     def _headers(self, ctx: RequestContext, cache_state: str) -> dict[str, str]:
         return {
             "X-Request-Id": ctx.request_id,
@@ -2677,6 +2711,11 @@ class GatewayPipeline:
             **({"X-Gateway-Tenant": ctx.auth.tenant_name} if ctx.auth.tenant_id else {}),
             **({"X-Gateway-Provider": ctx.provider} if ctx.provider else {}),
             **({"X-Gateway-Deployment": ctx.deployment} if ctx.deployment else {}),
+            **(
+                {"X-Gateway-Byok-Provider": ctx.byok_provider}
+                if ctx.byok_provider
+                else {}
+            ),
             **({"X-Gateway-Cost-Usd": f"{ctx.cost_usd:.8f}"} if ctx.cost_usd else {}),
             **({"X-Gateway-Latency-Ms": str(ctx.latency_ms())}),
         }

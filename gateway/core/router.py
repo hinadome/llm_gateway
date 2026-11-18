@@ -35,6 +35,7 @@ from ..schemas import (
 )
 from ..observability import metrics
 from .breaker import CircuitBreakerRegistry
+from .context import AuthContext
 from .cost import CostCalculator
 
 
@@ -90,6 +91,13 @@ def embed_fn_for(router: "Router", model: str) -> Callable[[str], Awaitable[list
     deployment raises — which the semantic cache treats as a miss
     (restricted callers simply lose semantic-cache hits, never
     correctness).
+
+    BYOK (tier 31): no ``auth`` is passed — the semantic cache is the
+    platform's own machinery, so the platform's configured provider
+    key embeds (the caller's stored credential, if any, is NOT used;
+    it also must never BLOCK an embed: an embedder leg on an unkeyed
+    provider simply rides the platform key, same as shadow mirrors
+    and canary probes).
     """
 
     async def embed(
@@ -113,16 +121,27 @@ class Router:
         providers: dict,
         clock: Callable[[], float] = time.monotonic,
         breakers=None,
+        vault=None,
     ) -> None:
         """``breakers``: a pre-built registry to use instead of the
         default in-memory one (main.py passes the Redis-backed registry
         when ``routing.breaker.backend: redis``; the interface is the
         same). The clock is injectable so tests can fast-forward
-        cooldowns."""
+        cooldowns.
+
+        ``vault`` (tier 31): the BYOK vault service. When a dispatch
+        carries the caller's auth, a tenant with a stored credential
+        for the deployment's provider rides THEIR key instead of the
+        platform's configured one — see _resolve_provider_cfg. None =
+        platform credentials everywhere (the vault is off or absent).
+        """
         self.config = config
         self.providers = providers
         # Per-deployment circuit breakers (health-aware routing).
         self.breakers = breakers or CircuitBreakerRegistry(config.routing, clock=clock)
+        # BYOK vault (optional — main.py always passes one; it is
+        # disabled unless GATEWAY_VAULT_MASTER_KEY is set).
+        self.vault = vault
         # Pricing view for cost-aware routing (_pick); rebuilt on config
         # swap so pricing hot-reloads apply. Same CostCalculator billing
         # uses, looked up on the deployment's upstream model.
@@ -290,6 +309,40 @@ class Router:
             )
         return cfg
 
+    async def _resolve_provider_cfg(
+        self,
+        deployment: DeploymentConfig,
+        auth: "AuthContext | None" = None,
+    ) -> ProviderConfig:
+        """The provider config for a serving call, with the BYOK vault
+        applied (tier 31): when the caller belongs to a tenant that
+        stored a credential for this deployment's provider, that key
+        replaces the platform's — a copy with ``api_key`` set and
+        ``api_key_env`` cleared, so ``resolve_key()`` (the single place
+        every adapter reads credentials) returns the tenant's key. The
+        copy is never cached on the config itself; the vault caches the
+        decrypted entry for ttl_seconds, so the hot path is a dict read.
+
+        Platform callers (auth None, admin/env traffic) and tenants
+        without a stored key get the platform config untouched. An
+        entry that cannot be decrypted fails the request
+        (byok_key_unreadable, fail closed) rather than silently
+        billing the platform. Shadow mirrors and canary probes call
+        the sync ``_provider_cfg`` instead — they are the platform's
+        own machinery and ride platform credentials by design."""
+        cfg = self._provider_cfg(deployment)
+        if (
+            self.vault is None
+            or not self.vault.enabled
+            or auth is None
+            or auth.tenant_id is None
+        ):
+            return cfg
+        entry = await self.vault.get(auth.tenant_id, deployment.provider)
+        if entry is None:
+            return cfg
+        return cfg.model_copy(update={"api_key": entry.key, "api_key_env": None})
+
     @staticmethod
     def _backoff(attempt: int, base: float) -> float:
         return min(8.0, base * (2**attempt)) * (0.5 + random.random())
@@ -301,6 +354,7 @@ class Router:
         model: str,
         call: Callable[..., Awaitable],
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, Any]:
         """Shared non-streaming executor for every modality: resolve →
         breaker filter → retry/backoff per deployment → fallback across
@@ -309,7 +363,13 @@ class Router:
         ``residencies`` is the caller's effective data-residency
         requirement (None = unrestricted) — it filters the candidate
         list before anything else, so retries and fallbacks can never
-        escape to a non-compliant deployment."""
+        escape to a non-compliant deployment.
+        ``auth`` is the caller's snapshot (None = platform traffic):
+        each candidate deployment's provider config is resolved through
+        the BYOK vault, so a tenant's stored key follows the request
+        through EVERY retry and fallback — the fallback may cross to a
+        provider the tenant did not key, and that leg (alone) rides
+        the platform's credential (see _resolve_provider_cfg)."""
         deployments = self.resolve(model, residencies)
         remaining = await self._available(deployments)
         last_error: ProviderError | None = None
@@ -322,7 +382,7 @@ class Router:
                 continue
             tried.add(deployment.name)
             adapter = self.providers[deployment.provider]
-            provider_cfg = self._provider_cfg(deployment)
+            provider_cfg = await self._resolve_provider_cfg(deployment, auth)
             max_retries = (
                 deployment.max_retries
                 if deployment.max_retries is not None
@@ -361,17 +421,20 @@ class Router:
         self,
         request: ChatCompletionRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         return await self._dispatch(
             request.model,
             lambda a, d, pc, t: a.complete(d, request, pc, t),
             residencies,
+            auth,
         )
 
     async def embed(
         self,
         request: EmbeddingRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         """Route an embeddings request — same retry/fallback/breaker
         contract as ``complete`` (embeddings are never streamed).
@@ -382,60 +445,70 @@ class Router:
             request.model,
             lambda a, d, pc, t: a.embed(d, request, pc, t),
             residencies,
+            auth,
         )
 
     async def generate_image(
         self,
         request: ImageGenerationRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         """Route an image-generation request (same contract as embed)."""
         return await self._dispatch(
             request.model,
             lambda a, d, pc, t: a.generate_image(d, request, pc, t),
             residencies,
+            auth,
         )
 
     async def edit_image(
         self,
         request: ImageEditRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         """Route an image-edit request (uploaded image(s) + prompt)."""
         return await self._dispatch(
             request.model,
             lambda a, d, pc, t: a.edit_image(d, request, pc, t),
             residencies,
+            auth,
         )
 
     async def vary_image(
         self,
         request: ImageVariationRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, dict]:
         """Route an image-variation request (uploaded image, no prompt)."""
         return await self._dispatch(
             request.model,
             lambda a, d, pc, t: a.vary_image(d, request, pc, t),
             residencies,
+            auth,
         )
 
     async def transcribe(
         self,
         request: TranscriptionRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, tuple[dict | str, str]]:
         """Route an audio transcription/translation request."""
         return await self._dispatch(
             request.model,
             lambda a, d, pc, t: a.transcribe(d, request, pc, t),
             residencies,
+            auth,
         )
 
     async def speak(
         self,
         request: SpeechRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, tuple[bytes, str]]:
         """Route a text-to-speech request (buffered; audio is not streamed
         through the gateway in this version)."""
@@ -443,6 +516,7 @@ class Router:
             request.model,
             lambda a, d, pc, t: a.speak(d, request, pc, t),
             residencies,
+            auth,
         )
 
     # -- streaming ---------------------------------------------------------------
@@ -451,13 +525,17 @@ class Router:
         self,
         request: ChatCompletionRequest,
         residencies: frozenset[str] | None = None,
+        auth: AuthContext | None = None,
     ) -> tuple[DeploymentConfig, AsyncIterator[dict]]:
         """Start a streamed completion.
 
         Failover happens until the *first chunk* has been received; once the
         stream is committed, upstream errors surface to the client.
         ``residencies`` filters the candidate ladder before anything
-        else — same fail-closed contract as ``_dispatch``.
+        else — same fail-closed contract as ``_dispatch``. ``auth`` is
+        the caller's snapshot: a tenant's BYOK key follows the request
+        through every failover attempt (per-candidate resolution, the
+        same contract as ``_dispatch``).
         """
         deployments = self.resolve(request.model, residencies)
         remaining = await self._available(deployments)
@@ -471,7 +549,7 @@ class Router:
                 continue
             tried.add(deployment.name)
             adapter = self.providers[deployment.provider]
-            provider_cfg = self._provider_cfg(deployment)
+            provider_cfg = await self._resolve_provider_cfg(deployment, auth)
             max_retries = (
                 deployment.max_retries
                 if deployment.max_retries is not None

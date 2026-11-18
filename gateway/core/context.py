@@ -218,6 +218,14 @@ class RequestContext:
     # metrics; verdicts still land in guardrail_actions (the replay
     # result is built from them). Never set on client traffic.
     dry_run: bool = False
+    # BYOK vault (tier 31): the provider whose upstream call used the
+    # TENANT's stored credential instead of the platform's key (None =
+    # platform credential — platform/admin callers, cache hits, and
+    # everyone without a stored key). Set right after dispatch; flows to
+    # the request-log row, the X-Gateway-Byok-Provider header and the
+    # gateway_byok_requests_total metric. Observability only: the key
+    # itself is never recorded anywhere.
+    byok_provider: str | None = None
     # Cached *input* tokens the upstream reported (provider-side
     # prompt caching) — a subset of prompt_tokens, billed at the
     # cached_input price. None when the upstream reports no detail

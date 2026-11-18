@@ -8,6 +8,45 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- BYOK vault — tenants bring their OWN provider credentials, encrypted
+  at rest: one Fernet-encrypted entry per (tenant, provider)
+  (`PUT /admin/tenants/{id}/provider-keys/{provider}`,
+  `GET .../provider-keys`, `DELETE .../provider-keys/{provider}`), and
+  every request from that tenant through that provider rides THEIR
+  account instead of the platform's configured key — chat (stream and
+  not), embeddings, images, audio, through every retry and fallback
+  leg (per-candidate resolution inside the router's dispatch loop, so
+  the stored key never leaks onto a fallback provider the tenant
+  didn't key; that leg alone rides the platform's). The swap point is
+  Router._resolve_provider_cfg: a copy of the provider config with
+  api_key set / api_key_env cleared — every adapter already reads
+  credentials through provider_cfg.resolve_key(), so the tier needed
+  ZERO adapter changes. The raw key exists exactly twice: the caller's
+  PUT body and the upstream auth header. At rest: Fernet (AES128-CBC +
+  HMAC-SHA256) under GATEWAY_VAULT_MASTER_KEY (env only, never
+  config.yaml — it encrypts secrets; comma-separated list = MultiFernet
+  rotation: first encrypts, all decrypt). Never surfaced: the admin API
+  returns only a hint ("…1234" — last chars, enough to tell stored keys
+  apart, never enough to use), audit records carry the same hint
+  (vault.provider_key.upsert/delete events), log rows record only
+  byok_provider (the provider name) alongside the
+  X-Gateway-Byok-Provider response header and the
+  gateway_byok_requests_total{provider} counter — the
+  chargeback-compatibility metric. Fail closed where it matters: an
+  entry that cannot be decrypted (a rotated-away master key) fails the
+  request with 500 byok_key_unreadable instead of silently spending
+  the platform's key; fail honest when off (no master key): PUT 400s
+  vault_unavailable naming GATEWAY_VAULT_MASTER_KEY, reads stay empty,
+  every caller byte-for-byte unchanged. Hot path: decrypted entries
+  cached per (tenant, provider) for vault.ttl_seconds (30 default,
+  invalidate-on-write; other replicas converge within the TTL —
+  documented; Redis-shared invalidation deferred). Tenant admins
+  manage their own tenant's credentials only (cross-tenant 404, the
+  same anti-leak semantics as key management); platform machinery
+  (shadow mirrors, canary probes, the semantic-cache embedder) rides
+  platform credentials by design. Requires pip install
+  'llm-gateway[vault]' (cryptography). 11 new tests
+  (tests/test_byok_vault.py); full suite 992 passing.
 - Tool-call policy (MCP-lite) — the agent-era sibling of model
   allowlists: `allowed_tools` on a virtual key (and pooled on its
   tenant) is a list of fnmatch patterns over the tool NAMES a request

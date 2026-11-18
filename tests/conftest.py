@@ -629,6 +629,7 @@ async def _make_env(
     cors_allow_origins=None,
     jwks_client=None,
     audit_client=None,
+    vault_master_key=None,
 ):
     """Build a full app (fresh DB + mock upstream) as an async generator.
 
@@ -649,6 +650,7 @@ async def _make_env(
         admin_key=ADMIN_KEY,
         database_url=db_url,
         cors_allow_origins=cors_allow_origins,
+        vault_master_key=vault_master_key,
     )
     app = create_app(
         settings=settings,
