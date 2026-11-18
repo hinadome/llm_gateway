@@ -44,6 +44,8 @@ from gateway.config import (
     ProviderConfig,
     RoutingConfig,
     SemanticCacheConfig,
+    SLOTargetConfig,
+    SLOsConfig,
     VaultConfig,
 )
 from gateway.db import dispose_engine, init_engine, reset_engine_for_tests
@@ -116,6 +118,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     replay = cache_overrides.pop("replay", None) or ReplayConfig()
     trials = cache_overrides.pop("trials", None) or TrialsConfig()
     migration = cache_overrides.pop("migration", None) or MigrationConfig()
+    slos = cache_overrides.pop("slos", None) or SLOsConfig()
     runaway = cache_overrides.pop("runaway", None) or RunawayConfig()
     concurrency = cache_overrides.pop("concurrency", None) or ConcurrencyConfig()
     mcp = cache_overrides.pop("mcp", None) or MCPConfig()
@@ -186,6 +189,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         trials=trials,
         runaway=runaway,
         concurrency=concurrency,
+        slos=slos,
         events=events,
         mcp=mcp,
         vault=vault,

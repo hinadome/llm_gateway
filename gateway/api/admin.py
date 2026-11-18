@@ -35,6 +35,7 @@ from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
 from ..core import migration as migration_core
 from ..core import promotion as promotion_core
+from ..core import slos as slos_core
 from ..core import trials as trials_core
 from ..core.vault import VaultService
 from ..db import get_sessionmaker
@@ -2634,6 +2635,51 @@ async def playground_chat(
         "response": json.loads(response.body),
         "diagnostics": diagnostics,
     }
+
+
+# -- service level objectives (tier 42) --------------------------------------
+# Named, deliberate promises about the client experience — "p95
+# latency under 800ms", "error rate under 1%" — measured over the
+# request logs and verdicted honestly. Pure config read at request
+# time: no loop, no persistence, no notifications in this tier, so a
+# tightened bar re-verdicts on the next read (hot-reload applies
+# instantly). Platform-admin-only: SLO definitions are platform
+# health configuration, like canaries and routing.
+
+
+@router.get("/admin/slos")
+async def slo_status(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """One row per configured SLO target (``slos:`` in config.yaml,
+    hot-reloadable), measured and verdicted over its rolling window.
+
+    Each row echoes the target's definition (name, model, optional
+    deployment scope, metric, the ceiling, the window, the sufficiency
+    minimum) beside the measurement — the window's requests/errors/
+    error-rate, the latency percentiles and TTFT p95, all from one
+    pass over the same rows — the target metric's ``value``, and the
+    ``verdict``: ``met`` (the ceiling holds), ``breached`` (it does
+    not — the human ``reason`` says by how much) or
+    ``insufficient_evidence`` (fewer than ``min_requests`` requests in
+    the window, or nothing streamed for a TTFT target — a quiet
+    window is not a verdict). What counts is CLIENT EXPERIENCE, not
+    deployment health: non-shadow, non-trial rows for the scope, cache
+    replays included (a cached answer is a fast answer the client
+    really received) and unattributed error rows included at model
+    scope; a deployment-scoped target measures only its attributed
+    rows, exactly like the post-promotion watch.
+
+    The numbers always ship beside the verdict, so the call is
+    auditable and re-bucketable, never taken on faith. This surface is
+    the measurement and the honest answer — never a pager; alert
+    delivery on breach is a later tier."""
+    config = raw_request.app.state.config
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        data = await slos_core.status(session, config)
+    return {"data": data, "config": config.slos.model_dump()}
 
 
 # -- candidate trials (tier 36) -------------------------------------------

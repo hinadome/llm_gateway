@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 84 Python files, ~30,400 lines, 1167 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 85 Python files, ~30,750 lines, 1175 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -475,6 +475,26 @@ gateway/
 │                           blocked or failed — is audited as
 │                           playground.chat with the calling admin
 │                           as the actor;
+│                           GET /admin/slos (tier 42, same
+│                           platform-admin boundary — SLO definitions
+│                           are platform health config) is the SLO
+│                           verdict surface: every slos: target from
+│                           app.state.config measured over its
+│                           rolling window (slos_core.status —
+│                           non-shadow, non-trial rows, cache replays
+│                           included, unattributed errors at model
+│                           scope, attributed rows only under a
+│                           deployment scope) and verdicted met /
+│                           breached / insufficient_evidence, each row
+│                           echoing the definition beside the full
+│                           measurement (requests/errors/error-rate,
+│                           latency p50/p95/p99, ttft p95), the
+│                           metric value and the check with its
+│                           human reason — the numbers always beside
+│                           the verdict; the config echoes as
+│                           model_dump(); read-at-request-time means
+│                           hot-reload re-verdicts on the next call;
+│                           breach delivery is a later tier;
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -1082,6 +1102,39 @@ gateway/
 │   │                       interval_seconds and re-reads
 │   │                       app.state.config.canary each iteration;
 │   │                       under pytest tests drive probe_once() directly
+│   ├── slos.py            Service level objectives (tier 42): the
+│   │                       query+verdict legs for GET /admin/slos.
+│   │                       _CLIENT_ROW defines client experience once
+│   │                       (non-shadow, non-trial rows; cache replays
+│   │                       INCLUDED — a cached answer is a fast answer
+│   │                       the client really received). measure() is
+│   │                       one windowed aggregation per target —
+│   │                       requests, errors, error_rate, latency
+│   │                       percentiles, ttft p95 — all from the same
+│   │                       rows so every metric of a target shares one
+│   │                       truth; unmeasurable legs are None, never
+│   │                       fabricated; deployment scope adds the
+│   │                       attributed-rows filter (tier-40 story:
+│   │                       a request that failed before any dispatch
+│   │                       completed has no deployment to match, so it
+│   │                       can neither inflate nor flatter a
+│   │                       deployment's SLO), model scope counts the
+│   │                       unattributed failures too. _percentile is
+│   │                       the same nearest-rank /admin/stats uses, so
+│   │                       a bar and the stats panel can never
+│   │                       disagree about the method. evaluate() is
+│   │                       pure — every input in the arguments, no DB,
+│   │                       no clock — met / breached (reason says the
+│   │                       metric, the number and the bar) /
+│   │                       insufficient_evidence (min_requests gate
+│   │                       first, then no-measurement for ttft);
+│   │                       status() reads config.slos at request time
+│   │                       and sorts by name: no loop, no persistence,
+│   │                       no cached verdicts, so a tightened bar
+│   │                       re-verdicts on the next read (hot-reload
+│   │                       applies instantly); breach delivery is a
+│   │                       later tier — this surface is the
+│   │                       measurement, never a pager
 │   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
 │   │                       that answers "did secrets land in the request
 │   │                       log?"): detectors mirror the pii_redaction
@@ -1595,7 +1648,18 @@ gateway/
                             pasted into a login overlay (kept in sessionStorage,
                             sent as Bearer). 9 tabs: overview stats (+ usage CSV
                             export for the selected window, by-tenant breakdown
-                            when tenants have traffic), key
+                            when tenants have traffic; tier 42 adds the SLO
+                            panel above the traffic tables — one row per
+                            slos: target from GET /admin/slos: objective,
+                            scope (model · deployment), metric, the bar,
+                            the measured value, the request count against
+                            the min_requests sufficiency gate, the
+                            met/breached/insufficient_evidence badge with
+                            the failed reason in its tooltip and the
+                            target's own rolling window — the panel hides
+                            itself when no targets are configured, and a
+                            tenant admin who cannot read SLOs loses the
+                            panel, not the tab), key
                             management (create/edit/revoke, raw key shown once,
                             tenant placement + admin-key grants for platform
                             admins; badges for tenant membership and admin
@@ -2867,6 +2931,43 @@ tests/
 │                        records for success, error and no-key runs,
 │                        actor = the calling admin, details = key/
 │                        model/request_id/outcome/cost)
+├── test_slos.py         Service level objectives (tier 42): evaluate
+│                        units — the pure verdict: met/breached with
+│                        the reason naming metric, number and bar,
+│                        the boundary inclusive (exactly at the bar
+│                        is met), thin volume insufficient even when
+│                        every request failed (the min_requests gate
+│                        runs before the metric) with exactly-min
+│                        judged, and unmeasurable-ttft insufficient
+│                        never fake (volume cannot rescue a metric
+│                        that was never measured; value stays None).
+│                        e2e — real traffic: two streamed chats with
+│                        a real upstream delay (a zero-delay mock can
+│                        genuinely measure 0ms — no bar for an
+│                        "impossible" target to breach), p95 met
+│                        under a generous bar, breached under a 0.5ms
+│                        bar, error_rate met on clean rows, ttft met,
+│                        a min_requests=100 target honestly
+│                        insufficient on test volumes, rows sorted by
+│                        name while the config echo keeps declaration
+│                        order; deployment vs model scope: seeded
+│                        attributed rows (20 latencies 100..290 — p95
+│                        exactly 280, breached against a 279 bar, the
+│                        same nearest-rank /admin/stats uses), an
+│                        unattributed error, a shadow mirror and a
+│                        trial replay — the deployment-scoped target
+│                        sees ONLY its attributed rows (clean error
+│                        rate), the model-scoped one counts the
+│                        unattributed failure too (1/21 against a
+│                        0.04 bar → breached) and never the mirror
+│                        or trial row; cache hits are client
+│                        experience (an identical repeat answers from
+│                        the response cache, both rows counted);
+│                        permissions (403 tenant-admin/plain — SLO
+│                        definitions are platform health config) and
+│                        the empty config (empty data, config echoed
+│                        — no targets means no promises, not an
+│                        error)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while

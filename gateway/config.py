@@ -625,6 +625,66 @@ class CanaryConfig(BaseModel):
     deployments: list[str] | None = None  # fnmatch patterns; None = all
 
 
+class SLOTargetConfig(BaseModel):
+    """One named service-level objective: a bar (``target``) on one
+    ``metric`` over the client traffic of a ``model`` (optionally
+    narrowed to one ``deployment``), measured across a rolling
+    ``window_minutes`` and gated by ``min_requests`` — a verdict on
+    thin volume is ``insufficient_evidence`` regardless of the
+    numbers, because a quiet five-minute window proves nothing about
+    the service.
+
+    Metrics are all lower-is-better (the bar is a ceiling):
+
+    * ``error_rate`` — failed + blocked over total, as a fraction
+      (``0.01`` = 1%).
+    * ``latency_p50_ms`` / ``latency_p95_ms`` / ``latency_p99_ms`` —
+      end-to-end latency percentiles, in milliseconds.
+    * ``ttft_p95_ms`` — time-to-first-token p95 over the requests
+      that streamed (non-streamed rows have nothing to measure;
+      a window where nothing streamed is insufficient, honestly).
+
+    What counts is CLIENT EXPERIENCE, not deployment health: every
+    non-shadow, non-trial row for the scope — cache replays included
+    (a cached answer is a fast answer the client really received)
+    and, for a model-scoped target, unattributed error rows too (the
+    client experienced the failure even when no deployment completed
+    the dispatch to blame). A deployment-scoped target measures only
+    the rows attributed to that deployment — the same honesty the
+    post-promotion watch uses.
+    """
+
+    name: str
+    model: str  # public model name, exact
+    deployment: str | None = None  # narrow to one deployment's attributed rows
+    metric: Literal[
+        "error_rate",
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "latency_p99_ms",
+        "ttft_p95_ms",
+    ]
+    target: float  # the ceiling (fraction for error_rate, ms otherwise)
+    window_minutes: int = 60
+    min_requests: int = 20  # sufficiency gate — thin volume is not a verdict
+
+
+class SLOsConfig(BaseModel):
+    """Service level objectives (tier 42): named, deliberate promises
+    about the client experience — ``p95 latency under 800ms``, ``error
+    rate under 1%`` — measured over the request logs and verdicted
+    honestly at ``GET /admin/slos`` (met / breached /
+    insufficient_evidence, with the numbers that produced the verdict
+    beside it). Pure config: evaluation is on demand at read time, so
+    targets are hot-reloadable — tighten a bar and the next read
+    re-verdicts. Alert delivery on breach (webhook + re-arm semantics)
+    is the next tier; this surface is the measurement and the honest
+    answer, never a pager.
+    """
+
+    targets: list[SLOTargetConfig] = Field(default_factory=list)
+
+
 class PIIScanConfig(BaseModel):
     """PII/secret scan over *stored* request/response bodies — the
     audit that answers "did secrets or PII land in the request log?".
@@ -1019,6 +1079,7 @@ class GatewayConfig(BaseModel):
     uploads: UploadsConfig = Field(default_factory=UploadsConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
     canary: CanaryConfig = Field(default_factory=CanaryConfig)
+    slos: SLOsConfig = Field(default_factory=SLOsConfig)
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)

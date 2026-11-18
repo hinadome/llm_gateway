@@ -204,6 +204,12 @@
       <button class="ghost small" id="btn-export" title="Download the current window's usage as CSV (billing / chargeback; shadow mirrors excluded)">⬇ Export usage (CSV)</button>
     </div>
     <div class="cards" id="ov-cards"></div>
+    <div class="panel" id="ov-slos-panel" style="display:none">
+      <div class="ph">Service level objectives
+        <div class="right muted" style="font-weight:400;font-size:12px">named promises from <span class="mono" style="font-size:11px">slos:</span> in config.yaml &middot; measured over each target's own rolling window &middot; client experience (cache hits included) &middot; met / breached / insufficient &middot; the numbers beside every verdict</div>
+      </div>
+      <div style="overflow-x:auto"><table id="ov-slos"></table></div>
+    </div>
     <div class="panel">
       <div class="ph">By model</div>
       <div style="overflow-x:auto"><table id="ov-models"></table></div>
@@ -857,6 +863,56 @@ async function loadOverview() {
         ? '<span class="muted">platform (no tenant)</span>'
         : esc(state.tenantNames[e.tenant_id] || e.tenant_id)}</td><td class="num">${fmtInt(e.requests)}</td><td class="num">${fmtUsd(e.cost_usd)}</td></tr>`).join("") + "</tbody>";
   }
+  await loadSLOs();
+}
+
+// ---------- service level objectives (tier 42) ----------------------------
+// The operator's named promises, verdicted: each slos: target from
+// config.yaml measured over its own rolling window and judged met /
+// breached / insufficient — the numbers beside every verdict. The
+// panel hides itself when no targets are configured (the config is
+// the operator's own; an empty list means no promises, not an
+// error).
+
+const SLO_BADGE = { met: "b-green", breached: "b-red", insufficient_evidence: "b-gray" };
+
+function fmtSloValue(metric, v) {
+  if (v == null) return "—";
+  return metric === "error_rate" ? (v * 100).toFixed(2) + "%" : fmtMs(Math.round(v));
+}
+
+async function loadSLOs() {
+  const panel = $("#ov-slos-panel");
+  const box = $("#ov-slos");
+  let r;
+  try {
+    r = await api("/admin/slos");
+  } catch (e) {
+    // A tenant admin cannot read SLOs — hide the panel, not the tab.
+    panel.style.display = "none";
+    return;
+  }
+  const targets = r.data || [];
+  panel.style.display = targets.length ? "" : "none";
+  if (!targets.length) return;
+  box.innerHTML = "<thead><tr><th>Objective</th><th>Scope</th><th>Metric</th><th class=num>Bar</th><th class=num>Measured</th><th class=num>Requests</th><th>Verdict</th><th>Window</th></tr></thead><tbody>" +
+    targets.map(t => {
+      const scope = esc(t.model) + (t.deployment ? ` · <span class="mono" style="font-size:12px">${esc(t.deployment)}</span>` : "");
+      const badge = `<span class="b ${SLO_BADGE[t.verdict] || "b-gray"}"${t.reason ? ` title="${esc(t.reason)}"` : ""}>${esc(t.verdict.replace(/_/g, " "))}</span>`;
+      const measured = t.verdict === "insufficient_evidence"
+        ? `<span class="muted" title="${esc(t.reason || "")}">unproven</span>`
+        : fmtSloValue(t.metric, t.value);
+      return `<tr>
+        <td>${esc(t.name)}</td>
+        <td>${scope}</td>
+        <td class="mono" style="font-size:12px">${esc(t.metric)}</td>
+        <td class="num">${fmtSloValue(t.metric, t.target)}</td>
+        <td class="num">${measured}</td>
+        <td class="num">${fmtInt((t.measured || {}).requests)} <span class="muted" style="font-size:12px">of ${t.min_requests} min</span></td>
+        <td>${badge}</td>
+        <td style="white-space:nowrap">last ${t.window_minutes}m</td>
+      </tr>`;
+    }).join("") + "</tbody>";
 }
 
 // Shared budget cell for keys and tenants — the same machinery: a

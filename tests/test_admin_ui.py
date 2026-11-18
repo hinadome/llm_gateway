@@ -234,6 +234,30 @@ async def test_admin_ui_playground_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_slo_surface(env):
+    # Tier 42: the Overview tab's SLO panel — the operator's named
+    # promises from `slos:` in config.yaml, verdicted (GET /admin/slos,
+    # platform admin): objective/scope/metric columns, the bar and the
+    # measured value beside it, the request count against the
+    # min_requests sufficiency gate, the met/breached/insufficient
+    # badge with the failed reason in its tooltip, each target's own
+    # rolling window. The panel hides itself when no targets are
+    # configured or when a tenant admin cannot read them. Static-shell
+    # assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="ov-slos-panel"',
+        'id="ov-slos"',
+        "loadSLOs",
+        "/admin/slos",
+        "SLO_BADGE",
+        "insufficient_evidence",
+        "fmtSloValue",
+        "min_requests",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

@@ -8,6 +8,46 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Service level objectives (tier 42) — named promises about the
+  client experience, measured and verdicted honestly. A latency bar
+  in a design doc is a hope; the same bar verdicted against the
+  request logs is an SLO. `slos:` in config.yaml declares targets —
+  a metric (`error_rate`, `latency_p50_ms`/`p95`/`p99`, `ttft_p95_ms`,
+  all lower-is-better ceilings), a `target` bar, a rolling
+  `window_minutes` and a `min_requests` sufficiency minimum, scoped
+  to a `model` (exact public name) or narrowed to one `deployment` —
+  and `GET /admin/slos` (platform-admin-only) measures each and
+  verdicts it.
+  - **Client experience, not deployment health.** Every non-shadow,
+    non-trial row for the scope: cache replays INCLUDED (a cached
+    answer is a fast answer the client really received) and, at
+    model scope, the unattributed error rows too — the client
+    experienced the failure even when no dispatch completed to
+    blame a deployment (the tier-40 attribution story). A
+    deployment-scoped target measures only its attributed rows,
+    exactly like the post-promotion watch.
+  - **Honest verdicts.** `met` (the ceiling holds), `breached` (the
+    `reason` names the metric, the number and the bar), or
+    `insufficient_evidence` — fewer than `min_requests` requests in
+    the window (a quiet window is not a verdict), or nothing
+    streamed for a TTFT target (an unmeasurable metric is no
+    answer, never a fabricated 0).
+  - **The numbers beside every verdict.** Each row ships the full
+    measurement — requests, errors, error rate, latency p50/p95/p99,
+    TTFT p95 — all from one pass over the same rows, so a verdict is
+    auditable and re-bucketable, never taken on faith.
+  - **Pure config, measured at read time.** No loop, no cached
+    verdicts, no notifications in this tier — a tightened bar
+    re-verdicts on the next read, hot-reload applies instantly.
+    The surface is the measurement and the honest answer; alert
+    delivery on breach is the next tier.
+  The admin dashboard's Overview tab gains an SLO panel above the
+  traffic tables: objective, scope, metric, the bar, the measured
+  value, the request count against the `min_requests` gate, and the
+  met/breached/insufficient badge (the failed reason in its tooltip)
+  — hidden when no targets are configured. 7 tests + a UI-surface
+  pin (`tests/test_slos.py`, `tests/test_admin_ui.py`); the suite
+  stands at 1175.
 - Admin playground (tier 41) — the dashboard's own chat client.
   "What does a request from this key actually experience?" now has
   an answer that IS the thing, not a simulation of it:
