@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 84 Python files, ~29,800 lines, 1142 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 84 Python files, ~30,200 lines, 1154 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -410,6 +410,32 @@ gateway/
 │                           flat names only (charset bars path
 │                           separators — the resolution can never
 │                           leave the config directory);
+│                           GET /admin/migration/watch (tier 40,
+│                           same platform-admin boundary) is the
+│                           post-promotion leg — the migration story
+│                           continued after the promotion flips the
+│                           candidate live and the mirrors stop: one
+│                           row per serving deployment, re-verdicted
+│                           on the rows attributed to it (mirrors,
+│                           trial replays and cache replays
+│                           excluded; a row lands on a deployment
+│                           only when a dispatch COMPLETED on it, so
+│                           a candidate failing at dispatch shows up
+│                           as traffic that ran away — the expected
+│                           vs actual share split on the row says
+│                           it, never fabricated attributed errors),
+│                           from when it started serving the model
+│                           (its first serving row — the promotion
+│                           moment measured on the traffic itself,
+│                           no side state), against its same-priority
+│                           tier peers over exactly that window, with
+│                           the same go/hold/no_go/
+│                           insufficient_evidence vocabulary and
+│                           migration: thresholds echoed live — a
+│                           recommendation to keep serving or roll
+│                           back, never an automatic one;
+│                           ?model=/?deployment= narrow, ?since=
+│                           (ISO-8601) overrides every window;
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -1291,7 +1317,32 @@ gateway/
 │   │                       config section, read live (hot-reload
 │   │                       re-verdicts) and echoed by the endpoints.
 │   │                       A RECOMMENDATION, not a gate — nothing
-│   │                       promotes automatically.
+│   │                       promotes automatically. Tier 40 adds the
+│   │                       POST-promotion leg: once a candidate
+│   │                       serves the mirrors stop, so
+│   │                       evaluate_serving verdicts what the logs
+│   │                       still say — the attributed serving rows
+│   │                       the deployment carried (_SERVING_ROW
+│   │                       excludes mirrors, trial replays and
+│   │                       cache replays; a row lands on a
+│   │                       deployment only when a dispatch COMPLETED
+│   │                       on it, so a candidate failing at dispatch
+│   │                       shows up as traffic that ran away, never
+│   │                       as fabricated attributed errors),
+│   │                       against its same-priority-tier peers
+│   │                       over the same window (serving_overview
+│   │                       per model — one grouped query carrying
+│   │                       requests, errors, latency/cost means and
+│   │                       first_served_at, the promotion moment
+│   │                       measured on the traffic itself;
+│   │                       serving_baseline for the peers' window
+│   │                       aggregate). Same vocabulary, same
+│   │                       thresholds, same honesty: sufficiency
+│   │                       gate, error rate on attributed rows,
+│   │                       latency as a percent of the peers' mean
+│   │                       — null + caveat when unmeasurable. A
+│   │                       recommendation to keep serving or roll
+│   │                       back, never an automatic one.
 │   ├── promotion.py        Migration promotion (tier 38): the deliberate
 │   │                       act that turns a go verdict into serving
 │   │                       traffic, through config.yaml itself (no DB
@@ -1565,7 +1616,21 @@ gateway/
                             Rollback-to-this apply (POST
                             /admin/migration/rollback) that toasts the
                             undo point and refreshes the routing
-                            tables —
+                            tables. Tier 40 adds the Post-promotion
+                            watch panel between the shadow-diff
+                            evidence and the trials: one row per
+                            serving deployment from GET
+                            /admin/migration/watch, each with the
+                            go/no-go badge (failed-check reasons in
+                            the tooltip, same vocabulary as the
+                            evidence tables), the expected vs actual
+                            share split (weight's share of the tier vs
+                            its fraction of the tier's attributed
+                            requests — the traffic-ran-away signal),
+                            requests/errors, latency mean, the latency
+                            delta vs the tier peers pulled from the
+                            recommendation's checks, cost mean, and
+                            the watching-since column —
                             guardrail inventory, system (health/readiness,
                             config reload, backups). A test enforces the
                             no-external-resources invariant.
@@ -2632,6 +2697,56 @@ tests/
 │                        empty 404 + missing-config 409s; like the
 │                        promotion tests, config_path always points
 │                        at a tmp_path file the test owns
+├── test_watch.py        Post-promotion watch (tier 40): evaluate_serving
+│                        units — clean go (every check measured and
+│                        passed, no reasons), the no_go that outranks
+│                        a co-failing latency bar, the latency hold,
+│                        thin volume insufficient even when every
+│                        request failed, no-baseline go with the
+│                        honestly-null latency check + caveat (and
+│                        the zero-peer-mean caveat wording); e2e —
+│                        the happy path (two pre-promotion mirror
+│                        chats, the promotion at w=100, the incumbent
+│                        made to fail so every chat ends on the twin
+│                        — 12 serving rows EXACTLY: the two mirror
+│                        rows and the cache-replay row never reach
+│                        the watch; verdict go with the
+│                        latency-unmeasured caveat, thresholds echoed,
+│                        the incumbent honestly insufficient on its
+│                        pre-promotion volume; ?since= into the
+│                        future bounds every window — zero requests,
+│                        the bound echoed, insufficient), the
+│                        latency hold (w=50 against the incumbent's
+│                        50 splits the tier evenly, the candidate's
+│                        upstream delayed — the split-independent
+│                        facts pinned: both sides carried volume,
+│                        expected share 0.5, delta far over the bar,
+│                        the incumbent verdicts go being FASTER,
+│                        never exact-pinning the probabilistic
+│                        split), the traffic-ran-away honesty pin (a
+│                        sole deployment failing every attempt logs
+│                        UNATTRIBUTED rows — deployment None, pinned
+│                        off the logs — so the watch shows requests
+│                        0 vs expected share 1.0, insufficient,
+│                        never a fabricated no_go), the no_go on
+│                        attributed errors (mid-stream failures are
+│                        the one error class that lands ON a
+│                        deployment; the atomically-buffered mock
+│                        cannot simulate one, so the rows are seeded
+│                        as the stream wrapper would write them —
+│                        25% error rate → no_go with the same SLO
+│                        the mirrors judged by), the rescued
+│                        candidate (fails at w=100, incumbent
+│                        rescues: zero rows ever end on it, actual
+│                        share 0.0 vs expected 0.6667, insufficient
+│                        — the incumbent carried everything, go), and
+│                        the boundaries (403s for tenant/plain,
+│                        malformed since 400, unknown model/
+│                        deployment empty, shadow twins absent —
+│                        they carry no serving traffic, the zero-
+│                        traffic row honestly insufficient); like
+│                        the promotion/rollback tests, config_path
+│                        always points at a tmp_path file
 ├── test_usage_export.py  /admin/usage/export: CSV columns/order/attachment download,
 │                        JSON summary + by_key/by_model/by_status aggregates, key/model/
 │                        status filters, time windows (default 30d, naive=UTC), shadow

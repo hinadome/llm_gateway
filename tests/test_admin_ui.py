@@ -183,6 +183,26 @@ async def test_admin_ui_rollback_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_watch_surface(env):
+    # Tier 40: the Routing tab's Post-promotion watch table — serving
+    # traffic re-verdicted against the migration thresholds (GET
+    # /admin/migration/watch): the go/no-go badge with the
+    # failed-check reasons in its tooltip, the expected -> actual
+    # share split, requests/errors/latency/cost means, the latency
+    # delta vs the tier pulled from recommendation.checks by name,
+    # and the watching-since column. Loaded by loadRouting after the
+    # shadow-diff table. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="watch-table"',
+        "Post-promotion watch",
+        "loadWatch",
+        "/admin/migration/watch",
+        "latency_delta_pct",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

@@ -8,6 +8,57 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Post-promotion watch (tier 40) — the migration story continued
+  after the promotion flips the candidate live. Promotion ended the
+  mirrors: the candidate serves, the pair-shaped evidence stops, and
+  the operator is back to watching by feel — exactly when watching
+  matters most. `GET /admin/migration/watch` (platform-admin-only)
+  re-verdicts **what the logs still say**: one row per serving
+  deployment, judged by the same `migration:` thresholds with the
+  same go / hold / no_go / insufficient_evidence vocabulary the
+  pre-promotion verdicts used:
+  - **The evidence is the attributed serving rows** — the
+    client-facing rows logged once a dispatch *completed* on the
+    deployment, with mirrors (shadow twins and prompt A/B),
+    candidate-trial replays and cache replays excluded: evidence,
+    experiments and cache hits are not serving traffic.
+  - **The attribution is the honest part, and it cuts both ways.**
+    A request that fails *before* any dispatch completes (the
+    router exhausted its ladder — a sole deployment failing every
+    attempt, or a candidate rescued by a tier peer) logs its row
+    with no deployment, so a failing candidate shows up as **traffic
+    that ran away**, never as fabricated attributed errors. The
+    row's share split says it loudest: `expected_share` (its
+    weight's share of its priority tier) vs `actual_share` (its
+    fraction of the tier's attributed requests in the window). The
+    error rows that *do* land on a deployment are failures after
+    the dispatch completed — a stream that dies mid-flight — and
+    those feed the error-rate check.
+  - **The window is measured on the traffic itself.** Each row
+    watches from `since` — the deployment's first serving row, the
+    promotion moment as traffic saw it; no side state, nothing to
+    drift. The baseline aggregates the same-priority-tier peers
+    over exactly that window (same traffic regime, same clock).
+    `?since=` (ISO-8601) overrides every window; `?model=` /
+    `?deployment=` narrow; unknown names are empty data.
+    Thresholds are echoed live.
+  - **The checks, same shape as every verdict:** `requests`
+    (the `min_pairs` sufficiency gate), `error_rate` (against
+    `max_shadow_error_rate` — the same SLO the mirror verdicts
+    judged by, measured on serving traffic) and
+    `latency_delta_pct` (against `max_latency_delta_pct` — null
+    and skipped with a caveat when unmeasurable, never a fake 0%).
+    A `no_go` outranks a `hold`; thin volume is
+    `insufficient_evidence` regardless of the numbers.
+  The verdict is a **recommendation to keep serving or roll back** —
+  the endpoint never pushes the rollback button itself. The admin
+  dashboard's Routing tab carries a Post-promotion watch table:
+  per deployment the go/no-go badge (failed-check reasons in the
+  tooltip), the expected → actual share split, requests/errors,
+  latency mean, the latency delta vs the tier, cost mean, and the
+  watching-since column. 11 tests + a UI-surface pin
+  (`tests/test_watch.py`, `tests/test_admin_ui.py`); the suite
+  stands at 1154.
 - Promotion rollback (tier 39) — promotion's undo, the same
   discipline in reverse. Tier 38 left an operator staring at a
   promoted canary with a timestamped backup file and no API that

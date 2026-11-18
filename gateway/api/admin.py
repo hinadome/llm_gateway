@@ -2285,6 +2285,162 @@ async def migration_rollback(
     }
 
 
+# -- post-promotion watch (tier 40) -----------------------------------------
+# Once a candidate is promoted the mirrors stop, so the pair-shaped
+# evidence ends exactly when watching matters. The watch re-verdicts
+# what the logs still say: the serving rows each deployment actually
+# carried (mirrors, trial replays and cache replays excluded), against
+# its same-priority-tier peers over the same window — its own error
+# rate and its mean latency as a percent of the peers' mean, judged by
+# the same migration: thresholds. A RECOMMENDATION to keep serving or
+# to roll back, never an automatic one.
+
+
+@router.get("/admin/migration/watch")
+async def migration_watch(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+    model: str | None = None,
+    deployment: str | None = None,
+    since: str | None = None,
+) -> dict:
+    """Post-promotion watch: go/no-go over the SERVING traffic — the
+    migration story continued after the promotion flips the candidate
+    live and the mirrored evidence ends.
+
+    One row per serving (non-shadow) deployment, each re-verdicted on
+    the rows attributed to it — the client-facing log rows written
+    once a dispatch COMPLETED on the deployment (mirrors — shadow
+    twins and prompt A/B — candidate-trial replays and cache replays
+    excluded: evidence, experiments and cache hits are not serving
+    traffic). The attribution is the honest part: a request that
+    fails before any dispatch completes (the router exhausted its
+    ladder — a failing sole deployment, or a candidate rescued by a
+    tier peer) logs with no deployment, so a failing candidate shows
+    up as traffic that ran away, never as fabricated attributed
+    errors. Each row carries its ``requests`` / ``errors`` /
+    ``error_rate`` / ``latency_mean_ms`` / ``cost_mean_usd`` over
+    the watch window, the tier peers' aggregate it is compared
+    against (``baseline``), the routing share split (``expected_share``
+    = its weight's share of its priority tier, ``actual_share`` = its
+    fraction of the tier's attributed requests in the window — a
+    rescued candidate thins toward 0 while its expected share stays
+    put, the loudest "traffic ran away from it" signal the watch can
+    show), and the ``recommendation`` (go / hold / no_go /
+    insufficient_evidence — same vocabulary, same thresholds, same
+    per-check numbers as the pre-promotion verdicts; a ``no_go`` or
+    ``hold`` on a freshly promoted candidate says where the Backups
+    button is, never pushes it).
+
+    The window: each row watches from when the deployment started
+    serving the model (``since`` — its first serving row, i.e. the
+    promotion moment measured on the traffic itself; no side state to
+    drift), and the baseline aggregates the same-priority peers over
+    exactly that window — the same traffic regime, the same clock.
+    ``?since=`` (ISO-8601) overrides the window for every row instead
+    (use it to re-verdict a slice); ``?model=`` / ``?deployment=``
+    narrow; an unknown model or deployment is empty data, not an
+    error. Thresholds come from the live ``migration:`` config and
+    are echoed, so every verdict is auditable against its bars."""
+    config = raw_request.app.state.config
+    since_ts = _parse_range_ts(since, "since") if since else None
+    sessionmaker = get_sessionmaker()
+
+    data: list[dict] = []
+    async with sessionmaker() as session:
+        for cfg_model in sorted(config.models, key=lambda m: m.name):
+            if model is not None and cfg_model.name != model:
+                continue
+            serving = [d for d in cfg_model.deployments if not d.shadow]
+            if not serving:
+                continue
+            if deployment is not None and not any(
+                d.name == deployment for d in serving
+            ):
+                continue  # nothing here can match — no query needed
+            # Tier-weight totals per priority — the expected-share
+            # denominators, a routing-config statement over the FULL
+            # tier (not narrowed by ?deployment=): the peers exist
+            # whether or not the operator filtered the response.
+            tier_weight: dict[int, int] = {}
+            for d in serving:
+                tier_weight[d.priority] = tier_weight.get(d.priority, 0) + d.weight
+            overview = await migration_core.serving_overview(
+                session, cfg_model.name, since=since_ts
+            )
+            for dep in sorted(serving, key=lambda d: d.name):
+                if deployment is not None and dep.name != deployment:
+                    continue
+                stats = overview.get(dep.name) or {
+                    "requests": 0,
+                    "errors": 0,
+                    "error_rate": None,
+                    "latency_mean_ms": None,
+                    "cost_mean_usd": None,
+                    "first_served_at": None,
+                }
+                peers = [
+                    d.name
+                    for d in serving
+                    if d.name != dep.name and d.priority == dep.priority
+                ]
+                # The baseline — the peers' aggregate over the
+                # candidate's own window (one light query; only a
+                # deployment that carried traffic opens one).
+                if stats["requests"] > 0:
+                    window_start = since_ts or stats["first_served_at"]
+                    baseline_raw = await migration_core.serving_baseline(
+                        session, cfg_model.name, peers, window_start
+                    )
+                else:
+                    baseline_raw = {
+                        "requests": 0,
+                        "errors": 0,
+                        "error_rate": None,
+                        "latency_mean_ms": None,
+                    }
+                baseline = {**baseline_raw, "deployments": peers}
+                recommendation = migration_core.evaluate_serving(
+                    {
+                        **stats,
+                        "baseline_requests": baseline_raw["requests"],
+                        "baseline_errors": baseline_raw["errors"],
+                        "baseline_latency_mean_ms": baseline_raw["latency_mean_ms"],
+                    },
+                    config.migration,
+                )
+                tier_requests = stats["requests"] + baseline_raw["requests"]
+                window_since = since_ts or stats["first_served_at"]
+                data.append(
+                    {
+                        "model": cfg_model.name,
+                        "deployment": dep.name,
+                        "priority": dep.priority,
+                        "weight": dep.weight,
+                        "since": (
+                            window_since.isoformat()
+                            if window_since is not None
+                            else None
+                        ),
+                        "requests": stats["requests"],
+                        "errors": stats["errors"],
+                        "error_rate": stats["error_rate"],
+                        "latency_mean_ms": stats["latency_mean_ms"],
+                        "cost_mean_usd": stats["cost_mean_usd"],
+                        "expected_share": round(
+                            dep.weight / tier_weight[dep.priority], 4
+                        ),
+                        "actual_share": round(stats["requests"] / tier_requests, 4)
+                        if tier_requests
+                        else 0.0,
+                        "baseline": baseline,
+                        "recommendation": recommendation,
+                    }
+                )
+    data.sort(key=lambda row: (row["model"], row["deployment"]))
+    return {"data": data, "thresholds": config.migration.model_dump()}
+
+
 # -- candidate trials (tier 36) -------------------------------------------
 # The deliberate-replay leg: a captured window of one public model's
 # traffic replayed against a named candidate deployment with real

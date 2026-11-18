@@ -315,6 +315,12 @@
       <div style="overflow-x:auto"><table id="shadow-diff-table"></table></div>
     </div>
     <div class="panel" style="margin-top:14px">
+      <div class="ph">Post-promotion watch
+        <div class="right muted" style="font-weight:400;font-size:12px">serving traffic, verdicted against the same <span class="mono" style="font-size:11px">migration:</span> thresholds &middot; from when each deployment started serving &middot; go / no-go vs its priority-tier peers &middot; a recommendation, never an automatic rollback</div>
+      </div>
+      <div style="overflow-x:auto"><table id="watch-table"></table></div>
+    </div>
+    <div class="panel" style="margin-top:14px">
       <div class="ph">Candidate trials
         <div class="right muted" style="font-weight:400;font-size:12px">deliberate replay of a captured window against a candidate &middot; real upstream calls &middot; throttled + spend-capped &middot; scored like mirrors</div>
       </div>
@@ -1636,6 +1642,7 @@ async function loadRouting() {
   }
   $("#routing-table").innerHTML = html + "</tbody>";
   await loadShadowDiff();
+  await loadWatch();
   await loadTrials(r);
 }
 $("#routing-table").addEventListener("click", async e => {
@@ -1967,6 +1974,60 @@ async function loadShadowPairsPage() {
   $("#shadow-pairs-more").hidden = s.offset >= s.total;
 }
 $("#shadow-pairs-more").addEventListener("click", loadShadowPairsPage);
+
+// ---------- post-promotion watch (tier 40) -------------------------------
+// Serving traffic re-verdicted: once a candidate is promoted the
+// mirrors stop, so /admin/migration/watch is what the logs still say
+// — each serving deployment's requests/errors/latency/cost from when
+// it started serving, compared against its priority-tier peers over
+// the same window, judged by the same migration: thresholds. The Go
+// / no-go badge is a recommendation to keep serving or roll back —
+// never an automatic one.
+
+async function loadWatch() {
+  const box = $("#watch-table");
+  let r;
+  try {
+    r = await api("/admin/migration/watch");
+  } catch (e) {
+    box.innerHTML = `<tbody><tr><td class="muted">${esc(e.message || e)}</td></tr></tbody>`;
+    return;
+  }
+  if (!(r.data || []).length) {
+    box.innerHTML = `<tbody><tr><td class="muted">No serving deployments to watch. Every non-shadow deployment appears here with the requests it actually carried — mirrored evidence ends at promotion; this table is the watch that replaces it.</td></tr></tbody>`;
+    return;
+  }
+  let html = "<thead><tr><th>Model</th><th>Deployment</th><th>Go / no-go</th><th class=num>Share (expected &rarr; actual)</th><th class=num>Requests</th><th class=num>Errors</th><th class=num>Latency mean</th><th class=num>&Delta; latency vs tier</th><th class=num>Cost mean</th><th>Watching since</th></tr></thead><tbody>";
+  for (const w of r.data) {
+    const rec = w.recommendation || {};
+    const reasons = rec.reasons && rec.reasons.length
+      ? rec.reasons.join(" · ")
+      : `clears every migration threshold (${(rec.checks || []).filter(c => c.pass).length} checks)`;
+    const badge = `<span class="b ${MIGRATION_BADGE[rec.verdict] || "b-gray"}" title="${esc(reasons)}">${esc((rec.verdict || "").replace(/_/g, " "))}</span>`;
+    const latencyCheck = (rec.checks || []).find(c => c.name === "latency_delta_pct");
+    const latencyDelta = latencyCheck && latencyCheck.value != null
+      ? (latencyCheck.value > 0 ? "+" : "") + latencyCheck.value.toFixed(1) + "%"
+      : "—";
+    const share = `${Math.round(w.expected_share * 100)}% &rarr; ${Math.round(w.actual_share * 100)}%`;
+    const tierRequests = w.requests + ((w.baseline || {}).requests || 0);
+    const peers = (w.baseline || {}).deployments || [];
+    const shareTitle = `expected: its weight's share of the priority tier · actual: its fraction of the tier's ${tierRequests} request(s) in the window`
+      + (peers.length ? ` · peers: ${peers.join(", ")}` : " · no serving peers in its priority tier");
+    html += `<tr>
+      <td class="mono">${esc(w.model)}</td>
+      <td class="mono">${esc(w.deployment)}</td>
+      <td>${badge}</td>
+      <td class="num" title="${esc(shareTitle)}">${share}</td>
+      <td class="num">${fmtInt(w.requests)}</td>
+      <td class="num">${fmtInt(w.errors)} <span class="muted" style="font-size:12px">(${w.error_rate == null ? "—" : (w.error_rate * 100).toFixed(1) + "%"})</span></td>
+      <td class="num">${fmtMs(w.latency_mean_ms)}</td>
+      <td class="num">${latencyDelta}</td>
+      <td class="num">${fmtUsd(w.cost_mean_usd)}</td>
+      <td style="white-space:nowrap">${w.since ? esc(w.since.replace("T", " ").slice(0, 19)) + " UTC" : "—"}</td>
+    </tr>`;
+  }
+  box.innerHTML = html + "</tbody>";
+}
 
 // ---------- candidate trials (tier 36) ----------------------------------
 
