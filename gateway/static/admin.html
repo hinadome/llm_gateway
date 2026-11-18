@@ -305,6 +305,12 @@
       </div>
       <div style="overflow-x:auto"><table id="routing-table"></table></div>
     </div>
+    <div class="panel" style="margin-top:14px">
+      <div class="ph">Shadow diff evidence
+        <div class="right muted" style="font-weight:400;font-size:12px">mirrored pairs, scored raw-vs-raw &middot; exact = 1.0 &middot; near &ge; 0.80 &middot; deltas vs the paired primaries</div>
+      </div>
+      <div style="overflow-x:auto"><table id="shadow-diff-table"></table></div>
+    </div>
   </section>
 
   <!-- Guardrails -->
@@ -502,6 +508,19 @@
       <button value="ok" class="primary">Create version</button>
     </div>
   </form>
+</dialog>
+
+<!-- shadow-diff pair drilldown (tier 35): both sides of scored mirror pairs -->
+<dialog id="dlg-shadow-pairs">
+  <div class="dh" id="shadow-pairs-title">Shadow pairs</div>
+  <div class="db" style="min-width:780px;max-width:960px;max-height:70vh;overflow:auto">
+    <div id="shadow-pairs-list" style="display:grid;gap:14px"></div>
+    <div style="display:flex;justify-content:center">
+      <button class="small ghost" id="shadow-pairs-more" hidden>Load more</button>
+    </div>
+    <div class="muted" style="font-size:12px">Primary text is the serving leg&rsquo;s raw provider answer; shadow text the mirror&rsquo;s. Texts render only when logging.store_bodies was on for the row &mdash; the verdict always exists.</div>
+  </div>
+  <form method="dialog" class="df"><button>Close</button></form>
 </dialog>
 
 <div id="toasts"></div>
@@ -1546,6 +1565,7 @@ async function loadRouting() {
     }
   }
   $("#routing-table").innerHTML = html + "</tbody>";
+  await loadShadowDiff();
 }
 $("#routing-table").addEventListener("click", async e => {
   const btn = e.target.closest("button[data-reset]");
@@ -1558,6 +1578,121 @@ $("#routing-table").addEventListener("click", async e => {
     loadRouting();
   } catch (err) { toast(err.message, true); }
 });
+
+// ---------- shadow diff (tier 35): migration evidence over mirrors ------
+
+const VERDICT_BADGE = {
+  exact: "b-green", near: "b-blue", divergent: "b-amber",
+  shadow_error: "b-red", not_comparable: "b-gray",
+};
+const shadowPairs = { model: null, deployment: null, verdict: null, limit: 25, offset: 0, total: 0 };
+
+function signedDelta(v, fmt) {
+  if (v == null) return "—";
+  const mag = Math.abs(v);
+  return (v > 0 ? "+" : "") + (fmt ? fmt(mag) : mag);
+}
+
+async function loadShadowDiff() {
+  // Scored mirror pairs per shadow deployment — the go/no-go numbers
+  // for promoting a candidate to serving. Platform-admin surface
+  // (pairs carry request bodies, which cross tenants); any error is
+  // reported in place rather than blanking the routing table above.
+  let r;
+  try { r = await api("/admin/shadow-diff"); }
+  catch (e) {
+    $("#shadow-diff-table").innerHTML =
+      `<tbody><tr><td class="muted">${esc(e.message || e)}</td></tr></tbody>`;
+    return;
+  }
+  const groups = r.groups || [];
+  if (!groups.length) {
+    $("#shadow-diff-table").innerHTML =
+      `<tbody><tr><td class="muted">No scored mirror pairs yet. Add a shadow deployment to a model above and serve some traffic — every successful request is mirrored, scored raw-vs-raw, and reported here per shadow deployment.</td></tr></tbody>`;
+    return;
+  }
+  let html = "<thead><tr><th>Model</th><th>Shadow deployment</th><th class=num>Pairs</th><th>Verdicts</th><th class=num>Match rate</th><th class=num>Mean similarity</th><th class=num>&Delta; latency</th><th class=num>&Delta; cost</th><th>Last pair</th><th></th></tr></thead><tbody>";
+  for (const g of groups) {
+    const badges = [
+      ["exact", g.exact, "byte-identical answers (similarity 1.0)"],
+      ["near", g.near, "cosmetic drift: similarity at or above 0.80"],
+      ["divergent", g.divergent, "different answers: similarity below 0.80"],
+      ["shadow_error", g.shadow_error, "the mirror call itself failed"],
+      ["not_comparable", g.not_comparable, "no text on a side (tool-call replies, empty content)"],
+    ].filter(([, n]) => n > 0)
+     .map(([v, n, t]) => `<span class="b ${VERDICT_BADGE[v]}" title="${t}">${n} ${v.replace(/_/g, " ")}</span>`)
+     .join(" ");
+    html += `<tr>
+      <td class="mono">${esc(g.model)}</td>
+      <td class="mono">${esc(g.deployment)} <span class="muted" style="font-size:12px">${esc(g.provider)}</span></td>
+      <td class="num">${fmtInt(g.pairs)}</td>
+      <td>${badges || '<span class="muted">—</span>'}</td>
+      <td class="num">${g.match_rate == null ? "—" : Math.round(g.match_rate * 100) + "%"}</td>
+      <td class="num">${g.similarity_mean == null ? "—" : Number(g.similarity_mean).toFixed(3)}</td>
+      <td class="num" title="shadow mean latency minus primary mean latency (positive = shadow slower)">${signedDelta(g.latency_delta_ms, fmtMs)}</td>
+      <td class="num" title="shadow cost minus primary cost over the window (positive = shadow pricier)">${signedDelta(g.cost_delta_usd, v => "$" + v.toFixed(4))}</td>
+      <td class="muted" style="font-size:12px">${fmtWhen(g.last_pair_at)}</td>
+      <td>
+        <button class="small ghost" data-pairs-model="${esc(g.model)}" data-pairs-deployment="${esc(g.deployment)}">Pairs</button>
+        ${g.divergent > 0 ? `<button class="small ghost" data-pairs-model="${esc(g.model)}" data-pairs-deployment="${esc(g.deployment)}" data-pairs-verdict="divergent">Divergent ${g.divergent}</button>` : ""}
+      </td></tr>`;
+  }
+  $("#shadow-diff-table").innerHTML = html + "</tbody>";
+}
+$("#shadow-diff-table").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-pairs-model]");
+  if (!btn) return;
+  openShadowPairs(btn.dataset.pairsModel, btn.dataset.pairsDeployment, btn.dataset.pairsVerdict || null);
+});
+
+function pairSideHtml(label, side, missingText) {
+  const stats = side == null ? "" :
+    `<div class="muted" style="font-size:12px;margin-bottom:4px">${esc(side.status)} · ${fmtMs(side.latency_ms)} · ${fmtInt(side.completion_tokens)} tok · ${fmtUsd(side.cost_usd)}</div>`;
+  const text = side == null
+    ? `<div class="muted" style="font-size:12px">${esc(missingText)}</div>`
+    : side.text == null
+      ? `<div class="muted" style="font-size:12px">body not stored (logging.store_bodies was off)</div>`
+      : `<div style="white-space:pre-wrap;font-size:12.5px;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--panel2);max-height:220px;overflow:auto">${esc(side.text)}</div>`;
+  return `<div style="min-width:0"><div style="font-size:12px;font-weight:700;margin-bottom:4px">${label}</div>${stats}${text}</div>`;
+}
+
+async function openShadowPairs(model, deployment, verdict) {
+  Object.assign(shadowPairs, { model, deployment, verdict, offset: 0, total: 0 });
+  $("#shadow-pairs-title").textContent = `Shadow pairs — ${model} / ${deployment}` + (verdict ? ` · ${verdict}` : "");
+  $("#shadow-pairs-list").innerHTML = "";
+  $("#dlg-shadow-pairs").showModal();
+  await loadShadowPairsPage();
+}
+
+async function loadShadowPairsPage() {
+  const s = shadowPairs;
+  const params = new URLSearchParams({ model: s.model, deployment: s.deployment, limit: s.limit, offset: s.offset });
+  if (s.verdict) params.set("verdict", s.verdict);
+  const r = await api("/admin/shadow-diff/pairs?" + params);
+  s.total = r.total;
+  const list = $("#shadow-pairs-list");
+  if (!r.data.length && s.offset === 0) {
+    list.innerHTML = `<div class="muted">No pairs${s.verdict ? ` with verdict '${s.verdict}'` : ""} scored for this deployment.</div>`;
+  }
+  for (const p of r.data) {
+    const badge = `<span class="b ${VERDICT_BADGE[p.verdict] || "b-gray"}">${esc(p.verdict || "")}</span>`;
+    const sim = p.similarity == null ? "" : ` <span class="muted" style="font-size:12px">similarity ${Number(p.similarity).toFixed(3)}</span>`;
+    list.insertAdjacentHTML("beforeend", `<div style="border:1px solid var(--border);border-radius:8px;padding:10px;display:grid;gap:8px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        ${badge}${sim}
+        <span class="muted" style="font-size:12px">${fmtWhen(p.created_at)}</span>
+        <span class="mono muted" style="font-size:11px">${esc(p.request_id)}</span>
+      </div>
+      <div class="grid2">
+        ${pairSideHtml("Primary (serving)", p.primary, "primary row not found (retention-pruned or pre-tier row)")}
+        ${pairSideHtml("Shadow (candidate)", p.shadow, "")}
+      </div>
+    </div>`);
+  }
+  s.offset += r.data.length;
+  $("#shadow-pairs-more").hidden = s.offset >= s.total;
+}
+$("#shadow-pairs-more").addEventListener("click", loadShadowPairsPage);
 
 // ---------- system -----------------------------------------------------
 

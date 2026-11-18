@@ -105,6 +105,8 @@ class LoggingService:
                 cache_hit=ctx.cache_hit,
                 shadow=ctx.shadow,
                 prompt_variant=ctx.prompt_variant,
+                shadow_verdict=ctx.shadow_verdict,
+                shadow_similarity=ctx.shadow_similarity,
                 byok_provider=ctx.byok_provider,
                 trace_id=ctx.trace_id,
                 span_id=ctx.span_id,

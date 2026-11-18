@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 60 Python files, ~16,100 lines, 736 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 81 Python files, ~27,200 lines, 1081 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -104,7 +104,10 @@ gateway/
 │                           RateLimitError, BudgetExceededError, ...)
 ├── models.py / db.py       SQLAlchemy ORM (Tenant, VirtualKey, RequestLog, Prompt,
 │                           SettingKV) + async engine management incl. get_engine (readiness
-│                           checks, VACUUM INTO backups)
+│                           checks, VACUUM INTO backups); RequestLog's
+│                           tier-35 shadow-diff columns (shadow_verdict /
+│                           shadow_similarity, mirror rows only) ride the
+│                           auto-upgrade like every nullable addition
 ├── bootstrap.py           First-boot seeding: admin key, default virtual key
 ├── serve.py + __main__.py `python -m gateway` runner (wrapped by scripts/gateway.sh):
 │                           HTTP by default, HTTPS via three certificate modes —
@@ -308,6 +311,11 @@ gateway/
 │                           each line carrying the recorded baseline +
 │                           comparable/skip_reason; POST /admin/replay is
 │                           the replay+diff leg — see core/replay.py;
+│                           GET /admin/shadow-diff + /admin/shadow-diff/
+│                           pairs (tier 35, platform-admin-only — the
+│                           pairs carry request bodies, which cross
+│                           tenants) serve core/shadow_diff's migration
+│                           evidence over mirrored traffic;
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -431,7 +439,15 @@ gateway/
 │   │                       deployments and _queue_prompt_ab mirrors a fraction of
 │   │                       them to the library prompt's candidate version (same
 │   │                       deployment, candidate swapped into the system slot;
-│   │                       background tasks, like spend accounting);
+│   │                       background tasks, like spend accounting); tier 35
+│   │                       threads the primary's RAW answer text through both
+│   │                       — extracted before the response phase on the
+│   │                       buffered path, accumulated source text on the
+│   │                       streaming path, captured BY VALUE at queue time so
+│   │                       no rewrite or scheduling race leaks into the
+│   │                       baseline — and each mirror row is scored on it
+│   │                       (core/shadow_diff): shadow_verdict +
+│   │                       shadow_similarity land on the shadow row;
 │   │                       _note_byok (tier 31) marks the ctx right after
 │   │                       every dispatch when the upstream call rode
 │   │                       the TENANT'S stored vault credential —
@@ -837,6 +853,9 @@ gateway/
 │                           store_bodies=false skips persisting bodies (PII-safe mode),
 │                           prune() deletes rows older than retention_days (called from
 │                           the lifespan retention loop, counted on LOGS_PRUNED);
+│                           every RequestContext field maps to a column —
+│                           tier 35's shadow_verdict/shadow_similarity
+│                           persist on mirror rows like prompt_variant;
 │                           QueuedLoggingService (logging.background_write) is a
 │                           drop-in subclass whose write_request_log only
 │                           enqueues — a lazily started consumer performs the
@@ -1023,6 +1042,35 @@ gateway/
 │   │                       exported but not comparable (their
 │   │                       outcome was state, not policy); outcomes
 │   │                       count on gateway_replay_total{result}.
+│   ├── shadow_diff.py     Shadow diffing (tier 35): the evidence layer
+│   │                       over mirrored traffic. extract_content_text
+│   │                       pulls the answer text out of either logged
+│   │                       body shape (full OpenAI response or the
+│   │                       synthesized {"content": …} streaming body);
+│   │                       score_pair buckets a mirror against the
+│   │                       primary's RAW provider text — exact
+│   │                       (difflib ratio 1.0) / near (≥ 0.80) /
+│   │                       divergent / shadow_error (the mirror call
+│   │                       failed) / not_comparable (no text on a
+│   │                       side — never a fake 0.0) — wired into BOTH
+│   │                       mirror tasks (pipeline._mirror_to_shadow,
+│   │                       _mirror_prompt_variant) so the verdict +
+│   │                       similarity land on the shadow row at write
+│   │                       time (RequestLog.shadow_verdict /
+│   │                       shadow_similarity, auto-upgraded). aggregate()
+│   │                       / pairs() are the admin API's data layer:
+│   │                       a GROUP BY over the stored columns (never
+│   │                       a re-diff of bodies) for per-(model, shadow
+│   │                       deployment) pair counts, verdict breakdown,
+│   │                       match rate, similarity mean, latency/token/
+│   │                       cost deltas vs the paired primaries, and the
+│   │                       per-pair drilldown with text excerpts (null
+│   │                       when bodies were not stored — the verdict
+│   │                       exists regardless, scored in memory).
+│   │                       Deployment mirrors only: prompt_variant rows
+│   │                       are excluded (their divergence is by
+│   │                       design), pre-tier-35 rows (verdict NULL)
+│   │                       are never re-guessed.
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -1189,7 +1237,7 @@ gateway/
                             /admin/ui without auth (the shell holds no data);
                             talks to the JSON admin API above with the admin key
                             pasted into a login overlay (kept in sessionStorage,
-                            sent as Bearer). 6 tabs: overview stats (+ usage CSV
+                            sent as Bearer). 9 tabs: overview stats (+ usage CSV
                             export for the selected window, by-tenant breakdown
                             when tenants have traffic), key
                             management (create/edit/revoke, raw key shown once,
@@ -1198,9 +1246,19 @@ gateway/
                             keys), tenant management (create/edit/delete,
                             pooled budget bars, kill switch — platform admins
                             only; a tenant admin lands on a scoped note),
-                            request logs (filter, paginate, expand full bodies),
-                            routing table with live breaker state + reset,
-                            guardrail inventory. A test enforces the
+                            vault (tier 34: honest status + the per-tenant
+                            credential manager, hints only), prompt library
+                            (versions, activate/candidate patching, the
+                            new-version dialog), request logs (filter,
+                            paginate, expand full bodies), routing table with
+                            live breaker state + reset — plus, tier 35, the
+                            shadow-diff evidence table under it (per shadow
+                            deployment: verdict breakdown, match rate, mean
+                            similarity, latency/cost deltas) and the pair-
+                            drilldown dialog (verdict-filtered, both sides'
+                            text side by side, load-more paging) —
+                            guardrail inventory, system (health/readiness,
+                            config reload, backups). A test enforces the
                             no-external-resources invariant.
 ```
 
@@ -1498,7 +1556,7 @@ sequenceDiagram
     end
 
     Note over P: account usage → cost → spend (async task — key row<br/>then tenant row, crossed thresholds on either<br/>→ webhook alert, kind key or tenant).<br/>Cost is BILLED (tenant pricing_markup_pct) for<br/>spend/budgets/log/exports/per-key metrics,<br/>gateway_cost_usd_total stays ACTUAL and<br/>gateway_markup_usd_total counts the revenue
-    Note over P: mirror to shadow deployments (async task:<br/>non-streaming complete, own log row + metrics,<br/>no guardrails/budgets/rate limits, never affects client)
+    Note over P: mirror to shadow deployments (async task:<br/>non-streaming complete, own log row + metrics,<br/>no guardrails/budgets/rate limits, never affects client.<br/>tier 35: scored against the RAW provider answer —<br/>verdict + similarity land on the shadow row)
     P->>L: write request log (tokens, cost, latency, guardrail actions)
     P-->>C: 200 OpenAI response + X-Gateway-* headers
 ```
@@ -1539,7 +1597,7 @@ sequenceDiagram
     end
     P->>P: flush pending before the finish chunk<br/>(final=True — redact all matches)
     P-->>C: data: [DONE]
-    Note over P: finally: account usage/cost/spend (alerts in the<br/>spend task), queue shadow mirror, synthesize+store<br/>cache entry (REWRITTEN text — what the client saw),<br/>write log (one stream-modify action per rewriter)
+    Note over P: finally: account usage/cost/spend (alerts in the<br/>spend task), queue shadow mirror (tier 35: with the<br/>accumulated SOURCE text — pre-rewrite, captured by value<br/>at queue time — as the scoring baseline), synthesize+store<br/>cache entry (REWRITTEN text — what the client saw),<br/>write log (one stream-modify action per rewriter)
 ```
 
 Two properties worth highlighting:
@@ -2109,6 +2167,18 @@ tests/
 │                        fraction clamp/roll, streamed requests mirrored non-streaming,
 │                        shadow rows excluded from spend + /admin/stats, breaker recording,
 │                        metrics + routing-table fields
+├── test_shadow_diff.py  Shadow diffing (tier 35): extraction + bucketing units
+│                        (body shapes, the not-comparable honesty), e2e scoring —
+│                        exact pairs, the raw-vs-raw PII pin (masked client body
+│                        vs raw mirror still scores exact), streamed primaries
+│                        pairing against the accumulated source text, divergent
+│                        + shadow_error buckets — the aggregate (three shadow
+│                        twins fanned out per request: verdict breakdown, match
+│                        rate, similarity mean, latency/token/cost deltas,
+│                        no-comparable nulls), the drilldown + pagination,
+│                        bodies-off (verdicts survive, excerpts honestly null),
+│                        platform-admin-only, prompt_variant + pre-tier-35
+│                        rows excluded, 400s on bad/missing params
 ├── test_usage_export.py  /admin/usage/export: CSV columns/order/attachment download,
 │                        JSON summary + by_key/by_model/by_status aggregates, key/model/
 │                        status filters, time windows (default 30d, naive=UTC), shadow

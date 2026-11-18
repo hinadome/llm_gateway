@@ -69,6 +69,7 @@ from .cache import ResponseCache, cache_payload_for, cache_key_for
 from .idempotency import IdempotencyStore
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
+from .shadow_diff import extract_content_text, score_pair
 from .cost import CostCalculator, cached_tokens_from_usage
 from .mcp import (
     GUARDRAIL_BLOCKED,
@@ -746,6 +747,14 @@ class GatewayPipeline:
         )
 
         # 8. Guardrails: response phase
+        # Tier 35: the PRE-phase answer is the raw provider text — the
+        # baseline shadow diffing scores against. Extracted HERE, as an
+        # immutable string, so no response-phase rewrite can leak into
+        # the baseline (ctx.response_body below is what the CLIENT saw,
+        # rewrites and all). Mirrors run no guardrails, so raw-vs-raw is
+        # the apples-to-apples pairing — a primary-leg rewrite never
+        # reads as provider drift.
+        primary_raw_text = extract_content_text(response)
         try:
             response = await self.guardrails.run_response_phase(request, response, ctx)
         except GuardrailBlocked as exc:
@@ -764,8 +773,8 @@ class GatewayPipeline:
         # affects the response). Only for successful upstream responses —
         # cache hits returned earlier, blocked ones skip mirroring.
         if ctx.status == "success":
-            self._queue_shadow(request, ctx)
-            self._queue_prompt_ab(request, ctx)
+            self._queue_shadow(request, ctx, primary_raw_text)
+            self._queue_prompt_ab(request, ctx, primary_raw_text)
 
         if key is not None and ctx.status == "success":
             await self.cache.put(key, response)
@@ -2688,10 +2697,14 @@ class GatewayPipeline:
                 ctx.status = "success" if ctx.error_message is None else ctx.status
             # Mirror to shadow deployments once the stream has completed
             # successfully (never for blocked/errored streams; cache hits
-            # replayed earlier never reach here).
+            # replayed earlier never reach here). accumulated_text is the
+            # SOURCE text (line 2560) — what the model said, pre-rewrite —
+            # captured by value here so the mirror task (tier 35) scores
+            # raw-vs-raw no matter when the loop schedules it; emitted_text
+            # is only what the client saw.
             if not blocked and ctx.status == "success":
-                self._queue_shadow(request, ctx)
-                self._queue_prompt_ab(request, ctx)
+                self._queue_shadow(request, ctx, accumulated_text)
+                self._queue_prompt_ab(request, ctx, accumulated_text)
             if usage is not None:
                 await self._account_usage(
                     ctx, usage, ctx.native_model or ctx.model, spend=True
@@ -3406,7 +3419,12 @@ class GatewayPipeline:
     # Shadow mirroring
     # ------------------------------------------------------------------
 
-    def _queue_shadow(self, request: ChatCompletionRequest, ctx: RequestContext) -> None:
+    def _queue_shadow(
+        self,
+        request: ChatCompletionRequest,
+        ctx: RequestContext,
+        primary_text: str | None = None,
+    ) -> None:
         """Mirror a successfully-served request to the model's shadow
         deployments (fire-and-forget, exactly like spend accounting).
 
@@ -3415,6 +3433,12 @@ class GatewayPipeline:
         promoted to serving. The mirror never affects the client: no
         guardrails, no rate limits, no budgets, no cache, and its cost
         is logged on its own row instead of the key's spend.
+
+        ``primary_text`` (tier 35) is the primary's RAW provider text
+        (pre-rewrite), captured by value at queue time; the mirror task
+        scores its own answer against it (core/shadow_diff) and the
+        verdict + similarity land on the shadow row — the migration
+        evidence /admin/shadow-diff aggregates.
         """
         import asyncio
 
@@ -3433,8 +3457,11 @@ class GatewayPipeline:
 
             async def _mirror(
                 deployment: DeploymentConfig = deployment,
+                primary_text: str | None = primary_text,
             ) -> None:
-                await self._mirror_to_shadow(deployment, request, ctx)
+                await self._mirror_to_shadow(
+                    deployment, request, ctx, primary_text
+                )
 
             try:
                 self._spawn(_mirror())
@@ -3446,6 +3473,7 @@ class GatewayPipeline:
         deployment: DeploymentConfig,
         request: ChatCompletionRequest,
         ctx: RequestContext,
+        primary_text: str | None = None,
     ) -> None:
         """Send one non-streaming copy of the request to a shadow deployment.
 
@@ -3454,6 +3482,13 @@ class GatewayPipeline:
         Outcomes land in the shadow metrics, the deployment's circuit
         breaker, and a shadow request-log row sharing the primary's
         request_id — nothing here can reach the client.
+
+        Tier 35: the row also carries the pair's score. The mirror's
+        answer is diffed against ``primary_text`` (the primary's raw
+        provider text, captured at queue time) — verdict + similarity
+        via core/shadow_diff.score_pair — so /admin/shadow-diff can
+        aggregate migration evidence straight off the log rows without
+        re-reading or re-diffing bodies.
         """
         started = time.monotonic()
         # The copy is non-streaming even for streamed primaries.
@@ -3505,6 +3540,11 @@ class GatewayPipeline:
             if response is not None
             else None
         )
+        # Tier 35: score the pair in memory (works even when bodies are
+        # not persisted — only the drilldown excerpts need stored bodies).
+        verdict, similarity = score_pair(
+            primary_text, extract_content_text(response), outcome
+        )
         shadow_ctx = RequestContext(
             request_id=ctx.request_id,  # correlation: same id as the primary
             auth=AuthContext(
@@ -3523,6 +3563,8 @@ class GatewayPipeline:
             status=outcome,
             error_message=error_message,
             shadow=True,
+            shadow_verdict=verdict,
+            shadow_similarity=similarity,
         )
         # Snapshot this mirror's own wire capture (its task context, not
         # the primary's — see the reset above).
@@ -3538,7 +3580,10 @@ class GatewayPipeline:
     # ------------------------------------------------------------------
 
     def _queue_prompt_ab(
-        self, request: ChatCompletionRequest, ctx: RequestContext
+        self,
+        request: ChatCompletionRequest,
+        ctx: RequestContext,
+        primary_text: str | None = None,
     ) -> None:
         """Mirror a fraction of successfully-served requests to the
         library prompt's candidate version (fire-and-forget).
@@ -3549,6 +3594,11 @@ class GatewayPipeline:
         deployment the primary used — same model, same conditions, only
         the prompt differs. The client is never affected (no guardrails,
         no rate limits, no budgets, no cache, no spend; own log row).
+
+        ``primary_text`` (tier 35): the primary's raw answer, scored
+        against at mirror time — the variant row carries a verdict +
+        similarity too (the prompt workflow's evidence; the deployment
+        aggregate excludes prompt_variant rows by design).
         """
         import asyncio
 
@@ -3559,8 +3609,10 @@ class GatewayPipeline:
         if candidate.fraction < 1.0 and random.random() > candidate.fraction:
             return
 
-        async def _mirror() -> None:
-            await self._mirror_prompt_variant(request, ctx, library_prompt, candidate)
+        async def _mirror(primary_text: str | None = primary_text) -> None:
+            await self._mirror_prompt_variant(
+                request, ctx, library_prompt, candidate, primary_text
+            )
 
         try:
             self._spawn(_mirror())
@@ -3573,6 +3625,7 @@ class GatewayPipeline:
         ctx: RequestContext,
         library_prompt: ResolvedPrompt,
         candidate: CandidatePrompt,
+        primary_text: str | None = None,
     ) -> None:
         """Send one non-streaming copy of the request with the candidate
         prompt to the deployment that served the primary.
@@ -3582,6 +3635,12 @@ class GatewayPipeline:
         client supplied its own system message the library prompt never
         served, and if a guardrail rewrote it the comparison would be
         polluted; both cases skip the mirror.
+
+        Tier 35: the variant row is scored against ``primary_text``
+        (the primary's raw answer) like a deployment mirror — the
+        verdict/similarity on the row are the prompt A/B evidence.
+        Divergence here is EXPECTED (a different prompt was tested);
+        /admin/shadow-diff therefore excludes prompt_variant rows.
         """
         variables = dict(self.config.prompts.variables)
         if ctx.auth.prompt_variables:
@@ -3658,6 +3717,10 @@ class GatewayPipeline:
             if response is not None
             else None
         )
+        # Tier 35: score the candidate's answer against the primary's.
+        verdict, similarity = score_pair(
+            primary_text, extract_content_text(response), outcome
+        )
         variant_ctx = RequestContext(
             request_id=ctx.request_id,  # correlation: same id as the primary
             auth=AuthContext(
@@ -3677,6 +3740,8 @@ class GatewayPipeline:
             error_message=error_message,
             shadow=True,  # excluded from /admin/stats and key spend
             prompt_variant=f"{library_prompt.name} v{candidate.version}",
+            shadow_verdict=verdict,
+            shadow_similarity=similarity,
         )
         # Snapshot this mirror's own wire capture (its task context).
         variant_ctx.upstream_request = wire.upstream_request()

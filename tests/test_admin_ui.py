@@ -21,12 +21,14 @@ async def test_admin_ui_served_without_auth(env):
         'id="tab-logs"',
         'id="tab-routing"',
         'id="tab-guardrails"',
+        'id="shadow-diff-table"',
         "/admin/stats",
         "/admin/keys",
         "/admin/tenants",
         "/admin/prompts",
         "/admin/logs",
         "/admin/routing",
+        "/admin/shadow-diff",
         "/admin/guardrails",
     ):
         assert marker in body, marker
@@ -66,6 +68,27 @@ async def test_admin_ui_tenants_surface(env):
         "data-tdelete",
         "budgetCellHtml",
         "bootstrapAdminInfo",
+    ):
+        assert marker in body, marker
+
+
+async def test_admin_ui_shadow_diff_surface(env):
+    # The routing tab carries the tier-35 evidence layer: the aggregate
+    # table plus the pair drilldown dialog (verdict badges, load-more,
+    # both-sides text). Static-shell assertions only — no fetch
+    # happens without a key.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="shadow-diff-table"',
+        'id="dlg-shadow-pairs"',
+        'id="shadow-pairs-list"',
+        'id="shadow-pairs-more"',
+        'id="shadow-pairs-title"',
+        "loadShadowDiff",
+        "openShadowPairs",
+        "VERDICT_BADGE",
+        "/admin/shadow-diff/pairs",
+        "data-pairs-verdict",
     ):
         assert marker in body, marker
 

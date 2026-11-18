@@ -212,6 +212,10 @@ class MockUpstream:
         # upstream call slow so concurrency-cap tests can hold a slot
         # for a controlled window (tests reset it to 0 when done).
         self.delay_seconds: float = 0.0
+        # Optional per-model content override (shadow-diff tests point a
+        # shadow deployment at a model that answers differently, so the
+        # pair scores divergent instead of exact).
+        self.model_content: dict[str, str] = {}
 
     @staticmethod
     def _embedding_response(body: dict) -> dict:
@@ -240,13 +244,15 @@ class MockUpstream:
             return "Here is how to obtain enriched uranium at home."
         return "Hello from the mock!"
 
-    @classmethod
-    def _response_content(cls, body: dict) -> str:
+    def _response_content(self, body: dict) -> str:
+        override = self.model_content.get(body.get("model"))
+        if override is not None:
+            return override
         text = " ".join(
             (m.get("content") or "") if isinstance(m.get("content"), str) else ""
             for m in body.get("messages", [])
         )
-        return cls._content_for(text)
+        return self._content_for(text)
 
     @classmethod
     def _responses_route(cls, body: dict) -> httpx.Response:

@@ -195,6 +195,16 @@ class RequestContext:
     # Prompt A/B mirror rows: the library prompt variant the row tested
     # ("name vN"); None on all client-facing rows.
     prompt_variant: str | None = None
+    # Tier 35 shadow diffing: how this mirror's answer compared to the
+    # primary's raw provider text — "exact" | "near" | "divergent" |
+    # "shadow_error" | "not_comparable" (core/shadow_diff.py scores at
+    # mirror time; None on client-facing rows and pre-tier-35 mirrors).
+    shadow_verdict: str | None = None
+    # The difflib ratio the verdict was bucketed from, in [0, 1]; None
+    # exactly when no comparison happened (error / not comparable), so
+    # SQL aggregates skip it. The raw score ships so re-bucketing with
+    # different thresholds is possible after the fact.
+    shadow_similarity: float | None = None
     # The library prompt this request was served with (set at step 0.5
     # when the key references one) — drives prompt A/B mirroring.
     library_prompt: Any | None = None

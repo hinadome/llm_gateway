@@ -8,6 +8,55 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Shadow diffing (tier 35) — the evidence layer over mirrored traffic.
+  Shadow mirroring already wrote paired rows (the client-facing primary
+  and the mirrored candidate share a request_id, each with its own
+  body, latency, tokens and cost), but nothing ever compared them: an
+  operator weighing a provider migration had hundreds of pairs and no
+  way to answer "how divergent is the candidate? at what latency/cost
+  delta? show me the worst pairs." Now every mirror is scored at
+  mirror time:
+  - **Raw-vs-raw** — the mirror's answer is diffed against the
+    primary's RAW provider text: extracted before the response phase
+    on the buffered path (an immutable string, so no rewrite can leak
+    into the baseline), the accumulated source text on the streaming
+    path (captured by value at queue time, so no scheduling race
+    either). Mirrors run no guardrails by design, so a primary-leg
+    rewrite never reads as provider drift — the PII redactor can mask
+    every client-seen body and the pair still scores exact.
+  - **Fixed verdict buckets, no config surface** — `exact`
+    (difflib ratio 1.0), `near` (≥ 0.80, cosmetic drift), `divergent`
+    (different answers), `shadow_error` (the mirror call itself
+    failed — a candidate that can't serve traffic is the loudest
+    finding of all), `not_comparable` (no text on a side: tool-call
+    replies, empty content — never a fake 0.0 that would read as
+    maximal divergence). The raw similarity ships on every row
+    (`RequestLog.shadow_similarity`, visible in `/admin/logs`) so
+    re-bucketing with different thresholds stays possible.
+  - **Aggregation stays SQL** — verdict + similarity are computed in
+    the mirror task and written onto the shadow row
+    (`shadow_verdict`/`shadow_similarity`, auto-upgraded columns), so
+    `GET /admin/shadow-diff` is a GROUP BY over stored columns: per
+    (model, shadow deployment) — pair counts, verdict breakdown,
+    match rate, mean similarity over comparable pairs, and latency/
+    token/cost deltas against the paired primaries. Scoring happens
+    in memory, so verdicts exist even when `logging.store_bodies` is
+    off; only the drilldown excerpts need stored bodies.
+  - **The drilldown is the review queue** — `GET /admin/shadow-diff/
+    pairs?model=…&deployment=…&verdict=divergent` shows both sides
+    side by side with paging; texts are null (honestly) on rows whose
+    bodies were never stored. The admin dashboard's Routing tab
+    renders the same: an evidence table under the routing table and
+    a pair-drilldown dialog behind each row.
+  - **Honest scoping** — deployment mirrors only: prompt A/B rows
+    (also shadow rows) are excluded from the aggregate because their
+    divergence is by design, though they carry verdicts on the log
+    surface for the prompt workflow; mirrors scored before tier 35
+    (verdict NULL) are never re-guessed. Both endpoints are
+    platform-admin-only — the pairs carry request bodies, which
+    cross tenants (the same boundary as /admin/routing).
+  13 tests pin the contract (`tests/test_shadow_diff.py`); the suite
+  stands at 1081.
 - BYOK hardening (tier 34) — three load-bearing additions to the
   tenant-owned-credential vault:
   - `vault.strict` — the platform-economics stance: tenant traffic may

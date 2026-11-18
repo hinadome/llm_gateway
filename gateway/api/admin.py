@@ -23,6 +23,7 @@ from ..core.alerts import BudgetAlertManager
 from ..core.context import AuthContext
 from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
+from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
 from ..core.vault import VaultService
 from ..db import get_sessionmaker
 from ..errors import GatewayError
@@ -41,6 +42,10 @@ from ..schemas import (
 from .deps import ENDPOINT_SCOPES, hash_key, require_admin, require_platform_admin
 
 router = APIRouter()
+
+# Shadow-diff verdict vocabulary, single-sourced from the scorer —
+# the /admin/shadow-diff/pairs ?verdict= filter accepts exactly these.
+_VERDICT_PATTERN = "^(" + "|".join(VERDICTS) + ")$"
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -800,6 +805,8 @@ def _log_row(row: RequestLog) -> dict:
         "cache_hit": row.cache_hit,
         "shadow": bool(row.shadow),
         "prompt_variant": row.prompt_variant,
+        "shadow_verdict": row.shadow_verdict,
+        "shadow_similarity": row.shadow_similarity,
         # BYOK vault: the provider whose upstream call used the TENANT'S
         # stored credential (None = platform credential). Observability
         # only — the credential itself is never stored anywhere.
@@ -1485,6 +1492,8 @@ def _usage_row(row: RequestLog) -> dict:
         "stream": bool(row.stream),
         "shadow": bool(row.shadow),
         "prompt_variant": row.prompt_variant,
+        "shadow_verdict": row.shadow_verdict,
+        "shadow_similarity": row.shadow_similarity,
     }
 
 
@@ -1734,6 +1743,65 @@ async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depe
             for model in config.models
         ],
     }
+
+
+@router.get("/admin/shadow-diff")
+async def shadow_diff_summary(
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+    model: str | None = None,
+    since: str | None = None,
+) -> dict:
+    """Shadow diffing — the migration-evidence aggregate (tier 35).
+
+    Shadow mirroring writes paired rows (same request_id); this scores
+    them into go/no-go numbers per (model, shadow deployment): pair
+    counts, the verdict breakdown (exact / near / divergent /
+    shadow_error / not_comparable), match rate, mean similarity, and
+    the latency / token / cost deltas against the paired primaries —
+    the answers an operator needs before promoting a candidate to
+    serving. Deployment mirrors only (prompt A/B rows are excluded —
+    their divergence is by design); rows scored before tier 35 carry
+    no verdict and are not re-guessed. ``?since=`` (ISO-8601) scopes
+    the window, ``?model=`` to one public model.
+
+    Platform-admin-only like /admin/routing: the pairs carry request
+    BODIES, which cross tenants — a tenant admin cannot read them.
+    """
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        return await shadow_aggregate(
+            session,
+            model=model,
+            since=_parse_range_ts(since, "since") if since else None,
+        )
+
+
+@router.get("/admin/shadow-diff/pairs")
+async def shadow_diff_pair_list(
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+    model: str = Query(...),
+    deployment: str = Query(...),
+    verdict: str | None = Query(None, pattern=_VERDICT_PATTERN),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """The shadow-diff drilldown: scored pairs for one shadow
+    deployment, newest first — the divergent ones (``?verdict=
+    divergent``) are the migration review queue. Each pair carries both
+    sides' status / latency / tokens / cost and the stored bodies' text
+    excerpts; texts are null on rows whose bodies were not persisted
+    (``logging.store_bodies`` off) — the verdict still exists, because
+    it was computed in memory at mirror time."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        return await shadow_pairs(
+            session,
+            model=model,
+            deployment=deployment,
+            verdict=verdict,
+            limit=limit,
+            offset=offset,
+        )
 
 
 @router.get("/admin/mcp")

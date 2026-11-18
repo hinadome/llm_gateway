@@ -397,6 +397,16 @@ class RequestLog(Base):
     # tested ("name vN"). Such rows are shadow rows sharing the primary's
     # request_id; the column is what comparison queries group on.
     prompt_variant: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # Tier 35 shadow diffing, mirror rows only: how this mirror's answer
+    # scored against the primary's raw provider text ("exact" | "near" |
+    # "divergent" | "shadow_error" | "not_comparable" — core/shadow_diff).
+    # Nullable: NULL on client-facing rows and mirrors scored before the
+    # column existed (the auto-upgrade adds it as NULL).
+    shadow_verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # The difflib ratio behind the verdict, in [0, 1]; NULL exactly when
+    # no comparison happened (mirror error / not comparable) so AVG()
+    # aggregates only over comparable pairs.
+    shadow_similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
     # BYOK vault (tier 31): the provider whose upstream call was made
     # with the TENANT'S stored credential instead of the platform's
     # configured key (None = platform credential, incl. every row from
