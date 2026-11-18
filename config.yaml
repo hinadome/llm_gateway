@@ -327,6 +327,13 @@ routing:
   timeout_seconds: 300
   max_retries: 2
   retry_backoff_base: 0.5
+  # Cost-aware routing: within a priority tier, prefer the deployment
+  # whose upstream model has the cheapest INPUT price (per the pricing
+  # table below — the same lookup billing uses). The price ladder is
+  # also the failover ladder; weight only breaks ties between equal
+  # prices; unpriced models sort last (unknown cost gets no discount).
+  # Priority still rules across tiers.
+  cost_aware: false
   # Per-deployment circuit breaker: a deployment that fails
   # `failure_threshold` consecutive requests (after retries) is skipped
   # for `cooldown_seconds`, then probed with one request before being
@@ -562,6 +569,12 @@ events:
 #   speech_usd_per_1m_chars — per 1M input characters (/v1/audio/speech)
 pricing: {}
   # gpt-4o: {input: 2.5, output: 10.0}
+  #   cached_input: 1.25   # per-1M price for provider-side prompt-cache
+  #                       # reads (OpenAI prompt_tokens_details.cached_
+  #                       # tokens). Defaults to 50% of `input` when
+  #                       # omitted; set it explicitly when the
+  #                       # provider's discount differs (Anthropic's
+  #                       # cache reads are 10% of base input).
   # text-embedding-3-small: {input: 0.02}
   # gpt-image-1: {image_usd: 0.04}
   # whisper-1: {audio_usd_per_minute: 0.006}

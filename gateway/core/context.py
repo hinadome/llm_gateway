@@ -155,6 +155,11 @@ class RequestContext:
     # metrics; verdicts still land in guardrail_actions (the replay
     # result is built from them). Never set on client traffic.
     dry_run: bool = False
+    # Cached *input* tokens the upstream reported (provider-side
+    # prompt caching) — a subset of prompt_tokens, billed at the
+    # cached_input price. None when the upstream reports no detail
+    # (older rows, cache hits with no stored split, non-chat paths).
+    cached_tokens: int | None = None
     # OpenTelemetry span for this request (None when tracing is disabled)
     otel_span: "Span | None" = None
     # Trace correlation ids (hex strings; None when tracing is disabled)

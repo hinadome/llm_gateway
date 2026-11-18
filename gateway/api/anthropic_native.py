@@ -319,6 +319,16 @@ def render_response(completion: dict) -> dict:
     choice = (completion.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     usage = completion.get("usage") or {}
+    usage_out = {
+        "input_tokens": usage.get("prompt_tokens") or 0,
+        "output_tokens": usage.get("completion_tokens") or 0,
+    }
+    # Cached input tokens round-trip in Anthropic's own field (the SDK
+    # surfaces usage.cache_read_input_tokens); the gateway's internal
+    # shape keeps them in prompt_tokens_details.cached_tokens.
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    if cached:
+        usage_out["cache_read_input_tokens"] = int(cached)
     return {
         "id": _anthropic_id(completion.get("id")),
         "type": "message",
@@ -327,10 +337,7 @@ def render_response(completion: dict) -> dict:
         "content": _content_blocks(message),
         "stop_reason": _STOP_TO_REASON.get(choice.get("finish_reason"), "end_turn"),
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens") or 0,
-            "output_tokens": usage.get("completion_tokens") or 0,
-        },
+        "usage": usage_out,
     }
 
 
@@ -349,6 +356,7 @@ class AnthropicStreamRenderer:
         self.message_id = _anthropic_id(None)
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cached_tokens = 0
         self.stop_reason: str | None = None
         self._started = False
         self._errored = False
@@ -419,6 +427,9 @@ class AnthropicStreamRenderer:
             usage = chunk.get("usage") or {}
             self.input_tokens = usage.get("prompt_tokens") or 0
             self.output_tokens = usage.get("completion_tokens") or 0
+            self.cached_tokens = (usage.get("prompt_tokens_details") or {}).get(
+                "cached_tokens"
+            ) or 0
             return events
 
         self._ensure_started(events)
@@ -480,7 +491,15 @@ class AnthropicStreamRenderer:
                         "stop_reason": _STOP_TO_REASON.get(self.stop_reason, "end_turn"),
                         "stop_sequence": None,
                     },
-                    "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens},
+                    "usage": {
+                        "input_tokens": self.input_tokens,
+                        "output_tokens": self.output_tokens,
+                        **(
+                            {"cache_read_input_tokens": self.cached_tokens}
+                            if self.cached_tokens
+                            else {}
+                        ),
+                    },
                 },
             )
         )

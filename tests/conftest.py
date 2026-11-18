@@ -191,6 +191,9 @@ class MockUpstream:
         self.stream_text: str | None = None
         # Optional override for the audio-output SSE body (delta.audio).
         self.audio_stream_text: str | None = None
+        # Optional fields merged into the non-streaming chat usage dict
+        # (e.g. prompt_tokens_details.cached_tokens — tier 24 billing).
+        self.usage_extra: dict | None = None
 
     @staticmethod
     def _embedding_response(body: dict) -> dict:
@@ -594,6 +597,7 @@ class MockUpstream:
                     "prompt_tokens": 10,
                     "completion_tokens": 7,
                     "total_tokens": 17,
+                    **(self.usage_extra or {}),
                 },
             },
         )

@@ -8,6 +8,54 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Cost-aware routing + cached-token billing — two halves of one
+  concern: what traffic costs.
+  - Cached-token billing: providers discount prompt-cache reads
+    (OpenAI prompt_tokens_details.cached_tokens, Anthropic
+    cache_read_input_tokens at 10% of base input, Gemini
+    cachedContentTokenCount) and the gateway now bills them. Adapters
+    normalize every provider's report into the OpenAI wire shape with
+    one internal contract — cached tokens are a subset of
+    prompt_tokens (Anthropic's out-of-band cache reads and cache
+    writes fold into the prompt count; Gemini's promptTokenCount
+    already includes them) — and the calculator bills
+    (prompt−cached)×input + cached×cached_input + completion×output.
+    cached_input is a new per-model pricing key defaulting to 50% of
+    input when omitted (OpenAI's discount; the built-in table encodes
+    Anthropic's 10% and Gemini's ~25%; operators can set it
+    explicitly). The split surfaces everywhere: the OpenAI response's
+    usage details (passthrough and translated), native Anthropic
+    cache_read_input_tokens, native Gemini cachedContentTokenCount,
+    the request-log row (new cached_tokens column — auto-upgrade
+    adds it; /admin/logs, the capture export and the usage export for
+    chargeback all carry it), and gateway_tokens_total
+    {type=cached_input} / the per-key family when metrics.per_key is
+    on. cached_tokens_from_usage is tolerant of flat-field
+    OpenAI-compatible servers and clamps to prompt_tokens so a lying
+    upstream cannot bill negative input.
+  - Cost-aware routing: routing.cost_aware (default false) ranks
+    same-priority deployments by their upstream model's INPUT price —
+    the pricing table with the same longest-prefix lookup billing
+    uses, via a CostCalculator the router rebuilds on config swap so
+    pricing hot-reloads apply. Cheapest first; the price ladder
+    doubles as the failover ladder (the dispatch loop re-picks from
+    the remainder); weight only breaks price ties (equal prices
+    load-balance by weight as before); unpriced models sort last
+    (unknown cost gets no discount); priority still rules across
+    tiers (cost never outranks a deliberately lower-priority
+    deployment). /admin/routing echoes the cost_aware flag and each
+    deployment's input/output/cached_input_usd_per_mtok so the
+    ranking is inspectable.
+  - 15 new tests (tests/test_cost_aware.py): extraction shapes and
+    clamping, billing math (default + explicit cached_input, prefix
+    match, unpriced), adapter folds (Anthropic non-stream + stream,
+    Gemini non-stream + stream), e2e billing/logging/metrics on the
+    OpenAI surface, native Anthropic/Gemini round trips, and the
+    routing ladder (cheapest-first, failover walk, unpriced-last,
+    equal-price weighting, cost_aware-off baseline,
+    priority-outranks-cost, /admin/routing echo). test_usage_export
+    and test_images pin updated contracts (cached_tokens column;
+    3-tuple lookup).
 - Capture-replay harness: a config-change safety net built on the
   request log. GET /admin/logs/export captures the replayable traffic
   as JSONL (rows with stored bodies; shadow mirrors excluded; same

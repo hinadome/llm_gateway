@@ -93,6 +93,7 @@ class LoggingService:
                 stream=ctx.stream,
                 prompt_tokens=ctx.prompt_tokens,
                 completion_tokens=ctx.completion_tokens,
+                cached_tokens=ctx.cached_tokens,
                 total_tokens=(
                     (ctx.prompt_tokens or 0) + (ctx.completion_tokens or 0)
                     if ctx.prompt_tokens is not None or ctx.completion_tokens is not None

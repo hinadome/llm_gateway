@@ -64,7 +64,7 @@ from .cache import ResponseCache, cache_payload_for, cache_key_for
 from .idempotency import IdempotencyStore
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
-from .cost import CostCalculator
+from .cost import CostCalculator, cached_tokens_from_usage
 from .events import EventBus
 from .logging_svc import LoggingService
 from .router import Router
@@ -572,6 +572,7 @@ class GatewayPipeline:
             usage = cached.get("usage") or {}
             ctx.prompt_tokens = usage.get("prompt_tokens")
             ctx.completion_tokens = usage.get("completion_tokens")
+            ctx.cached_tokens = cached_tokens_from_usage(usage) or None
             ctx.provider = "cache"
             ctx.status = "success"
             self._request_metric(ctx)
@@ -756,6 +757,7 @@ class GatewayPipeline:
             usage = entry["response"].get("usage") or {}
             ctx.prompt_tokens = usage.get("prompt_tokens")
             ctx.completion_tokens = usage.get("completion_tokens")
+            ctx.cached_tokens = cached_tokens_from_usage(usage) or None
             ctx.provider = "idempotency"
             ctx.status = "success"
             self._request_metric(ctx)
@@ -1775,17 +1777,29 @@ class GatewayPipeline:
     ) -> None:
         prompt_tokens = usage.get("prompt_tokens") or 0
         completion_tokens = usage.get("completion_tokens") or 0
+        cached_tokens = cached_tokens_from_usage(usage)
         ctx.prompt_tokens = prompt_tokens or ctx.prompt_tokens
         ctx.completion_tokens = completion_tokens or ctx.completion_tokens
+        if cached_tokens:
+            ctx.cached_tokens = cached_tokens
         if prompt_tokens or completion_tokens:
             metrics.TOKENS.labels("prompt").inc(prompt_tokens)
             metrics.TOKENS.labels("completion").inc(completion_tokens)
+            # Provider-side prompt-cache reads: their own series, so a
+            # cache-heavy traffic pattern is visible (and the uncached
+            # prompt total stays comparable with pre-tier-24 data).
+            if cached_tokens:
+                metrics.TOKENS.labels("cached_input").inc(cached_tokens)
             if self.config.metrics.per_key:
                 key = self._key_labeler.label(ctx.auth.key_name)
                 metrics.KEY_TOKENS.labels(key=key, type="prompt").inc(prompt_tokens)
                 metrics.KEY_TOKENS.labels(key=key, type="completion").inc(
                     completion_tokens
                 )
+                if cached_tokens:
+                    metrics.KEY_TOKENS.labels(key=key, type="cached_input").inc(
+                        cached_tokens
+                    )
             # TPM accounting: actual usage of completed (non-cached) calls.
             if ctx.auth.key_id is not None and not ctx.cache_hit:
                 await self.rate_limiter.record_usage(

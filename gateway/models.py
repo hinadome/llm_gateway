@@ -256,6 +256,11 @@ class RequestLog(Base):
     stream: Mapped[bool] = mapped_column(Boolean, default=False)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Cached *input* tokens the upstream reported (provider-side prompt
+    # caching) — a subset of prompt_tokens, billed at the cached_input
+    # price. NULL when the upstream reports no detail (also on rows
+    # written before the column existed — the auto-upgrade adds it).
+    cached_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

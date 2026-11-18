@@ -35,6 +35,7 @@ from ..schemas import (
 )
 from ..observability import metrics
 from .breaker import CircuitBreakerRegistry
+from .cost import CostCalculator
 
 
 def _trace_retry(deployment: DeploymentConfig, attempt: int, error: str) -> None:
@@ -112,6 +113,10 @@ class Router:
         self.providers = providers
         # Per-deployment circuit breakers (health-aware routing).
         self.breakers = breakers or CircuitBreakerRegistry(config.routing, clock=clock)
+        # Pricing view for cost-aware routing (_pick); rebuilt on config
+        # swap so pricing hot-reloads apply. Same CostCalculator billing
+        # uses, looked up on the deployment's upstream model.
+        self._cost = CostCalculator(config.pricing)
         self._groups: dict[str, list[DeploymentConfig]] = {}
         for model in config.models:
             self._groups[model.name] = sorted(
@@ -131,6 +136,7 @@ class Router:
         picked up here (they live on the adapters — restart to rotate
         those, or point them at a proxy)."""
         self.config = config
+        self._cost = CostCalculator(config.pricing)
         self._groups = {
             model.name: sorted(model.deployments, key=lambda d: d.priority)
             for model in config.models
@@ -200,11 +206,30 @@ class Router:
         return available
 
     def _pick(self, deployments: list[DeploymentConfig]) -> DeploymentConfig:
-        """Weighted pick among same-priority deployments."""
+        """Weighted pick among same-priority deployments.
+
+        With ``routing.cost_aware`` the tier is cost-ordered instead:
+        the cheapest *priced* upstream model wins (unpriced sort last —
+        unknown cost gets no discount), and weight only breaks ties
+        between equal prices. The dispatch loop removes exhausted
+        deployments and re-picks, so the price ladder doubles as the
+        failover ladder.
+        """
         first_priority = deployments[0].priority
         tier = [d for d in deployments if d.priority == first_priority]
         if len(tier) == 1:
             return tier[0]
+        if self.config.routing.cost_aware:
+            prices = [self._cost.input_price(d.model) for d in tier]
+            priced = [p for p in prices if p is not None]
+            if priced:
+                cheapest = min(priced)
+                tied = [d for d, p in zip(tier, prices) if p == cheapest]
+                if len(tied) == 1:
+                    return tied[0]
+                tier = tied  # equal prices: weighted-random among them
+            # No priced deployment in the tier: unknown costs all
+            # "tie" — plain weighted-random, as configured.
         weights = [max(1, d.weight) for d in tier]
         return random.choices(tier, weights=weights, k=1)[0]
 

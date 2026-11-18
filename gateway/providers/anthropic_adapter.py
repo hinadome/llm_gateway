@@ -245,12 +245,25 @@ def translate_response(native: dict, public_model: str) -> dict:
     if tool_calls:
         message["tool_calls"] = tool_calls
     usage_native = native.get("usage") or {}
-    usage = {
-        "prompt_tokens": usage_native.get("input_tokens", 0),
+    # Anthropic reports cache reads/writes OUTSIDE input_tokens; the
+    # gateway's internal contract is OpenAI's — prompt_tokens is the
+    # FULL input (cache reads are a subset of it), cached reads surface
+    # in prompt_tokens_details. Cache writes are input tokens too
+    # (billed at Anthropic's 1.25x write rate upstream; the gateway
+    # bills them at the input price — the pricing table's job).
+    cache_read = usage_native.get("cache_read_input_tokens", 0) or 0
+    cache_write = usage_native.get("cache_creation_input_tokens", 0) or 0
+    prompt_tokens = (
+        usage_native.get("input_tokens", 0) + cache_read + cache_write
+    )
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
         "completion_tokens": usage_native.get("output_tokens", 0),
-        "total_tokens": usage_native.get("input_tokens", 0)
+        "total_tokens": prompt_tokens
         + usage_native.get("output_tokens", 0),
     }
+    if cache_read:
+        usage["prompt_tokens_details"] = {"cached_tokens": int(cache_read)}
     return {
         "id": f"chatcmpl-{native.get('id', uuid.uuid4().hex)}",
         "object": "chat.completion",
@@ -298,11 +311,21 @@ class AnthropicStreamTranslator:
         if etype == "message_start":
             message = event.get("message") or {}
             usage_native = message.get("usage") or {}
+            # Same fold as translate_response: Anthropic keeps cache
+            # reads outside input_tokens; the trailing usage chunk
+            # carries the OpenAI shape with cached reads in details.
+            cache_read = usage_native.get("cache_read_input_tokens", 0) or 0
+            cache_write = usage_native.get("cache_creation_input_tokens", 0) or 0
+            prompt_tokens = (
+                usage_native.get("input_tokens", 0) + cache_read + cache_write
+            )
             self.usage = {
-                "prompt_tokens": usage_native.get("input_tokens", 0),
+                "prompt_tokens": prompt_tokens,
                 "completion_tokens": 0,
-                "total_tokens": usage_native.get("input_tokens", 0),
+                "total_tokens": prompt_tokens,
             }
+            if cache_read:
+                self.usage["prompt_tokens_details"] = {"cached_tokens": int(cache_read)}
             chunks.append(self._chunk({"role": "assistant", "content": ""}))
 
         elif etype == "content_block_start":

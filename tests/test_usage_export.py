@@ -34,6 +34,7 @@ CSV_COLUMNS = [
     "status",
     "prompt_tokens",
     "completion_tokens",
+    "cached_tokens",
     "total_tokens",
     "cost_usd",
     "latency_ms",
@@ -129,15 +130,16 @@ async def test_csv_export_rows_and_header(tmp_path):
         row = billed[0]
         assert row[3] == ""
         assert row[7] == "success"
-        assert row[8] == "10" and row[9] == "7" and row[10] == "17"
-        assert float(row[11]) == costs[1]
-        assert row[13] == "false" and row[15] == "false"
+        # prompt=10, completion=7, cached="" (none reported), total=17
+        assert row[8] == "10" and row[9] == "7" and row[10] == "" and row[11] == "17"
+        assert float(row[12]) == costs[1]
+        assert row[14] == "false" and row[16] == "false"
 
         # the cache replay: flagged, provider=cache, free
         replay = [r for r in data if r[2] == "team-a"][1]
         assert replay[5] == "cache"
-        assert float(replay[11]) == 0.0
-        assert replay[13] == "true"
+        assert float(replay[12]) == 0.0
+        assert replay[14] == "true"
 
         # rows are ordered oldest-first (stable for billing ingestion)
         created = [r[1] for r in data]

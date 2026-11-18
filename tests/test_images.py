@@ -41,7 +41,7 @@ def test_unit_pricing_lookup_and_overrides():
 
 def test_unit_pricing_token_fields_untouched():
     calc = CostCalculator({"model-a": {"input": 2.0, "output": 4.0, "image_usd": 0.5}})
-    assert calc.lookup("model-a") == (2.0, 4.0)  # token prices still parse
+    assert calc.lookup("model-a") == (2.0, 4.0, 1.0)  # token prices still parse; cached defaults to 50% of input
     assert calc.calculate_images("model-a", 2) == pytest.approx(1.0)
 
 

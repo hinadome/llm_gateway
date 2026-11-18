@@ -271,8 +271,15 @@ gateway/
 │                           stats
 │                           (by_tenant breakdown for platform admins),
 │                           usage export (CSV/JSON billing
-│                           extract, tenant filter + per-tenant aggregates),
-│                           routing/guardrail introspection (key mutations
+│                           extract, tenant filter + per-tenant
+│                           aggregates; cached_tokens is a column —
+│                           prompt-cache reads itemized for chargeback),
+│                           routing/guardrail introspection
+│                           (/admin/routing echoes each model's
+│                           context_window, the cost_aware flag and
+│                           per-deployment input/output/cached_input
+│                           prices — the same lookup the cost-aware
+│                           router ranks by; key mutations
 │                           and breaker resets emit audit records), operations —
 │                           POST /admin/reload (hot-reload config.yaml; invalid
 │                           config = 400, running one stays live; restart_required
@@ -381,7 +388,14 @@ gateway/
 │   │                       filters them; shadow_deployments() lists the mirroring
 │   │                       targets); apply_config hot-swaps models/deployments
 │   │                       and routing policy in place — breakers and provider
-│   │                       adapters survive the swap
+│   │                       adapters survive the swap. With routing.cost_aware
+│   │                       the same-priority tier is ranked by the deployment's
+│   │                       upstream-model INPUT price (the router's own
+│   │                       CostCalculator, rebuilt on config swap so pricing
+│   │                       hot-reloads apply): cheapest first, the price ladder
+│   │                       doubles as the failover ladder, weight breaks price
+│   │                       ties, unpriced models sort last, and priority still
+│   │                       rules across tiers
 │   ├── breaker.py         Per-deployment circuit breakers: closed → open (skip) → half-open (probe);
 │   │                       request-level failure counting, Prometheus state gauge,
 │   │                       admin reset; register() is idempotent — a config
@@ -406,7 +420,21 @@ gateway/
 │   ├── cost.py             CostCalculator: per-1M-token pricing, longest-prefix lookup;
 │   │                       unit prices for non-token modalities (image_usd,
 │   │                       audio_usd_per_minute, speech_usd_per_1m_chars —
-│   │                       same config block, same prefix match)
+│   │                       same config block, same prefix match). Three token
+│   │                       streams per entry: input, output and cached_input
+│   │                       (provider prompt-cache reads — OpenAI
+│   │                       prompt_tokens_details.cached_tokens, Anthropic
+│   │                       cache_read_input_tokens, Gemini
+│   │                       cachedContentTokenCount, all normalized to the
+│   │                       OpenAI wire shape with cached ⊆ prompt_tokens;
+│   │                       Anthropic's out-of-band cache reads fold into the
+│   │                       prompt count). cached_input defaults to 50% of
+│   │                       input when an entry sets none; billing is
+│   │                       (prompt−cached)×input + cached×cached_input +
+│   │                       completion×output; cached_tokens_from_usage
+│   │                       extracts the split (flat-field fallback, clamped
+│   │                       to prompt_tokens); input_price() is the
+│   │                       cost-aware router's ranking key
 │   ├── auth.py             Pluggable auth chain (Authenticator ABC → AuthChain.
 │   │                       from_config): built-in admin_key (constant-time vs
 │   │                       app.state), virtual_key (SHA-256 row lookup) and jwt
@@ -1751,14 +1779,14 @@ Three pillars, all wired from `create_app` and all testable in-process:
 | Pillar | Status | Where |
 |---|---|---|
 | **Metrics** | Always on — Prometheus, 24 series at `/metrics` (per-key family opt-in); optional OTLP mirror | `observability/metrics.py`, `observability/metrics_bridge.py` |
-| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`, and `key_id`/`route` — the exact-caller + inbound-surface columns the capture-replay harness pins replays by); optional JSON stdout + OTel logs pipeline; wire capture: allowlisted client request headers, the upstream request as sent to the provider and allowlisted provider response headers; streamed rows carry `ttft_ms` (time-to-first-token) and the derived decode rate | `core/logging_svc.py`, `observability/logs.py`, `observability/wire.py` |
+| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`, `key_id`/`route` — the exact-caller + inbound-surface columns the capture-replay harness pins replays by — and `cached_tokens`, the prompt-cache-read split billing itemizes); optional JSON stdout + OTel logs pipeline; wire capture: allowlisted client request headers, the upstream request as sent to the provider and allowlisted provider response headers; streamed rows carry `ttft_ms` (time-to-first-token) and the derived decode rate | `core/logging_svc.py`, `observability/logs.py`, `observability/wire.py` |
 | **Traces** | Opt-in (`GATEWAY_OTEL_ENABLED=true`) — OpenTelemetry, W3C propagation, configurable sampling & batching | `observability/tracing.py` |
 
 A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, Prometheus with alert rules, Grafana dashboard) ships in `deploy/` — see §10.5.
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_pii_scan_findings_total{kind}` (scanned request-log rows whose stored bodies matched a PII/secret detector kind) · `gateway_idempotency_total{outcome}` (Idempotency-Key outcomes: replayed / stored / rejected) · `gateway_replay_total{result}` (capture-replay harness line outcomes: changed / unchanged / not_comparable / error — POST /admin/replay; guardrail enforcement counters are suppressed during replay, so harness runs never touch `gateway_guardrail_blocks_total`) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` (prompt / completion / cached_input — the latter only when the upstream reports prompt-cache reads, so the uncached series stays comparable with pre-existing data) · `gateway_cost_usd_total{model}` (bills the cached split at the entry's cached_input price, 50% of input by default) · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_pii_scan_findings_total{kind}` (scanned request-log rows whose stored bodies matched a PII/secret detector kind) · `gateway_idempotency_total{outcome}` (Idempotency-Key outcomes: replayed / stored / rejected) · `gateway_replay_total{result}` (capture-replay harness line outcomes: changed / unchanged / not_comparable / error — POST /admin/replay; guardrail enforcement counters are suppressed during replay, so harness runs never touch `gateway_guardrail_blocks_total`) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 

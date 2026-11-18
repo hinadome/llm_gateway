@@ -328,6 +328,16 @@ def render_response(completion: dict) -> dict:
     usage = completion.get("usage") or {}
     prompt = usage.get("prompt_tokens") or 0
     completion_tokens = usage.get("completion_tokens") or 0
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    usage_meta = {
+        "promptTokenCount": prompt,
+        "candidatesTokenCount": completion_tokens,
+        "totalTokenCount": prompt + completion_tokens,
+    }
+    # Cached input tokens round-trip in Gemini's own field; the
+    # gateway's internal shape keeps them in prompt_tokens_details.
+    if cached:
+        usage_meta["cachedContentTokenCount"] = int(cached)
     return {
         "candidates": [
             {
@@ -336,11 +346,7 @@ def render_response(completion: dict) -> dict:
                 "index": 0,
             }
         ],
-        "usageMetadata": {
-            "promptTokenCount": prompt,
-            "candidatesTokenCount": completion_tokens,
-            "totalTokenCount": prompt + completion_tokens,
-        },
+        "usageMetadata": usage_meta,
         "modelVersion": completion.get("model", ""),
     }
 
@@ -409,11 +415,17 @@ class GeminiStreamRenderer:
         if self.usage:
             prompt = self.usage.get("prompt_tokens") or 0
             completion_tokens = self.usage.get("completion_tokens") or 0
-            final["usageMetadata"] = {
+            usage_meta = {
                 "promptTokenCount": prompt,
                 "candidatesTokenCount": completion_tokens,
                 "totalTokenCount": prompt + completion_tokens,
             }
+            cached = (self.usage.get("prompt_tokens_details") or {}).get(
+                "cached_tokens"
+            ) or 0
+            if cached:
+                usage_meta["cachedContentTokenCount"] = int(cached)
+            final["usageMetadata"] = usage_meta
         return [final]
 
 

@@ -38,7 +38,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Audit log** | Security-relevant admin actions (key create/update/revoke, breaker reset) POSTed as JSON webhooks to your SIEM/audit trail — who (key + auth method), what, when; best-effort background delivery, counted on `gateway_audit_events_total` |
 | **Token scoping** | Per-key `allowed_endpoints` (`chat` / `embeddings` / `images` / `audio` / `models`; `chat` covers the native formats and the Responses bridge) and `allowed_ips` (plain IPs or CIDR blocks) — defense in depth beyond model allowlists; admins are never scoped |
 | **Budget alerts** | Webhook fired when a key's spend crosses a threshold of its budget (default 50/80/90/100%, configurable); once per level per key, survives restarts, raising the budget re-arms; best-effort delivery with retry, counted on `gateway_alerts_total` |
-| **Routing** | Weighted load balancing, retries with exponential backoff, cross-provider fallbacks, per-deployment circuit breakers (failing deployments are skipped, probed after a cooldown; state visible in `/admin/routing` and on `gateway_circuit_state`; per-process by default, or **shared across replicas via Redis** with `routing.breaker.backend: redis`). **Canary** = a deployment's `weight` within a tier (raise it gradually to shift traffic); **shadow** = mirror a fraction of successful requests to a non-serving deployment for comparison |
+| **Routing** | Weighted load balancing, retries with exponential backoff, cross-provider fallbacks, per-deployment circuit breakers (failing deployments are skipped, probed after a cooldown; state visible in `/admin/routing` and on `gateway_circuit_state`; per-process by default, or **shared across replicas via Redis** with `routing.breaker.backend: redis`). **Canary** = a deployment's `weight` within a tier (raise it gradually to shift traffic); **shadow** = mirror a fraction of successful requests to a non-serving deployment for comparison; **cost-aware** = rank same-priority deployments by their upstream model's input price — cheapest first, the price ladder doubling as the failover ladder (`routing.cost_aware`) |
 | **Usage export** | `GET /admin/usage/export` (CSV or JSON): billing / chargeback extract of request rows with cost/tokens/latency, time-window + key/model/status filters, and per-key / per-model / per-status aggregates; mirrored shadow calls excluded by default |
 | **Batch API** | OpenAI-style `/v1/files` + `/v1/batches`: upload a JSONL of chat requests, execute them in the background — each line through the *full* pipeline (guardrails, cache, routing, spend, request logs) — then fetch per-line results as output/error JSONL. Rate limits and budgets defer a batch instead of failing lines; the 24h completion window bounds retries (see [Batch API](#batch-api)) |
 | **Lifecycle events** | Subscribe your own handlers to the request-stage boundaries (`request.received` / `routed` / `cache_hit` / `rejected` / `failed`, `response.completed`, `stream.started` / `completed`, `auth.rejected`, `key.*`, `budget.threshold`, `batch.*`) — **observers** are fire-and-forget on a background queue (a slow or crashing handler can never affect a request), **interceptors** run in-band with veto power at the two pre-irreversible events; with no handlers the bus is inert (see [Lifecycle events](#lifecycle-events)) |
@@ -49,7 +49,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Capture-replay harness** | Config-change safety net built on the request log: `GET /admin/logs/export` captures real traffic as JSONL (bodies + the recorded baseline: caller, route, model, status, deployment, guardrail verdicts), `POST /admin/replay` re-executes those requests through the request-policy phases ONLY — resolution, prompt policy, permissions, guardrails, routing selection — with no upstream calls, no counters, no spend, no log rows, then **diffs** each line against the record. Replays run as the recorded caller's *current* key (edited/revoked keys replay under what they are *now* — a revoked key shows up as would-now-401), guardrail counters are suppressed so a harness run can never trip block alerts, and tenant admins replay only their own tenant's traffic (see [Capture-replay harness](#capture-replay-harness)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
-| **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model |
+| **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model — including **provider prompt-cache discounts**: cached input tokens (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, Gemini `cachedContentTokenCount`) bill at the `cached_input` price, default 50% of input |
 | **Background queued logging** | Opt-in `logging.background_write` moves the request-log INSERT off the response path — the last DB round trip a response pays — behind a bounded queue drained by a background consumer; a full queue drops rows (counted on `gateway_logs_dropped_total`) rather than blocking, and shutdown drains everything pending |
 | **Per-key metrics** | Opt-in `metrics.per_key` splits request/token/cost counters by virtual key (`gateway_key_*_total`) for per-team dashboards; cardinality capped — keys beyond `per_key_max_series` collapse into one `__overflow__` label, and shadow mirrors are excluded |
 | **Operations** | Liveness (`/healthz`) separate from readiness (`/readyz` — 503 while starting, draining on shutdown, or DB-down; circuit-breaker state reported informationally); **config hot-reload** (`POST /admin/reload` or SIGHUP) swaps guardrails/models/routing/pricing without dropping traffic, refuses a bad config, and tells you what needs a restart; **SQLite backups** (`POST /admin/backup` — online `VACUUM INTO`, list/delete via `/admin/backups`; on PostgreSQL the endpoint refuses and points at `pg_dump`); graceful shutdown drains in-flight requests, background spend/shadow work and the log queue; hardened Docker image (non-root, HEALTHCHECK on readiness) + standalone `deploy/docker-compose.yml` (volumes for DB + backups, optional Redis profile) |
@@ -533,6 +533,27 @@ Config lives in the `replay:` section: `enabled` (default true — `POST /admin/
 
 16 tests pin the contract (`tests/test_replay.py`).
 
+## Cost-aware routing & cached-token billing
+
+Providers discount prompt-cache reads (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens` at 10% of base input, Gemini `cachedContentTokenCount`). And a fleet of deployments often contains the same capability at wildly different prices. Two features make the gateway bill and route accordingly:
+
+**Cached-token billing.** Adapters normalize every provider's cached-token report into the OpenAI wire shape (`usage.prompt_tokens_details.cached_tokens`, always a subset of `prompt_tokens` — Anthropic's out-of-band cache reads fold into the prompt count). The calculator bills the split: `(prompt − cached) × input + cached × cached_input + completion × output`, with `cached_input` a per-model pricing key that **defaults to 50% of input** (OpenAI's discount — set it explicitly when the provider's differs; the built-in table encodes Anthropic's 10% and Gemini's ~25%). The split surfaces everywhere: the OpenAI response's usage details, native Anthropic `cache_read_input_tokens`, native Gemini `cachedContentTokenCount`, the request-log row (`cached_tokens`, in `/admin/logs` and the usage export for chargeback), and `gateway_tokens_total{type=cached_input}` — per-key too, when `metrics.per_key` is on.
+
+```yaml
+pricing:
+  claude-sonnet-4-5: {input: 3.0, output: 15.0, cached_input: 0.30}
+```
+
+**Cost-aware routing.** `routing.cost_aware: true` ranks same-priority deployments by their **upstream model's input price** (the pricing table, the same longest-prefix lookup billing uses): cheapest first, so "model-a at $5/M and model-b at $1/M both serve `test-model`" stops being a coin flip. The rules, in order:
+
+- **Priority still rules across tiers** — cost never outranks a deliberately lower-priority deployment.
+- **Within a tier, cheapest wins; the price ladder doubles as the failover ladder** (an exhausted cheap deployment falls through to the next cheapest, then the existing retry/breaker machinery).
+- **Weight only breaks price ties** — equally-priced deployments load-balance by `weight` as before.
+- **Unpriced models sort last** — unknown cost gets no discount; price your deployments if you enable this.
+- `/admin/routing` echoes `cost_aware` and each deployment's `{input, output, cached_input}_usd_per_mtok` (from the same lookup), so the ranking is inspectable.
+
+15 tests pin the contract (`tests/test_cost_aware.py`).
+
 ## Architecture
 
 For a deep dive — module map, request lifecycle sequence diagrams, extension frameworks, coupling rules, and an honest modularity assessment — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
@@ -867,6 +888,7 @@ routing:
   timeout_seconds: 300
   max_retries: 2
   retry_backoff_base: 0.5
+  cost_aware: false                # same-priority tier ranked by input price
   breaker: {enabled: true, failure_threshold: 3, cooldown_seconds: 30}
 alerts:                # webhook when a key's spend crosses a % of its max_budget_usd
   budget_thresholds: [50, 80, 90, 100]        # each level fires once per key
@@ -915,6 +937,8 @@ events:
   handlers: []
 pricing:
   gpt-4o: {input: 2.5, output: 10.0}      # USD per 1M tokens
+  #  cached_input: 1.25                    # per-1M price for prompt-cache reads;
+                                          # defaults to 50% of input when omitted
   text-embedding-3-small: {input: 0.02}   # embeddings: input-only pricing
   # Non-token modalities use unit-price keys (same longest-prefix match):
   gpt-image-1: {image_usd: 0.04}               # per generated image

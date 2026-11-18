@@ -360,6 +360,16 @@ def translate_response(native: dict, public_model: str, audio_format: str = "wav
     usage_meta = native.get("usageMetadata") or {}
     prompt_tokens = usage_meta.get("promptTokenCount", 0)
     completion_tokens = usage_meta.get("candidatesTokenCount", 0)
+    # Gemini's promptTokenCount already INCLUDES cachedContentTokenCount
+    # (context-cache hits) — surface the split in the OpenAI shape.
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    cached = usage_meta.get("cachedContentTokenCount", 0) or 0
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": int(cached)}
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -373,11 +383,7 @@ def translate_response(native: dict, public_model: str, audio_format: str = "wav
                 "finish_reason": _FINISH_MAP.get(candidate.get("finishReason"), "stop"),
             }
         ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        "usage": usage,
     }
 
 
@@ -448,6 +454,11 @@ class GeminiStreamTranslator:
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
             }
+            # Same split as translate_response: promptTokenCount already
+            # includes cachedContentTokenCount.
+            cached = usage_meta.get("cachedContentTokenCount", 0) or 0
+            if cached:
+                self.usage["prompt_tokens_details"] = {"cached_tokens": int(cached)}
             # Emit OpenAI-style trailing usage chunk (empty choices).
             chunks.append(
                 {

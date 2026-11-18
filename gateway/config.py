@@ -285,6 +285,16 @@ class RoutingConfig(BaseModel):
     timeout_seconds: float = 300
     max_retries: int = 2
     retry_backoff_base: float = 0.5
+    # Cost-aware routing: within a priority tier, prefer the deployment
+    # whose upstream model has the cheapest INPUT price (per the pricing
+    # table — the same lookup billing uses, on the deployment's model).
+    # The price ladder is also the failover ladder: an exhausted cheap
+    # deployment falls through to the next cheapest. weight only breaks
+    # ties between equally-priced (or equally unpriced) deployments;
+    # unpriced deployments sort last — unknown cost gets no discount.
+    # Priority still rules across tiers: cost never outranks a
+    # deliberately lower-priority deployment.
+    cost_aware: bool = False
     breaker: BreakerConfig = Field(default_factory=BreakerConfig)
 
 

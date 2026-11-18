@@ -623,6 +623,7 @@ def _log_row(row: RequestLog) -> dict:
         "stream": row.stream,
         "prompt_tokens": row.prompt_tokens,
         "completion_tokens": row.completion_tokens,
+        "cached_tokens": row.cached_tokens,
         "cost_usd": row.cost_usd,
         "latency_ms": row.latency_ms,
         # Streaming detail: time-to-first-token (None on non-streaming
@@ -1283,6 +1284,7 @@ _USAGE_CSV_COLUMNS = (
     "status",
     "prompt_tokens",
     "completion_tokens",
+    "cached_tokens",
     "total_tokens",
     "cost_usd",
     "latency_ms",
@@ -1305,6 +1307,7 @@ def _usage_row(row: RequestLog) -> dict:
         "status": row.status,
         "prompt_tokens": row.prompt_tokens,
         "completion_tokens": row.completion_tokens,
+        "cached_tokens": row.cached_tokens,
         "total_tokens": row.total_tokens,
         "cost_usd": round(row.cost_usd, 6) if row.cost_usd is not None else None,
         "latency_ms": row.latency_ms,
@@ -1514,12 +1517,30 @@ async def export_usage(
 async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]) -> dict:
     config = raw_request.app.state.config
     breakers = raw_request.app.state.pipeline.router.breakers
+    cost = raw_request.app.state.pipeline.router._cost
+
+    def _pricing(deployment_model: str) -> dict | None:
+        """Per-1M prices the router ranks by (looked up on the upstream
+        model, the same key billing uses). None = unpriced (sorts last
+        when cost_aware is on; calculate() bills nothing)."""
+        prices = cost.lookup(deployment_model)
+        if prices is None:
+            return None
+        return {
+            "input_usd_per_mtok": prices[0],
+            "output_usd_per_mtok": prices[1],
+            "cached_input_usd_per_mtok": prices[2],
+        }
+
     snapshots = await breakers.snapshots()
     return {
         "circuit_breaker": {
             "enabled": breakers.enabled,
             "deployments": snapshots,
         },
+        # Cost-aware routing: cheapest-priced deployment first within a
+        # priority tier (see routing.cost_aware).
+        "cost_aware": config.routing.cost_aware,
         "models": [
             {
                 "name": model.name,
@@ -1533,6 +1554,7 @@ async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depe
                         "weight": d.weight,
                         "shadow": d.shadow,
                         "shadow_fraction": d.shadow_fraction,
+                        "pricing": _pricing(d.model),
                         "breaker": snapshots.get(d.name),
                     }
                     for d in model.deployments
