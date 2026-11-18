@@ -8,6 +8,54 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Quiet-key alerts (tier 56) — the page a key's own *silence* never
+  sends. Spend alerts fire when spend crosses a threshold, so a key
+  that stopped authenticating costs nothing and pages nothing: a dead
+  integration, a cancelled cron, a churned customer were all
+  invisible until someone remembered to check. New
+  `core/quiet_alerts.py` — the expiry sweep's sibling (hourly, the
+  canary-loop shape: always started, `alerts:` re-read each pass;
+  tests drive `evaluate_once(now=...)` with a pinned clock) — walks
+  active keys with a `last_used_at` (tier 55) and fires once per
+  day-level when a key that WAS alive goes idle for
+  `alerts.quiet_days` days (default **7/30**: 7 the early page — a
+  cron stopped, an integration is stuck; 30 the churn page — rotate
+  or revoke it).
+  - **Lowest level first** — the deliberate mirror of expiry's
+    highest-first. A deadline counts *down* to one moment, so its
+    most distant warning fires first; a quiet period counts *up*
+    from an event, so its story arrives in order: a key the sweep
+    discovers already 40 days quiet pages 7-then-30, never 30 alone,
+    never merged.
+  - **Resumed use re-arms silently ON THE SWEEP** — idle below every
+    level clears the fired state (`quiet_alerts_fired`, a new key-row
+    column persisted beside the budget/expiry levels, written before
+    delivery: duplicate silence over duplicate noise). No recovery
+    page (the happy path is not news), so one row pages once per
+    quiet period, forever — and the whole decision lives inside the
+    alert layer: `record_key_use` stays pure telemetry, the same
+    separation expiry keeps from rotation.
+  - **No arming hook at create/PATCH** — the mirror-image difference
+    from expiry. A deadline is the operator's own choice (arms
+    silently); quiet state is *earned by traffic*, not chosen, so
+    there is nothing to arm — the first use starts the clock and
+    discovery stays honest.
+  - **Scope honesty**: never-used keys never alert (they were never
+    alive — that finding is the `idle_days` listing filter's);
+    revoked keys never warn; rotation never touches the state (the
+    stamp belongs to the row, whichever credential presents it).
+  - **Delivery** rides the shared alert family: the same webhook
+    (`type: quiet_key_alert` with `level_days`, `key_id`/`key_name`,
+    `last_used_at`, `idle_days`, a human message), one retry,
+    `gateway_alerts_total{kind="quiet", outcome=sent|failed|skipped}`;
+    with no URL the POST is a no-op counted `skipped` while the
+    `quiet.threshold` observer events still fire. `quiet_days: []`
+    disables this sweep alone. The dashboard adds a gray **💤 quiet**
+    badge on active keys idle past the first level, with the idle
+    count and the whole page/re-arm story in the tooltip. 8 new tests
+    (`tests/test_quiet_alerts.py`), all clock-pinned via
+    `evaluate_once(now=...)` + direct-row idle time-travel — no
+    sleeps.
 - Key last-used tracking (tier 55) — the key row answers "which keys
   are actually alive?". Rotation and revocation were blind: the row
   said when a key was created and what it may do, never when it was

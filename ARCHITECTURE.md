@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 92 Python files, ~35,200 lines, 1344 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 93 Python files, ~35,600 lines, 1353 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -90,7 +90,10 @@ gateway/
 │                           sweep_interval_seconds, the current scanner +
 │                           knobs handed over each pass — reload applies
 │                           from the next pass; the purged/flagged state
-│                           lands via guarded UPDATE), SIGHUP →
+│                           lands via guarded UPDATE), quiet-key alert
+│                           sweep (tier 56: one quiet_alerts pass per
+│                           alerts.quiet_interval_seconds — always
+│                           started, config re-read each pass), SIGHUP →
 │                           reload, readiness flag, drain-before-close), reload_gateway
 │                           (one path for /admin/reload + SIGHUP), /healthz liveness
 │                           (never checks deps) + /readyz readiness (503 while
@@ -1332,6 +1335,44 @@ gateway/
 │   │                       Delivery = the budget alerts' webhook/metric family
 │   │                       (kind="expiry", gateway_alerts_total; no URL →
 │   │                       counted skipped) + expiry.threshold observer events
+│   ├── quiet_alerts.py     Quiet-key alerts (tier 56): the liveness edition —
+│   │                       the page a key's own silence never sends (spend
+│   │                       alerts cannot see a key that stopped
+│   │                       authenticating: it costs nothing). idle_days_
+│   │                       count / crossed_levels / should_rearm are the
+│   │                       pure math (idle >= a day-level crosses it;
+│   │                       naive SQLite datetimes normalize to UTC, the
+│   │                       _is_expired rule); QuietKeyAlertManager sweeps
+│   │                       ACTIVE keys WITH a last_used_at (never-used
+│   │                       keys were never alive — that finding is the
+│   │                       idle_days listing filter's; revoked keys are
+│   │                       excluded) and fires once per day-level
+│   │                       (alerts.quiet_days 7/30: 7 the early page, 30
+│   │                       the churn page), LOWEST FIRST — the mirror of
+│   │                       expiry's highest-first, because a quiet
+│   │                       period counts UP from an event (a deadline
+│   │                       counts down to one): a key discovered 40 days
+│   │                       quiet pages 7-then-30, never 30 alone. The
+│   │                       canary-loop shape — always started, alerts:
+│   │                       re-read each pass, tests drive evaluate_once
+│   │                       (now=) with a pinned clock. Resumed use
+│   │                       RE-ARMS ON THE SWEEP: idle below every level
+│   │                       clears quiet_alerts_fired (no recovery page —
+│   │                       the happy path is not news), so one row pages
+│   │                       once per quiet period forever, and the
+│   │                       decision lives entirely here: record_key_use
+│   │                       (tier 55) never touches alert state, the
+│   │                       separation expiry keeps from rotation. NO
+│   │                       arming hook at create/PATCH — the mirror-
+│   │                       image difference: a deadline is the operator's
+│   │                       choice (arms silently), quiet is earned by
+│   │                       traffic. Single writer → no CAS; fired state
+│   │                       persists before delivery (duplicate silence
+│   │                       over duplicate noise). Delivery = the shared
+│   │                       webhook/metric family (kind="quiet", one
+│   │                       retry, no URL → counted skipped) + quiet.
+│   │                       threshold observer events; quiet_days: []
+│   │                       stops this sweep alone
 │   └── logging_svc.py      Request log persistence + spend accounting — add_spend uses
 │                           UPDATE…RETURNING for an atomic post-update snapshot and
 │                           feeds it to the alert manager (same background task);
@@ -2291,7 +2332,14 @@ gateway/
                             exact ISO timestamp in the tooltip, and a
                             gray "never" badge for never-used keys
                             whose tooltip says what they are: rotation
-                            candidates), tenant management (create/edit/delete,
+                            candidates; tier 56 adds the gray 💤 quiet
+                            badge on active keys idle past the first
+                            alert level (hardcoded 7 of
+                            alerts.quiet_days 7/30, the expiring
+                            badge's 14 convention) — tooltip carries
+                            the idle count, last-used date and the
+                            whole page/rotate-or-revoke/re-arm story),
+                            tenant management (create/edit/delete,
                             pooled budget bars, kill switch — platform admins
                             only; a tenant admin lands on a scoped note),
                             vault (tier 34: honest status + the per-tenant
@@ -2887,6 +2935,7 @@ erDiagram
         str monthly_bucket "YYYY-MM of monthly_spend_usd"
         json budget_alerts_fired "alert threshold levels (%) already fired"
         json expiry_alerts_fired "expiry warning day-levels already fired (14/7/1/0, tier 52), NULL = never evaluated"
+        json quiet_alerts_fired "quiet-key day-levels already fired in the CURRENT quiet period (7/30, tier 56) — resumed use re-arms on the next sweep, so one row pages once per quiet period forever; NULL = never evaluated / re-armed"
         json disabled_guardrails "guardrail names skipped for this key (runtime override)"
         bool cache_enabled "tier 54 per-key cache policy: NULL = inherit global, false = bypass both response caches (exact + semantic, chat and embeddings) for lookup AND store — narrowing only"
         int cache_ttl_seconds "the key's own cache window: read-side freshness bound AND write-side entry lifetime (longer than the global is possible); NULL = global cache.ttl_seconds"
@@ -3338,7 +3387,10 @@ tests/
 │                        row badge), keys-table last-used markers (tier 55:
 │                        fmtAgo renderer units — just now/m/h/d + calendar
 │                        fallback, the Last used header, the never badge
-│                        tooltip, the ISO tooltip, colspan 9),
+│                        tooltip, the ISO tooltip, colspan 9), quiet-badge
+│                        markers (tier 56: the 💤 quiet badge, its 7-day
+│                        idle threshold, the alerts.quiet_days + re-arm
+│                        tooltip),
 │                        /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,
@@ -3986,6 +4038,25 @@ tests/
 │                        no-webhook = skipped metric while events
 │                        still fire, and rotation (tier 51) leaves
 │                        the expiry state alone
+├── test_quiet_alerts.py  Quiet-key alerts (tier 56): pure math (idle
+│                        >= level crosses, lowest-first ordering, the
+│                        6.9-day fractional below-7 boundary, naive-
+│                        UTC normalization, rearm = idle below every
+│                        level with state lingering) and the sweep
+│                        with its clock PINNED: the 7 then 30 ladder
+│                        fires once per level (webhook payload shape,
+│                        quiet.threshold events, persisted state
+│                        ascending), discovery of a 40-day-quiet key
+│                        fires 7-then-30 IN ORDER (never 30 alone),
+│                        resumed use re-arms silently on the next pass
+│                        and the NEXT quiet period pages again (once
+│                        per period, forever), never-used and revoked
+│                        keys never alert, quiet_days: [] stops this
+│                        sweep alone, no-webhook = skipped metric
+│                        while events still fire, and a 500-ing hook
+│                        retries once then counts failed with the
+│                        crossing still persisted (duplicate silence
+│                        over duplicate noise)
 ├── test_pii_scan.py      PII/secret scan over stored bodies: the
 │                        original-not-the-mask contract (redaction
 │                        protects the provider, the audit sees what

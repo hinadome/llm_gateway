@@ -472,3 +472,21 @@ async def test_admin_ui_key_last_used_surface(env):
         'colspan="9"',
     ):
         assert marker in body, marker
+
+
+async def test_admin_ui_quiet_key_badge_surface(env):
+    # Tier 56: active keys idle past the first quiet level (the 7 of
+    # alerts.quiet_days 7/30 — same hardcoded-first-level convention as
+    # the expiring badge's 14) wear a gray 💤 quiet badge whose tooltip
+    # carries the whole policy: what fired, what to do, and that
+    # resumed use re-arms silently. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        "quietBadge",
+        "idleDays >= 7",
+        "💤 quiet",
+        "alerts.quiet_days",
+        "Resumed use re-arms silently",
+        'class="b b-gray" title="Quiet — no use for',
+    ):
+        assert marker in body, marker

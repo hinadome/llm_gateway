@@ -108,6 +108,12 @@ class VirtualKey(Base):
     # or moving the deadline re-arms the same budget way. Null = never
     # evaluated (the sweep discovers such keys honestly).
     expiry_alerts_fired: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    # Quiet-key levels (day values, tier 56) already fired in the
+    # CURRENT quiet period — a key that was alive (has last_used_at)
+    # and went idle >= N days (7/30). Resumed use re-arms on the next
+    # sweep, so one row can page across many quiet periods; within one,
+    # each level fires once. Null = never evaluated.
+    quiet_alerts_fired: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     # Guardrail names that are skipped for requests authenticated with this
     # key — a runtime override of config scoping (see GuardrailScope).
     disabled_guardrails: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
@@ -215,6 +221,7 @@ class VirtualKey(Base):
             "monthly_bucket": self.monthly_bucket,
             "budget_alerts_fired": self.budget_alerts_fired,
             "expiry_alerts_fired": self.expiry_alerts_fired,
+            "quiet_alerts_fired": self.quiet_alerts_fired,
             "disabled_guardrails": self.disabled_guardrails,
             "cache_enabled": self.cache_enabled,
             "cache_ttl_seconds": self.cache_ttl_seconds,

@@ -437,6 +437,17 @@ class AlertsConfig(BaseModel):
     the operator just chose the deadline); a key the sweep *discovers*
     already near its deadline fires honestly. The fired levels persist
     on the key row beside the budget ones.
+
+    And quiet-key alerts (tier 56): the liveness edition — a key that
+    WAS alive (it has a last_used_at, tier 55) and has not been used
+    for ``quiet_days`` (default 7/30) fires each day-level once: 7 is
+    the early page (a cron stopped, an integration is stuck), 30 the
+    churn page (rotate or revoke it). Resumed use re-arms silently on
+    the next sweep — a key may go quiet (and page) once per quiet
+    period, forever. Never-used keys are NOT quiet-key alerts (they
+    were never alive — that finding is the ``idle_days`` listing
+    filter's); revoked keys never warn. An empty ``quiet_days`` list
+    disables the sweep without touching the other alert families.
     """
 
     enabled: bool = True
@@ -448,6 +459,14 @@ class AlertsConfig(BaseModel):
     # the deadline passes (the key stops authenticating at that moment).
     expiry_days: list[int] = Field(default_factory=lambda: [14, 7, 1, 0])
     expiry_interval_seconds: float = 3600.0  # sweep cadence (hourly)
+    # Day levels for the quiet-key sweep (tier 56): a key that was
+    # alive (has a last_used_at) and has been idle >= N days fires each
+    # level once, lowest first (the 7-day page never arrives after the
+    # 30-day one — a quiet period is a story that unfolds in order).
+    # Resumed use re-arms on the next sweep. [] disables this sweep
+    # alone.
+    quiet_days: list[int] = Field(default_factory=lambda: [7, 30])
+    quiet_interval_seconds: float = 3600.0  # sweep cadence (hourly)
     timeout_seconds: float = 5.0
     max_attempts: int = 2  # delivery attempts (1 retry)
 

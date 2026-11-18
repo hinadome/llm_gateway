@@ -450,10 +450,22 @@ metrics:
 # crossed never page — the operator just chose the deadline); a key the
 # sweep discovers already near its deadline fires honestly. Revoked keys
 # and keys with no deadline never warn.
+#
+# And quiet-key alerts (tier 56): the liveness edition — a key that WAS
+# alive (it has a last_used_at, tier 55) and has been idle for
+# quiet_days fires each day-level once, lowest first (the 7-day page
+# never arrives after the 30-day one: a quiet period unfolds in order).
+# 7 is the early page (a cron stopped, an integration is stuck), 30 the
+# churn page (rotate or revoke it). Resumed use re-arms silently on the
+# next sweep, so one key pages once per quiet period, forever. Keys
+# never used were never alive (that finding is the idle_days listing
+# filter's); revoked keys never warn. [] disables this sweep alone.
 alerts:
   budget_thresholds: [50, 80, 90, 100]   # % of max_budget_usd
   expiry_days: [14, 7, 1, 0]   # days before expires_at; 0 = expired page
   #expiry_interval_seconds: 3600          # expiry sweep cadence (seconds)
+  quiet_days: [7, 30]          # days since last use; 7 = early page, 30 = churn page
+  #quiet_interval_seconds: 3600           # quiet-key sweep cadence (seconds)
   # webhook_url: https://hooks.slack.com/services/T000/B000/XXXX
   # url_env: ALERT_WEBHOOK_URL           # env var that overrides webhook_url
   # timeout_seconds: 5                   # per POST attempt

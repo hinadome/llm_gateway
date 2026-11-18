@@ -1109,6 +1109,15 @@ async function loadKeys() {
     const graceBadge = inGrace
       ? ` <span class="b b-amber" title="Rotated: the previous credential ${esc(k.previous_key_prefix || "")}… still authenticates as this key until ${fmtWhen(k.grace_until)}, then hard-fails. Budgets, limits and logs are shared by both credentials.">grace ${fmtWhen(k.grace_until)}</span>`
       : "";
+    // Quiet-key badge (tier 56): idle past the first alert level (the
+    // default 7 of alerts.quiet_days 7/30 — same hardcoded-first-level
+    // convention as the expiring badge's 14). The sweep pages once per
+    // quiet period; resumed use re-arms silently and drops the badge.
+    const idleDays = k.last_used_at
+      ? (Date.now() - new Date(k.last_used_at)) / 86400000 : null;
+    const quietBadge = k.is_active && idleDays != null && idleDays >= 7
+      ? ` <span class="b b-gray" title="Quiet — no use for ${idleDays.toFixed(1)} days (last: ${esc(k.last_used_at)}). The alert sweep (alerts.quiet_days, default 7/30) pages once per quiet period: 7 is the early signal (a cron stopped, an integration is stuck), 30 the churn page (rotate or revoke). Resumed use re-arms silently.">💤 quiet</span>`
+      : "";
     const tenantBadge = k.tenant_id
       ? ` <span class="b b-purple" title="Tenant: must also pass this tenant's pooled policy ceiling (models, RPM/TPM, budgets)">${esc(state.tenantNames[k.tenant_id] || k.tenant_id)}</span>`
       : "";
@@ -1122,7 +1131,7 @@ async function loadKeys() {
       ? `<span title="${esc(k.last_used_at)}">${fmtAgo(k.last_used_at)}</span>`
       : '<span class="b b-gray" title="Never used — a rotation candidate (may also predate tracking)">never</span>';
     return `<tr>
-      <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}${expiringBadge}${graceBadge}</td>
+      <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}${expiringBadge}${graceBadge}${quietBadge}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
       <td>${models}${grOff}${scoped}${ipLock}${toolLock}${mcpLock}${promptPolicy}${concBadge}${resBadge}${cacheBadge}</td>

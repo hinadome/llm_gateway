@@ -53,6 +53,7 @@ from .core.expiry_alerts import ExpiryAlertManager
 from .core.idempotency import IdempotencyStore
 from .core.pii_scan import PIIScanner
 from .core.pii_sweep import PIISweepManager
+from .core.quiet_alerts import QuietKeyAlertManager
 from .core.slo_alerts import SLOAlertEvaluator
 from .core.forecast_alerts import ForecastAlertEvaluator
 from .core.cache import ResponseCache
@@ -304,6 +305,11 @@ def create_app(
     # a sweep (the lifespan loop below) fires day-levels as expires_at
     # approaches. Shares the budget alerts' HTTP client and config.
     expiry_alerts = ExpiryAlertManager(config.alerts, client=alert_http_client, events=events_bus)
+    # Quiet-key alerts (tier 56): the same webhook, liveness edition — a
+    # sweep fires day-levels when a key that was alive (last_used_at,
+    # tier 55) goes idle for alerts.quiet_days. Shares the same HTTP
+    # client and config; resumed use re-arms on the next pass.
+    quiet_alerts = QuietKeyAlertManager(config.alerts, client=alert_http_client, events=events_bus)
     # PII-scan sweep (tier 53): records scan findings on log rows (once
     # per row — the on-demand endpoints land the same state) and purges
     # flagged bodies past pii_scan.purge_days. No HTTP client of its
@@ -589,6 +595,31 @@ def create_app(
 
         expiry_alert_task = asyncio.create_task(_expiry_alert_loop())
 
+        # Quiet-key alert sweep (tier 56): one pass per interval over
+        # active keys with a last_used_at — the day-levels a key's own
+        # silence never sends (spend alerts cannot see a quiet key; the
+        # churn/broken-integration page). Always started (not gated on
+        # alerts.enabled or quiet_days) so hot-enabling takes effect
+        # from the next pass; re-reads app.state.config.alerts each
+        # iteration — enabled, the day levels and the interval all
+        # apply live. Under pytest (ASGITransport skips the lifespan)
+        # this loop never starts — tests drive evaluate_once() directly.
+        async def _quiet_alert_loop() -> None:
+            while True:
+                current = app.state.config.alerts
+                active = current.enabled and bool(current.quiet_days)
+                if active:
+                    quiet_alerts.config = current
+                    try:
+                        await quiet_alerts.evaluate_once()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("quiet-key sweep failed")
+                await asyncio.sleep(
+                    current.quiet_interval_seconds if active else 30.0
+                )
+
+        quiet_alert_task = asyncio.create_task(_quiet_alert_loop())
+
         # PII-scan sweep (tier 53): one pass per interval — record
         # findings on unscanned rows (the same state the on-demand
         # endpoints land; newly flagged rows fire pii.found), then the
@@ -693,6 +724,7 @@ def create_app(
         slo_alert_task.cancel()
         forecast_alert_task.cancel()
         expiry_alert_task.cancel()
+        quiet_alert_task.cancel()
         pii_sweep_task.cancel()
         mcp_sweep_task.cancel()
         if vault_invalidation_task is not None:
@@ -770,6 +802,9 @@ def create_app(
     # pinning the sweep's clock — the lifespan loop never starts under
     # ASGITransport).
     app.state.expiry_alerts = expiry_alerts
+    # Quiet-key alert sweep (admin-plane; same test shape — evaluate_once
+    # with a pinned clock).
+    app.state.quiet_alerts = quiet_alerts
     # PII-scan sweep (admin-plane; tests drive evaluate_once(), pinning
     # the clock and passing the current scanner + config).
     app.state.pii_sweep = pii_sweep
