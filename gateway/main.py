@@ -38,6 +38,7 @@ from .api import embeddings as embeddings_api
 from .api import feedback as feedback_api
 from .api import gemini_native
 from .api import images as images_api
+from .api import mcp as mcp_api
 from .api import models as models_api
 from .api import openai_responses as responses_api
 from .api import realtime as realtime_api
@@ -54,6 +55,7 @@ from .core.cache import ResponseCache
 from .core.events import EventBus
 from .core.cost import CostCalculator
 from .core.logging_svc import LoggingService, QueuedLoggingService
+from .core.mcp import MCPSessionRegistry
 from .core.prompt_library import PromptLibrary
 from .core.pipeline import GatewayPipeline
 from .core.ratelimit import RateLimiter
@@ -357,6 +359,10 @@ def create_app(
         runaway=runaway,
         concurrency=concurrency,
         vault=vault,
+        # The MCP proxy's transport: the app's shared HTTP client (the
+        # same one every outbound webhook/client uses; chat traffic
+        # still goes through the router's adapters).
+        http_client=client,
     )
     # Batch API worker: drives /v1/batches lines in waves (app.state so
     # tests can tick it manually; the lifespan loop is the only driver
@@ -439,6 +445,31 @@ def create_app(
                 )
 
         canary_task = asyncio.create_task(_canary_loop())
+
+        # MCP session TTL: evict gateway-issued sessions idle past
+        # mcp.session_ttl_seconds. The registry is the gateway's OWN
+        # state (survives hot-reloads — a client mid-conversation is
+        # never stranded by a config swap), while the TTL is read live
+        # each pass so a reload applies from the next sweep. Evicted
+        # sessions get the closed event and a best-effort upstream
+        # DELETE (server removed from the config: the upstream session
+        # is left to the server's own TTL). Under pytest
+        # (ASGITransport skips the lifespan) this loop never starts —
+        # tests call registry.sweep() directly.
+        async def _mcp_sweep_loop() -> None:
+            while True:
+                try:
+                    mcp_config = app.state.config.mcp
+                    for session in app.state.mcp_registry.sweep(
+                        mcp_config.session_ttl_seconds
+                    ):
+                        await pipeline._mcp_sweep_one(session, mcp_config)
+                except Exception:  # noqa: BLE001
+                    logger.exception("mcp session sweep failed")
+                await asyncio.sleep(60.0)
+
+        mcp_sweep_task = asyncio.create_task(_mcp_sweep_loop())
+
         logger.info("LLM Gateway %s ready (models: %s)", __version__, config.public_models())
 
         # SIGHUP = reload config.yaml without dropping traffic (the same
@@ -477,6 +508,7 @@ def create_app(
         if batch_task is not None:
             batch_task.cancel()
         canary_task.cancel()
+        mcp_sweep_task.cancel()
         # In-flight background work (spend accounting, shadow mirrors,
         # prompt A/B) is drained before the resources it depends on go
         # away — bounded, so a wedged upstream cannot hang shutdown.
@@ -524,6 +556,12 @@ def create_app(
 
     # ---- app state -----------------------------------------------------
     app.state.pipeline = pipeline
+    # MCP proxy sessions (gateway-issued Mcp-Session-Id -> upstream
+    # session + negotiated protocol version). Created here — once per
+    # app — so hot-reloads never strand a live client session; a
+    # server removed from the config evicts lazily (next request 404s,
+    # the client re-initializes) and the lifespan loop sweeps TTLs.
+    app.state.mcp_registry = MCPSessionRegistry()
     # Lifecycle events (bus shared with audit/alerts/pipeline).
     app.state.events = events_bus
     # Batch worker (tick() driven by the lifespan loop; tests call it).
@@ -681,6 +719,7 @@ def create_app(
     app.include_router(images_api.router)
     app.include_router(audio_api.router)
     app.include_router(realtime_api.router)
+    app.include_router(mcp_api.router)
     app.include_router(batches_api.router)
     app.include_router(feedback_api.router)
     app.include_router(admin_api.router)

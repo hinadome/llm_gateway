@@ -29,6 +29,8 @@ from gateway.config import (
     GuardrailConfig,
     IdempotencyConfig,
     JWTAuthConfig,
+    MCPConfig,
+    MCPServerConfig,
     ReplayConfig,
     RunawayConfig,
     ConcurrencyConfig,
@@ -111,6 +113,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     replay = cache_overrides.pop("replay", None) or ReplayConfig()
     runaway = cache_overrides.pop("runaway", None) or RunawayConfig()
     concurrency = cache_overrides.pop("concurrency", None) or ConcurrencyConfig()
+    mcp = cache_overrides.pop("mcp", None) or MCPConfig()
     cache = cache_overrides.pop("cache", None) or CacheConfig(
         enabled=True, ttl_seconds=300, max_entries=128
     )
@@ -177,6 +180,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         runaway=runaway,
         concurrency=concurrency,
         events=events,
+        mcp=mcp,
     )
     if redis_backends:
         config.cache.backend = "redis"
@@ -630,6 +634,7 @@ async def _make_env(
     jwks_client=None,
     audit_client=None,
     vault_master_key=None,
+    mcp_mock=None,
 ):
     """Build a full app (fresh DB + mock upstream) as an async generator.
 
@@ -645,7 +650,21 @@ async def _make_env(
     await init_engine(db_url)
 
     mock = MockUpstream()
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock.handler))
+    # With an MCP mock: one composite transport routing by host — MCP
+    # servers in test configs live at http://mcp.test/..., every other
+    # provider at its own host — so the gateway's shared HTTP client
+    # exercises BOTH transports in one app.
+    if mcp_mock is not None:
+
+        def _route(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "mcp.test":
+                return mcp_mock(request)
+            return mock.handler(request)
+
+        transport = httpx.MockTransport(_route)
+    else:
+        transport = httpx.MockTransport(mock.handler)
+    http_client = httpx.AsyncClient(transport=transport)
     settings = Settings(
         admin_key=ADMIN_KEY,
         database_url=db_url,
@@ -669,7 +688,7 @@ async def _make_env(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
         ) as client:
-            yield SimpleNamespace(app=app, client=client, mock=mock)
+            yield SimpleNamespace(app=app, client=client, mock=mock, mcp=mcp_mock)
     finally:
         # Background log writes (logging.background_write): drain the
         # queue before the engine goes away (mirrors the lifespan

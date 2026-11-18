@@ -31,15 +31,18 @@ from contextlib import nullcontext, suppress
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, Status, StatusCode, use_span
 
-from ..config import DeploymentConfig, GatewayConfig
+from ..config import DeploymentConfig, GatewayConfig, MCPConfig
 from ..errors import (
     BudgetExceededError,
     GatewayError,
     GuardrailBlocked,
+    MCPDisabledError,
+    MCPServerNotAllowedError,
     ModelNotAllowedError,
     ModelNotFoundError,
     ProviderError,
@@ -67,6 +70,22 @@ from .idempotency import IdempotencyStore
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
 from .cost import CostCalculator, cached_tokens_from_usage
+from .mcp import (
+    GUARDRAIL_BLOCKED,
+    MCPToolBlocked,
+    MCPServerConfig,
+    MCPSession,
+    MCPSessionRegistry,
+    SESSION_REQUIRED,
+    SESSION_TERMINATED,
+    TOOL_NOT_ALLOWED,
+    SSEReader,
+    classify,
+    jsonrpc_error,
+    parse_jsonrpc_message,
+    sse_frame,
+    upstream_headers,
+)
 from .realtime import RealtimeRelay
 from .runaway import RunawayProtector
 from .concurrency import ConcurrencyLimiter
@@ -183,6 +202,11 @@ class GatewayPipeline:
         runaway: RunawayProtector | None = None,
         concurrency: ConcurrencyLimiter | None = None,
         vault: "VaultService | None" = None,
+        # The app's shared HTTP client (create_app always passes one) —
+        # the MCP proxy's only transport, so the pipeline for the first
+        # time needs direct upstream reach (chat/embeddings/images/audio
+        # go through the router's adapters, which hold their own).
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.config = config
         # Per-key metric series (metrics.per_key — opt-in; the labeler's
@@ -231,6 +255,10 @@ class GatewayPipeline:
         # peeked — after dispatch — to mark the ctx when the call rode
         # the tenant's credential (log row, header, metric).
         self.vault = vault or VaultService(None)
+        # The MCP proxy's upstream transport (the app's shared client;
+        # None = standalone constructions, where the MCP surface refuses
+        # with a clear 503 rather than pretending to work).
+        self._http_client = http_client
         # OTel API is a no-op until a provider is installed (spans are then
         # invalid and cost ~nothing), so this is safe unconditionally.
         self._tracer = tracer or trace.get_tracer("gateway")
@@ -1039,6 +1067,873 @@ class GatewayPipeline:
                         else:
                             span.set_status(Status(StatusCode.OK))
                         span.end()
+
+    # ------------------------------------------------------------------
+    # MCP proxy (tier 33)
+    # ------------------------------------------------------------------
+
+    async def handle_mcp(
+        self,
+        message: dict[str, Any],
+        auth: AuthContext,
+        server_name: str,
+        registry: MCPSessionRegistry,
+        *,
+        session_header: str | None = None,
+        request_id: str | None = None,
+    ) -> Response:
+        """One POST /v1/mcp/{server}: one JSON-RPC message in, the
+        server's answer out — JSON or SSE, with the response frame
+        intercepted where policy applies (tools/list filtering,
+        tools/call guardrails). The transport follows MCP 2025-06-18
+        Streamable HTTP: the gateway issues its OWN Mcp-Session-Id at
+        initialize and maps it to the upstream session + negotiated
+        protocol version; notifications and client responses relay as
+        202; upstream HTTP failures relay verbatim (the client's
+        JSON-RPC layer sees the server's own protocol errors) while
+        GATEWAY failures keep the gateway envelope — the documented
+        split: HTTP-gate failures (auth, scope, config, rate limits)
+        are the operator's concern, JSON-RPC-level failures are the
+        caller's.
+
+        Accounting: one request-log row per message (route ``mcp``,
+        provider ``mcp``, model = the SERVER name), INFLIGHT, and
+        gateway_mcp_requests_total{server,method,outcome}. No tokens
+        and no cost — MCP servers are not language models; RPM applies
+        (the realtime precedent), TPM/budget do not, by design.
+        """
+        kind = classify(message)
+        method = message.get("method")
+        method_label = method or kind or "unknown"
+        if self._http_client is None:  # standalone pipeline — never via create_app
+            raise GatewayError(
+                503,
+                "The MCP proxy has no HTTP client configured "
+                "(create_app must receive one).",
+                "api_error",
+            )
+        ctx = RequestContext(
+            request_id=request_id or f"req_{uuid.uuid4().hex}",
+            auth=auth,
+            # The server name rides the log row's model column — the
+            # same role a model name plays on every other surface
+            # (what the caller chose to talk to), which also means
+            # model-scoped guardrails scope to servers on this route.
+            model=server_name,
+            stream=False,
+            route="mcp",
+            request_body={"method": method},
+        )
+        ctx.provider = "mcp"
+        metrics.INFLIGHT.inc()
+        span = self._tracer.start_span("gateway.mcp", kind=SpanKind.INTERNAL)
+        ctx.otel_span = span
+        span.set_attribute("gateway.request_id", ctx.request_id)
+        span.set_attribute("gateway.model", ctx.model)
+        span.set_attribute("gateway.route", ctx.route)
+        span.set_attribute("gateway.key_name", auth.key_name or "admin")
+        span.set_attribute("gateway.mcp.method", method_label)
+        span_context = span.get_span_context()
+        if span_context.is_valid:
+            ctx.trace_id = format(span_context.trace_id, "032x")
+            ctx.span_id = format(span_context.span_id, "016x")
+        # The SSE relay finishes its own accounting (the response body
+        # outlives this call); every other exit — return or raise — is
+        # accounted exactly once by the finally below.
+        deferred = False
+        with use_span(
+            span,
+            end_on_exit=False,
+            record_exception=False,
+            set_status_on_exception=False,
+        ):
+            try:
+                # The gates, in the HTTP order. All gateway-envelope
+                # failures (the documented split).
+                if not self.config.mcp.enabled:
+                    raise MCPDisabledError()
+                server = self.config.mcp.server(server_name)
+                if server is None:
+                    raise MCPServerNotAllowedError(server_name)
+                self._check_mcp_server_policy(ctx, server_name)
+                await self._check_rate_limit(ctx, 0)
+                await self._acquire_slot(ctx)
+
+                async def _dispatch() -> Response:
+                    # Session lifecycle: initialize creates; everything
+                    # else (notifications included, per the transport
+                    # spec) requires the session header and must map.
+                    if kind == "request" and method == "initialize":
+                        return await self._mcp_initialize(
+                            ctx, server, registry, message
+                        )
+                    if not session_header:
+                        ctx.status = "error"
+                        return JSONResponse(
+                            jsonrpc_error(
+                                None,
+                                SESSION_REQUIRED,
+                                "Bad Request: Mcp-Session-Id header is required. "
+                                "Send an 'initialize' request first.",
+                            ),
+                            status_code=400,
+                        )
+                    session = registry.get(session_header)
+                    if session is None:
+                        ctx.status = "error"
+                        return JSONResponse(
+                            jsonrpc_error(
+                                None,
+                                SESSION_TERMINATED,
+                                "Session not found or expired. Re-initialize.",
+                            ),
+                            status_code=404,
+                        )
+                    registry.touch(session)
+
+                    if kind in ("notification", "response"):
+                        return await self._mcp_relay(
+                            ctx, server, registry, session, message
+                        )
+                    if method == "tools/list":
+                        return await self._mcp_tools_list(
+                            ctx, server, registry, session, message
+                        )
+                    if method == "tools/call":
+                        return await self._mcp_tools_call(
+                            ctx, server, registry, session, message
+                        )
+                    return await self._mcp_exchange(
+                        ctx,
+                        server,
+                        registry,
+                        session,
+                        message,
+                        on_response=None,
+                        kind=kind,
+                        method_label=method_label,
+                    )
+
+                response = await _dispatch()
+                if isinstance(response, StreamingResponse):
+                    # The relay generator owns the stream — and the
+                    # accounting with it.
+                    deferred = True
+                return response
+            except GatewayError as exc:
+                ctx.status = "blocked" if isinstance(exc, GuardrailBlocked) else "error"
+                ctx.error_message = exc.message
+                raise
+            except Exception as exc:  # noqa: BLE001
+                ctx.status = "error"
+                ctx.error_message = f"internal error: {exc}"
+                raise
+            finally:
+                if not deferred:
+                    await self._mcp_account(ctx, span, kind, method_label)
+
+    async def mcp_terminate(
+        self,
+        server_name: str,
+        session_header: str | None,
+        registry: MCPSessionRegistry,
+        auth: AuthContext,
+    ) -> Response:
+        """DELETE /v1/mcp/{server}: the transport's session termination.
+        The LOCAL mapping always drops first (idempotent state the
+        client can rely on), then a best-effort upstream DELETE relays
+        its status — including 405, which the spec explicitly allows a
+        server to answer when it does not support termination. No log
+        row: DELETE carries no JSON-RPC message; the mcp.session.closed
+        event and the gauge carry the observability."""
+        config = self.config.mcp
+        if not config.enabled:
+            raise MCPDisabledError()
+        server = config.server(server_name)
+        if server is not None:
+            # Only fail on the config gate when the server exists — a
+            # client terminating the session of a since-removed server
+            # should still clean up local state.
+            self._check_mcp_server_policy_for(server_name, auth)
+        if self._http_client is None:
+            raise GatewayError(
+                503,
+                "The MCP proxy has no HTTP client configured.",
+                "api_error",
+            )
+        if not session_header:
+            return JSONResponse(
+                jsonrpc_error(
+                    None,
+                    SESSION_REQUIRED,
+                    "Bad Request: Mcp-Session-Id header is required.",
+                ),
+                status_code=400,
+            )
+        session = registry.drop(session_header)
+        if session is None:
+            return JSONResponse(
+                jsonrpc_error(
+                    None,
+                    SESSION_TERMINATED,
+                    "Session not found or already terminated.",
+                ),
+                status_code=404,
+            )
+        await self._emit(
+            "mcp.session.closed",
+            None,
+            server=session.server_name,
+            gateway_session_id=session.gateway_session_id,
+            reason="client",
+        )
+        status = 200
+        if server is not None:
+            try:
+                status = await self._mcp_delete_upstream(server, session)
+            except GatewayError:
+                # Local state is already dropped — the client got what
+                # it asked for — but be honest about the upstream leg.
+                return Response(status_code=502)
+        if status in (200, 202, 204):
+            return Response(status_code=200)
+        return Response(status_code=status, headers={"Allow": "POST, DELETE"})
+
+    def _check_mcp_server_policy(self, ctx: RequestContext, server: str) -> None:
+        self._check_mcp_server_policy_for(server, ctx.auth)
+
+    @staticmethod
+    def _check_mcp_server_policy_for(server: str, auth: AuthContext) -> None:
+        """Two-layer MCP server permission — the model-permission
+        mechanics, verbatim: the key's ``allowed_mcp_servers`` fnmatch
+        patterns (platform admins bypass — they are the operators),
+        then the tenant's pooled patterns (no bypass; a tenant can only
+        narrow). None = that layer sets no restriction."""
+        import fnmatch
+
+        if auth.is_admin:
+            return
+        patterns = auth.allowed_mcp_servers
+        if patterns and not any(fnmatch.fnmatch(server, p) for p in patterns):
+            raise MCPServerNotAllowedError(server)
+        tenant_patterns = auth.tenant_allowed_mcp_servers
+        if (
+            auth.tenant_id is not None
+            and tenant_patterns
+            and not any(fnmatch.fnmatch(server, p) for p in tenant_patterns)
+        ):
+            raise MCPServerNotAllowedError(server)
+
+    async def _mcp_initialize(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        registry: MCPSessionRegistry,
+        message: dict[str, Any],
+    ) -> Response:
+        """initialize: the only session-creating message. The upstream
+        answer (JSON or SSE — the server chooses) is consumed HERE and
+        re-emitted as JSON to the client, which then quotes OUR
+        Mcp-Session-Id — mapped to the upstream's session and the
+        negotiated protocol version — on every following message."""
+        response = await self._mcp_post(ctx, server, None, message, stream=False)
+        try:
+            if response.status_code >= 400:
+                ctx.status = "error"
+                ctx.error_message = f"upstream initialize answered {response.status_code}"
+                return Response(
+                    status_code=response.status_code,
+                    content=response.content,
+                    media_type=response.headers.get(
+                        "content-type", "application/json"
+                    ),
+                )
+            body = parse_jsonrpc_message(
+                response.content,
+                response.headers.get("content-type", ""),
+            )
+            if body is None:
+                ctx.status = "error"
+                ctx.error_message = "upstream initialize was not a JSON-RPC message"
+                raise ProviderError(
+                    502,
+                    f"MCP server '{server.name}' did not answer the "
+                    "initialize request with a JSON-RPC message.",
+                    "api_error",
+                )
+            if "error" in body:
+                ctx.status = "error"
+                ctx.error_message = "upstream refused the initialize request"
+                return JSONResponse(body)
+            result = body.get("result") if isinstance(body.get("result"), dict) else {}
+            session = registry.create(
+                server.name,
+                response.headers.get("mcp-session-id"),
+                result.get("protocolVersion"),
+            )
+            await self._emit(
+                "mcp.session.opened",
+                ctx,
+                server=server.name,
+                gateway_session_id=session.gateway_session_id,
+                protocol_version=session.protocol_version,
+            )
+            ctx.status = "success"
+            return JSONResponse(
+                body, headers={"Mcp-Session-Id": session.gateway_session_id}
+            )
+        finally:
+            with suppress(Exception):
+                await response.aclose()
+
+    async def _mcp_relay(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        registry: MCPSessionRegistry,
+        session: MCPSession,
+        message: dict[str, Any],
+    ) -> Response:
+        """Notifications (no id) and client responses (answering a
+        server-initiated request): relayed verbatim. A 202 is the
+        transport's 'accepted, no reply' — mirrored exactly; anything
+        else relays status + body so the client sees the server's own
+        protocol error. No guardrails here by design: policy on the
+        MCP surface attaches to tool traffic (tools/list, tools/call),
+        the two messages that move caller-controlled content."""
+        response = await self._mcp_post(ctx, server, session, message, stream=False)
+        try:
+            if response.status_code == 404:
+                registry.drop(session.gateway_session_id)
+                await self._emit(
+                    "mcp.session.closed",
+                    ctx,
+                    server=session.server_name,
+                    gateway_session_id=session.gateway_session_id,
+                    reason="upstream_gone",
+                )
+            if response.status_code >= 400:
+                ctx.status = "error"
+                ctx.error_message = f"upstream answered {response.status_code}"
+                return Response(
+                    status_code=response.status_code,
+                    content=response.content,
+                    media_type=response.headers.get(
+                        "content-type", "application/json"
+                    ),
+                )
+            ctx.status = "success"
+            if response.status_code == 202 or response.status_code == 204 or not response.content:
+                return Response(status_code=202)
+            # A body on a notification/response POST is off-spec but not
+            # ours to judge — relay it and let the client decide.
+            return Response(
+                status_code=response.status_code,
+                content=response.content,
+                media_type=response.headers.get(
+                    "content-type", "application/json"
+                ),
+            )
+        finally:
+            with suppress(Exception):
+                await response.aclose()
+
+    async def _mcp_tools_list(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        registry: MCPSessionRegistry,
+        session: MCPSession,
+        message: dict[str, Any],
+    ) -> Response:
+        """tools/list through the tier-30 tool policy: the key sees the
+        tools it could actually CALL. The upstream catalog arrives
+        unfiltered (the server is not gateway-aware); the filter is
+        applied on the response frame — JSON body or SSE frame — so a
+        restricted key never learns the names it may not use."""
+
+        async def on_response(body: dict[str, Any]) -> dict[str, Any]:
+            if isinstance(body.get("result"), dict) and isinstance(
+                body["result"].get("tools"), list
+            ):
+                body["result"]["tools"] = [
+                    tool
+                    for tool in body["result"]["tools"]
+                    if isinstance(tool, dict)
+                    and self._tool_name_allowed(str(tool.get("name") or ""), ctx)
+                ]
+            return body
+
+        return await self._mcp_exchange(
+            ctx,
+            server,
+            registry,
+            session,
+            message,
+            on_response=on_response,
+            kind="request",
+            method_label="tools/list",
+        )
+
+    async def _mcp_tools_call(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        registry: MCPSessionRegistry,
+        session: MCPSession,
+        message: dict[str, Any],
+    ) -> Response:
+        """tools/call: the full policy pass on the one message type
+        that moves caller-controlled content both ways.
+
+        Before upstream — the tool policy, then the request-phase
+        guardrails over the serialized arguments (a synthetic chat
+        request: model = server name, one user message = the sorted-
+        JSON arguments). A modify verdict is applied ONLY if the
+        rewritten text is still a valid JSON object — otherwise the
+        call fails closed as blocked; a model-redirect verdict has no
+        meaning on this surface and is treated the same way. A denial
+        is an IN-BAND JSON-RPC error (HTTP 200): the agent at the other
+        end must see which tool and why, and a transport 4xx would hide
+        that from its JSON-RPC layer. Nothing upstream sees a denied
+        call.
+
+        After upstream — the response-phase guardrails over each text
+        item of the result (synthetic chat.completion per item). A
+        blocked result becomes the same in-band error, upstream's
+        answer discarded."""
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        name = params.get("name")
+        message_id = message.get("id")
+
+        def denied(blocked: MCPToolBlocked) -> Response:
+            return JSONResponse(
+                jsonrpc_error(message_id, blocked.code, blocked.reason)
+            )
+
+        if not isinstance(name, str):
+            # Fail closed when a policy exists (the tier-30 rule: a
+            # policy a request can't prove it passes is a policy it
+            # fails); unrestricted callers fall through to the server,
+            # which rejects the malformed call in its own shape.
+            if not ctx.auth.is_admin and (
+                ctx.auth.allowed_tools or ctx.auth.tenant_allowed_tools
+            ):
+                blocked = MCPToolBlocked(
+                    TOOL_NOT_ALLOWED,
+                    "Tool call rejected: no tool name in params, and this "
+                    "API key has a tool policy (fail closed).",
+                )
+                await self._mcp_apply_block(ctx, blocked)
+                return denied(blocked)
+        elif not self._tool_name_allowed(name, ctx):
+            blocked = MCPToolBlocked(
+                TOOL_NOT_ALLOWED,
+                f"Tool '{name}' is not allowed for this API key "
+                "(allowed_tools policy).",
+                tool=name,
+            )
+            await self._mcp_apply_block(ctx, blocked)
+            return denied(blocked)
+
+        arguments = params.get("arguments")
+        serialized = json.dumps(arguments, sort_keys=True) if arguments is not None else "{}"
+        synthetic = ChatCompletionRequest(
+            model=server.name,
+            messages=[Message(role="user", content=serialized)],
+        )
+        try:
+            modified = await self.guardrails.run_request_phase(synthetic, ctx)
+        except GuardrailBlocked as exc:
+            blocked = MCPToolBlocked(
+                GUARDRAIL_BLOCKED,
+                f"Request blocked by guardrail '{exc.guardrail}': {exc.reason}",
+                tool=name,
+                guardrail=exc.guardrail,
+            )
+            await self._mcp_apply_block(ctx, blocked)
+            return denied(blocked)
+        if modified.model != server.name:
+            # A model-redirect verdict cannot apply to an MCP tool call
+            # (there is no model to redirect) — fail closed, never
+            # silently drop the verdict.
+            blocked = MCPToolBlocked(
+                GUARDRAIL_BLOCKED,
+                "Blocked: a guardrail issued a model redirect, which the "
+                "MCP surface cannot honor — failing closed.",
+                tool=name,
+            )
+            await self._mcp_apply_block(ctx, blocked)
+            return denied(blocked)
+        new_content = modified.messages[-1].content if modified.messages else None
+        if isinstance(new_content, str) and new_content != serialized:
+            try:
+                new_arguments = json.loads(new_content)
+                if not isinstance(new_arguments, dict):
+                    raise ValueError("not a JSON object")
+                params["arguments"] = new_arguments
+            except ValueError:
+                blocked = MCPToolBlocked(
+                    GUARDRAIL_BLOCKED,
+                    "Blocked: a guardrail rewrote the tool arguments into "
+                    "something that is no longer a valid JSON object — "
+                    "failing closed rather than corrupting the call.",
+                    tool=name,
+                )
+                await self._mcp_apply_block(ctx, blocked)
+                return denied(blocked)
+        elif new_content is not None and not isinstance(new_content, str):
+            blocked = MCPToolBlocked(
+                GUARDRAIL_BLOCKED,
+                "Blocked: a guardrail rewrote the tool arguments into a "
+                "non-text message — failing closed.",
+                tool=name,
+            )
+            await self._mcp_apply_block(ctx, blocked)
+            return denied(blocked)
+
+        request_for_response = modified
+
+        async def on_response(body: dict[str, Any]) -> dict[str, Any]:
+            if not isinstance(body.get("result"), dict):
+                return body
+            content = body["result"].get("content")
+            if not isinstance(content, list):
+                return body
+            for item in content:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "text"
+                    and isinstance(item.get("text"), str)
+                ):
+                    synthetic_response = {
+                        "id": f"chatcmpl-mcp-{ctx.request_id}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": server.name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "finish_reason": "stop",
+                                "message": {"role": "assistant", "content": item["text"]},
+                            }
+                        ],
+                    }
+                    try:
+                        rewritten = await self.guardrails.run_response_phase(
+                            request_for_response, synthetic_response, ctx
+                        )
+                    except GuardrailBlocked as exc:
+                        raise MCPToolBlocked(
+                            GUARDRAIL_BLOCKED,
+                            f"Request blocked by guardrail '{exc.guardrail}': {exc.reason}",
+                            tool=name,
+                            guardrail=exc.guardrail,
+                        ) from exc
+                    new_text = (
+                        rewritten.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content")
+                    )
+                    if isinstance(new_text, str):
+                        item["text"] = new_text
+            return body
+
+        return await self._mcp_exchange(
+            ctx,
+            server,
+            registry,
+            session,
+            message,
+            on_response=on_response,
+            kind="request",
+            method_label="tools/call",
+        )
+
+    async def _mcp_apply_block(
+        self, ctx: RequestContext, blocked: MCPToolBlocked
+    ) -> None:
+        """Record a policy denial: the row's status/error_message and
+        the mcp.tool.blocked event (observer-only — the in-band JSON-RPC
+        error is the decision; handlers watch, they don't veto)."""
+        ctx.status = "blocked"
+        ctx.error_message = blocked.reason
+        await self._emit(
+            "mcp.tool.blocked",
+            ctx,
+            server=ctx.model,
+            tool=blocked.tool,
+            code=blocked.code,
+            guardrail=blocked.guardrail,
+        )
+
+    async def _mcp_exchange(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        registry: MCPSessionRegistry,
+        session: MCPSession,
+        message: dict[str, Any],
+        on_response: Any = None,
+        kind: str | None = None,
+        method_label: str | None = None,
+    ) -> Response:
+        """One request upstream, answered in whatever shape the server
+        chose: application/json (intercepted via ``on_response`` and
+        re-serialized) or text/event-stream (relayed live, the response
+        frame intercepted, everything else VERBATIM). Upstream HTTP
+        failures relay status + body unchanged — the client's JSON-RPC
+        layer should see the server's own errors — and a 404 (the
+        upstream forgot our session) also drops the local mapping so
+        the NEXT request 404s at the gateway and the client
+        re-initializes."""
+        message_id = message.get("id")
+        response = await self._mcp_post(ctx, server, session, message, stream=True)
+        streamed = False
+        try:
+            if response.status_code == 404:
+                registry.drop(session.gateway_session_id)
+                await self._emit(
+                    "mcp.session.closed",
+                    ctx,
+                    server=session.server_name,
+                    gateway_session_id=session.gateway_session_id,
+                    reason="upstream_gone",
+                )
+            if "text/event-stream" in response.headers.get("content-type", ""):
+                streamed = True
+                return StreamingResponse(
+                    self._mcp_sse_relay(
+                        ctx, response, on_response, message_id, kind, method_label
+                    ),
+                    media_type="text/event-stream",
+                )
+            # Everything else is consumed inline. The POST went out with
+            # stream=True so the SSE relay could have the raw stream —
+            # here that means .content is empty until it is read.
+            await response.aread()
+            if response.status_code >= 400:
+                ctx.status = "error"
+                ctx.error_message = f"upstream answered {response.status_code}"
+                return Response(
+                    status_code=response.status_code,
+                    content=response.content,
+                    media_type=response.headers.get(
+                        "content-type", "application/json"
+                    ),
+                )
+            try:
+                body = json.loads(response.content)
+            except ValueError:
+                ctx.status = "error"
+                ctx.error_message = "upstream sent a non-JSON body"
+                raise ProviderError(
+                    502,
+                    f"MCP server '{server.name}' answered with a non-JSON "
+                    f"body ({response.headers.get('content-type')}).",
+                    "api_error",
+                ) from None
+            if isinstance(body, dict):
+                if "error" in body:
+                    ctx.status = "error"
+                    ctx.error_message = "upstream returned a JSON-RPC error"
+                if on_response is not None:
+                    try:
+                        body = await on_response(body)
+                    except MCPToolBlocked as blocked:
+                        await self._mcp_apply_block(ctx, blocked)
+                        return JSONResponse(
+                            jsonrpc_error(message_id, blocked.code, blocked.reason)
+                        )
+            if ctx.status != "error":
+                ctx.status = "success"
+            return JSONResponse(body)
+        finally:
+            if not streamed:
+                with suppress(Exception):
+                    await response.aclose()
+
+    async def _mcp_sse_relay(
+        self,
+        ctx: RequestContext,
+        response: httpx.Response,
+        on_response: Any,
+        message_id: Any,
+        kind: str | None,
+        method_label: str | None,
+    ) -> AsyncIterator[bytes]:
+        """Relay the upstream's SSE answer live, in-band: notifications
+        and server-initiated requests pass through VERBATIM (raw frame
+        bytes), keepalives survive, and THE response frame is handed to
+        ``on_response`` — re-serialized when policy rewrites it, or
+        replaced by an in-band JSON-RPC error FRAME when policy blocks
+        (the client's JSON-RPC layer sees the denial; the stream then
+        ends). Server traffic after the response frame belongs to the
+        standalone GET stream, which this proxy does not open."""
+        reader = SSEReader()
+        try:
+            async for chunk in response.aiter_bytes():
+                for frame in reader.feed(chunk):
+                    if frame.data is None:
+                        yield frame.raw.encode()
+                        continue
+                    try:
+                        parsed = json.loads(frame.data)
+                    except ValueError:
+                        yield frame.raw.encode()
+                        continue
+                    if classify(parsed) != "response":
+                        yield frame.raw.encode()
+                        continue
+                    # THE response frame.
+                    rewritten = parsed
+                    if on_response is not None:
+                        try:
+                            rewritten = await on_response(parsed)
+                        except MCPToolBlocked as blocked:
+                            await self._mcp_apply_block(ctx, blocked)
+                            yield sse_frame(
+                                jsonrpc_error(message_id, blocked.code, blocked.reason),
+                                event=frame.event,
+                            )
+                            return
+                    payload = (
+                        json.dumps(rewritten)
+                        if isinstance(rewritten, dict)
+                        else frame.data
+                    )
+                    yield (
+                        f"event: {frame.event or 'message'}\ndata: {payload}\n\n"
+                    ).encode()
+                    return
+            # The server closed the stream without answering.
+            ctx.status = "error"
+            ctx.error_message = "upstream SSE stream ended without a JSON-RPC response"
+        finally:
+            with suppress(Exception):
+                await response.aclose()
+            await self._mcp_account(ctx, ctx.otel_span, kind, method_label)
+
+    async def _mcp_post(
+        self,
+        ctx: RequestContext,
+        server: MCPServerConfig,
+        session: MCPSession | None,
+        message: dict[str, Any],
+        *,
+        stream: bool,
+    ) -> httpx.Response:
+        """POST one JSON-RPC message upstream. ``stream=True`` returns a
+        response whose body must be consumed (aiter_bytes/aread) and
+        closed (aclose) by the caller — the SSE relay needs incremental
+        chunks; a plain awaited post would buffer the whole stream
+        first. Connection failures become the gateway's 502 envelope
+        (the documented split: talking-to-the-server is ours, the
+        protocol above it is the server's)."""
+        request = self._http_client.build_request(
+            "POST",
+            server.url,
+            content=json.dumps(message),
+            headers=upstream_headers(server, session),
+        )
+        kwargs: dict[str, Any] = {}
+        if server.timeout_seconds is not None:
+            kwargs["timeout"] = httpx.Timeout(server.timeout_seconds)
+        try:
+            return await self._http_client.send(request, stream=stream, **kwargs)
+        except httpx.HTTPError as exc:
+            ctx.status = "error"
+            ctx.error_message = f"mcp upstream unreachable: {exc}"
+            raise ProviderError(
+                502,
+                f"MCP server '{server.name}' is unreachable: {exc}",
+                "api_error",
+            ) from exc
+
+    async def _mcp_delete_upstream(
+        self, server: MCPServerConfig, session: MCPSession
+    ) -> int:
+        """The transport's upstream session termination (best-effort
+        from the sweep; relayed from DELETE). 405 is a legitimate
+        answer (the spec lets servers refuse termination) — the caller
+        relays it."""
+        request = self._http_client.build_request(
+            "DELETE", server.url, headers=upstream_headers(server, session)
+        )
+        try:
+            response = await self._http_client.send(request)
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                502,
+                f"MCP server '{server.name}' is unreachable: {exc}",
+                "api_error",
+            ) from exc
+        return response.status_code
+
+    async def _mcp_account(
+        self,
+        ctx: RequestContext,
+        span: trace.Span,
+        kind: str | None,
+        method_label: str | None,
+    ) -> None:
+        """The MCP surface's one teardown — metric, row, slot, gauge,
+        span — run exactly once per message (the SSE relay finishes its
+        own; every inline path and the exception path run it in
+        handle_mcp's finally). Outcome vocabulary: success / error /
+        blocked / relayed (notifications and client responses — a 202
+        exchange has no result to succeed at)."""
+        outcome = "success"
+        if ctx.status == "blocked":
+            outcome = "blocked"
+        elif kind in ("notification", "response") and ctx.status == "success":
+            outcome = "relayed"
+        elif ctx.status == "error" or (ctx.status == "success" and ctx.error_message):
+            outcome = "error"
+        metrics.MCP_REQUESTS.labels(
+            server=ctx.model, method=method_label or "unknown", outcome=outcome
+        ).inc()
+        if ctx.status == "success" and ctx.error_message:
+            ctx.status = "error"
+        try:
+            try:
+                await self._log(ctx, "mcp request completed")
+            except Exception:  # noqa: BLE001
+                logger.exception("mcp log write failed")
+        finally:
+            self._release_slot(ctx)
+            metrics.INFLIGHT.dec()
+            if span is not None:
+                self._annotate_span(span, ctx)
+                if ctx.status in ("error", "blocked"):
+                    span.set_status(
+                        Status(StatusCode.ERROR, ctx.error_message or ctx.status)
+                    )
+                else:
+                    span.set_status(Status(StatusCode.OK))
+                span.end()
+
+    async def _mcp_sweep_one(
+        self, session: MCPSession, mcp_config: "MCPConfig"
+    ) -> None:
+        """Post-eviction work for one TTL-expired session (the lifespan
+        sweep loop): the closed event, and a best-effort upstream DELETE
+        when the server still exists — a server removed by hot-reload
+        leaves its session to the server's own TTL."""
+        await self._emit(
+            "mcp.session.closed",
+            None,
+            server=session.server_name,
+            gateway_session_id=session.gateway_session_id,
+            reason="ttl",
+        )
+        if self._http_client is None or session.upstream_session_id is None:
+            return
+        server = mcp_config.server(session.server_name)
+        if server is None:
+            return
+        with suppress(Exception):
+            await self._mcp_delete_upstream(server, session)
 
     # ------------------------------------------------------------------
     # Embeddings
@@ -1972,6 +2867,30 @@ class GatewayPipeline:
             name = extra.get("name")
             names.append(str(name) if name else "<unnamed>")
         return names
+
+    def _tool_name_allowed(self, name: str, ctx: RequestContext) -> bool:
+        """The single-tool predicate under the tool policy (tiers 30 +
+        33): platform admins bypass; otherwise the name must match the
+        key's ``allowed_tools`` patterns AND the tenant's pooled
+        patterns (either None = that layer sets no restriction; a
+        tenant can only narrow). Shared by the chat surface — which
+        checks a request's DECLARED tools in one batch, with the
+        two-layer error reporting preserved in ``_check_tool_policy`` —
+        and the MCP proxy, which needs a per-name verdict: tools/list
+        filters the catalog to the names this key could actually call,
+        tools/call admits or denies one name at a time."""
+        import fnmatch
+
+        if ctx.auth.is_admin:
+            return True
+        patterns = ctx.auth.allowed_tools
+        if patterns and not any(fnmatch.fnmatch(name, p) for p in patterns):
+            return False
+        tenant_patterns = ctx.auth.tenant_allowed_tools
+        if ctx.auth.tenant_id is not None and tenant_patterns:
+            if not any(fnmatch.fnmatch(name, p) for p in tenant_patterns):
+                return False
+        return True
 
     def _check_tool_policy(
         self, ctx: RequestContext, request: "ChatCompletionRequest"

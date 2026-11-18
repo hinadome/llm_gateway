@@ -166,6 +166,7 @@ async def create_key(
             is_admin=body.is_admin,
             allowed_models=body.allowed_models,
             allowed_tools=body.allowed_tools,
+            allowed_mcp_servers=body.allowed_mcp_servers,
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
             max_concurrency=body.max_concurrency,
@@ -268,6 +269,7 @@ async def update_key(
         for field in (
             "allowed_models",
             "allowed_tools",
+            "allowed_mcp_servers",
             "rpm_limit",
             "tpm_limit",
             "max_concurrency",
@@ -356,6 +358,7 @@ async def create_tenant(
             is_active=body.is_active,
             allowed_models=body.allowed_models,
             allowed_tools=body.allowed_tools,
+            allowed_mcp_servers=body.allowed_mcp_servers,
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
             pricing_markup_pct=body.pricing_markup_pct,
@@ -428,6 +431,7 @@ async def update_tenant(
             "is_active",
             "allowed_models",
             "allowed_tools",
+            "allowed_mcp_servers",
             "rpm_limit",
             "tpm_limit",
             "pricing_markup_pct",
@@ -1692,6 +1696,35 @@ async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depe
                 ],
             }
             for model in config.models
+        ],
+    }
+
+
+@router.get("/admin/mcp")
+async def mcp_status(
+    raw_request: Request, admin: Annotated[AuthContext, Depends(require_platform_admin)]
+) -> dict:
+    """The MCP proxy at a glance (the same introspection role as
+    /admin/routing): the config surface (enabled, TTL) and each
+    configured server — url, timeout, the NAMES of its auth headers
+    (never the values — they are secrets, possibly env-resolved) and
+    how many gateway sessions are currently open against it."""
+    config = raw_request.app.state.config.mcp
+    registry = raw_request.app.state.mcp_registry
+    counts = registry.live_counts()
+    return {
+        "object": "mcp_status",
+        "enabled": config.enabled,
+        "session_ttl_seconds": config.session_ttl_seconds,
+        "servers": [
+            {
+                "name": server.name,
+                "url": server.url,
+                "timeout_seconds": server.timeout_seconds,
+                "header_names": sorted({**server.headers, **server.headers_env}),
+                "open_sessions": counts.get(server.name, 0),
+            }
+            for server in config.servers
         ],
     }
 

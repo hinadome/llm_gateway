@@ -343,6 +343,9 @@
       <label class="fld" title="Tool-call policy: fnmatch patterns over the tool names this key may declare in a request (every surface — OpenAI chat, Responses, native Anthropic/Gemini). A declared tool outside the patterns 400s tool_not_allowed; empty = all tools. Intersected with the tenant's tool policy — the tenant can only narrow.">Allowed tools (comma-separated fnmatch patterns; empty = all)
         <input id="k-tools" placeholder="search_*, get_weather" autocomplete="off">
       </label>
+      <label class="fld" title="MCP proxy (POST /v1/mcp/{server}): fnmatch patterns over the MCP server names this key may reach. Empty = all configured servers. Intersected with the tenant's allowed_mcp_servers — the tenant can only narrow.">Allowed MCP servers (comma-separated fnmatch patterns; empty = all)
+        <input id="k-mcp-servers" placeholder="weather*, internal-*" autocomplete="off">
+      </label>
       <label class="fld" title="Guardrails skipped for requests from this key — a runtime override of the config scope">
         Disabled guardrails (comma-separated names; empty = none)
         <input id="k-guardrails" placeholder="prompt_injection, pii_redaction" autocomplete="off">
@@ -368,7 +371,7 @@
         <input id="k-prompt-vars" placeholder="company=Acme, tone=formal" autocomplete="off">
       </label>
       <label class="fld" title="Data-plane scopes this key may call. 'chat' covers OpenAI chat, the Responses API and the native Anthropic/Gemini formats; empty = all scopes">
-        Allowed endpoints (comma-separated: chat, embeddings, images, audio, models, batch, realtime; empty = all)
+        Allowed endpoints (comma-separated: chat, embeddings, images, audio, models, batch, realtime, mcp; empty = all)
         <input id="k-endpoints" placeholder="chat, models" autocomplete="off">
       </label>
       <label class="fld" title="Source addresses calls must come from — plain IPs or CIDR blocks (10.0.0.0/8); empty = any">
@@ -754,6 +757,9 @@ async function loadKeys() {
     const toolLock = (k.allowed_tools || []).length
       ? ` <span class="b b-teal" title="Tool policy: only tools matching ${(k.allowed_tools || []).map(esc).join(", ")} may be declared (intersected with the tenant's policy)">🛠 ${(k.allowed_tools || []).map(esc).join(",")}</span>`
       : "";
+    const mcpLock = (k.allowed_mcp_servers || []).length
+      ? ` <span class="b b-purple" title="MCP proxy: only the servers matching ${(k.allowed_mcp_servers || []).map(esc).join(", ")} are reachable via /v1/mcp (intersected with the tenant's policy)">🔌 ${(k.allowed_mcp_servers || []).map(esc).join(",")}</span>`
+      : "";
     const promptBits = [];
     if (k.system_prompt_ref) promptBits.push("library prompt '" + k.system_prompt_ref + "'");
     if (k.system_prompt) promptBits.push("inline system prompt");
@@ -778,7 +784,7 @@ async function loadKeys() {
       <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
-      <td>${models}${grOff}${scoped}${ipLock}${toolLock}${promptPolicy}${concBadge}${resBadge}</td>
+      <td>${models}${grOff}${scoped}${ipLock}${toolLock}${mcpLock}${promptPolicy}${concBadge}${resBadge}</td>
       <td class="num">${k.rpm_limit == null ? "—" : fmtInt(k.rpm_limit)} / ${k.tpm_limit == null ? "—" : fmtInt(k.tpm_limit)}</td>
       <td>${budgetCell}</td>
       <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
@@ -825,6 +831,7 @@ function openKeyDialog(k) {
   $("#k-admin").disabled = !!k; // admin rights are set at creation only
   $("#k-models").value = k && k.allowed_models ? k.allowed_models.join(", ") : "";
   $("#k-tools").value = k && k.allowed_tools ? k.allowed_tools.join(", ") : "";
+  $("#k-mcp-servers").value = k && k.allowed_mcp_servers ? k.allowed_mcp_servers.join(", ") : "";
   $("#k-guardrails").value = k && k.disabled_guardrails ? k.disabled_guardrails.join(", ") : "";
   $("#k-mappings").value = k && k.model_mappings
     ? Object.entries(k.model_mappings).map(([a, b]) => a + "=" + b).join(", ") : "";
@@ -879,6 +886,8 @@ async function submitKeyDialog() {
       ? $("#k-models").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     allowed_tools: $("#k-tools").value.trim()
       ? $("#k-tools").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    allowed_mcp_servers: $("#k-mcp-servers").value.trim()
+      ? $("#k-mcp-servers").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     disabled_guardrails: $("#k-guardrails").value.trim()
       ? $("#k-guardrails").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     model_mappings: Object.keys(mappings).length ? mappings : null,
@@ -913,6 +922,7 @@ async function submitKeyDialog() {
     } else {
       if (body.allowed_models == null) delete body.allowed_models;
       if (body.allowed_tools == null) delete body.allowed_tools;
+      if (body.allowed_mcp_servers == null) delete body.allowed_mcp_servers;
       if (body.disabled_guardrails == null) delete body.disabled_guardrails;
       if (body.model_mappings == null) delete body.model_mappings;
       if (body.default_model == null) delete body.default_model;

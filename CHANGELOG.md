@@ -8,6 +8,84 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- MCP proxy — `POST /v1/mcp/{server}` (plus `DELETE` for session
+  termination, `GET` answered 405), the sixth inbound surface and the
+  first whose payload is not for the gateway's models at all: a
+  transparent Model Context Protocol proxy speaking the Streamable
+  HTTP transport (spec 2025-06-18) between MCP clients and
+  operator-configured MCP servers (`mcp:` in config.yaml — servers
+  with url + auth headers, literal or env-resolved, and a session
+  TTL), with the gateway in the middle applying its keys, its policy
+  and its logs while the servers never know. Wire contract: one
+  JSON-RPC message per POST (arrays answer -32600 — the transport
+  removed batching; non-JSON -32700; both as transport 400s in the
+  JSON-RPC envelope so client SDKs parse the rejection), initialize
+  creates a session, notifications and client answers to
+  server-initiated requests relay upstream and answer 202, everything
+  else requires the Mcp-Session-Id header (400 -32000 missing, 404
+  -32003 unknown/expired). The gateway issues its OWN session ids
+  (gw_-prefixed) mapped to the upstream session + the negotiated
+  protocol version, stamping both on every post-initialize upstream
+  call — a client session id is useless upstream, and the registry is
+  the gateway's own state (app.state, survives hot-reloads; DELETE
+  drops the local mapping first — idempotent for the client — then
+  relays the upstream DELETE, 405 allowed; an upstream 404 evicts
+  lazily so the next message fails at the gateway and the client
+  re-initializes, per the transport spec; a lifespan loop sweeps
+  idle sessions after mcp.session_ttl_seconds, closing them upstream
+  best-effort). The caller's gateway credential NEVER travels
+  upstream — upstream auth is the operator's configured headers, and
+  `GET /admin/mcp` (platform admin) introspects each server showing
+  the auth-header NAMES only, never the values. Policy spine, per
+  name (the tier-30 tool policy): tools/list is filtered to the
+  names this key could actually call (a restricted key never learns
+  the catalog it is denied), tools/call is admitted one name at a
+  time, and a denial is an IN-BAND JSON-RPC error — HTTP 200, -32001
+  — so the calling agent sees which tool and why (a transport 4xx
+  would hide it from its JSON-RPC layer); nothing upstream ever sees
+  a denied call, and a nameless call under a tool policy fails
+  closed. Guardrails over the tool traffic: on tools/call the request
+  phase runs over the serialized arguments (a synthetic chat request)
+  and the response phase over each text item of the result — BLOCK is
+  the same in-band error (-32002), MODIFY is applied only while the
+  rewritten arguments stay a valid JSON object (else fail closed
+  rather than corrupt the call), and a model-redirect verdict fails
+  closed (no model exists to redirect on this surface). Server
+  allowlists follow the model-permission mechanics: allowed_mcp_
+  servers (fnmatch, key layer with platform-admin bypass ∩ tenant
+  layer with none — the tenant can only narrow), the 'mcp' endpoint
+  scope (chat/embeddings/images/audio/models/realtime vocabulary
+  extended; admin-UI key + tenant dialogs gain the field), and
+  unknown/not-allowed servers answer 404 exactly like missing ones.
+  Both upstream answer shapes work: application/json is intercepted
+  (filtering/rewrites applied, re-serialized) and text/event-stream
+  is relayed LIVE — progress notifications and keepalives pass
+  through verbatim (byte-identical, so client read timeouts never
+  fire), and THE response frame per exchange is intercepted,
+  re-serialized with policy applied or replaced by an in-band error
+  frame; the standalone GET stream (server-to-client outside an open
+  POST) is out of scope — GET answers 405, which the spec permits.
+  Documented error split: gateway failures (auth, scope, config,
+  rate limit, concurrency) keep the OpenAI envelope like every
+  surface; protocol-level failures (the codes above, the in-band
+  denials) use the JSON-RPC envelope; upstream HTTP failures relay
+  verbatim so the client's JSON-RPC layer sees the server's own
+  errors. Accounting: one request-log row per message (route mcp,
+  provider mcp, model = the SERVER name — the same role a model name
+  plays everywhere else, which scopes model-scoped guardrails to
+  servers here), gateway_mcp_requests_total{server,method,outcome}
+  (success/error/blocked/relayed) + the gateway_mcp_sessions{server}
+  gauge, mcp.session.opened / mcp.tool.blocked / mcp.session.closed
+  lifecycle events; NO tokens, cost, TPM or budgets — MCP servers are
+  not language models; RPM applies (the realtime precedent), token
+  economics do not, by design. mcp: hot-reloads (a removed server
+  404s the next message; live sessions stay mapped until they expire
+  or are deleted). Out of scope, documented: stdio upstreams
+  (HTTP-only transport), the standalone GET stream, and BYOK on MCP
+  upstreams (no per-tenant notion of "your" weather server). 40 new
+  tests (tests/test_mcp.py, behind a scripted JSON-RPC upstream on a
+  composite mock transport that routes mcp.test to the MCP mock and
+  everything else to the chat mock); full suite 1049 passing.
 - Realtime API — `WS /v1/realtime?model=<public-model>`, the fifth
   inbound surface and the first STATEFUL one: a long-lived
   bidirectional event session speaking the OpenAI Realtime protocol

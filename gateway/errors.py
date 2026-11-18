@@ -174,3 +174,32 @@ class ModelNotFoundError(GatewayError):
             code="model_not_found",
             param="model",
         )
+
+
+class MCPDisabledError(GatewayError):
+    """MCP proxy (tier 33) is off (``mcp.enabled: false``): the routes
+    404 like every disabled surface (batch's precedent) — existence is
+    not leaked to callers without the admin surface."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=404,
+            message="The MCP proxy is disabled (config: mcp.enabled: false).",
+            error_type="invalid_request_error",
+            code="mcp_disabled",
+        )
+
+
+class MCPServerNotAllowedError(GatewayError):
+    """MCP proxy (tier 33): the named server is either not configured
+    or outside this key's (or its tenant's) ``allowed_mcp_servers``
+    patterns. The ModelNotAllowedError shape deliberately — 404 with the
+    same wording, so server existence is not leaked."""
+
+    def __init__(self, server: str) -> None:
+        super().__init__(
+            status_code=404,
+            message=f"The MCP server '{server}' does not exist or is not available for this API key.",
+            error_type="invalid_request_error",
+            code="mcp_server_not_found",
+        )

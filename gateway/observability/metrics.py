@@ -170,6 +170,21 @@ REALTIME_SESSIONS = Gauge(
     ["provider", "model"],
 )
 
+MCP_SESSIONS = Gauge(
+    "gateway_mcp_sessions",
+    "MCP proxy sessions currently registered, by server. A session "
+    "maps a client's gateway-issued Mcp-Session-Id to the upstream "
+    "session until it is deleted or idles past the TTL.",
+    ["server"],
+)
+
+MCP_REQUESTS = Counter(
+    "gateway_mcp_requests_total",
+    "JSON-RPC requests proxied through /v1/mcp/{server}, by server, "
+    "JSON-RPC method and outcome (success / error / blocked / relayed).",
+    ["server", "method", "outcome"],
+)
+
 CIRCUIT_STATE = Gauge(
     "gateway_circuit_state",
     "Circuit breaker state per deployment (0=closed, 1=half_open, 2=open).",

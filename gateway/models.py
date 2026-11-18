@@ -63,6 +63,11 @@ class VirtualKey(Base):
     # tool names this key may declare. None = all tools. A declared tool
     # must pass both this and the tenant's patterns — tenant only narrows.
     allowed_tools: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    # MCP proxy (tier 33): fnmatch patterns over the MCP SERVER names
+    # this key may reach through /v1/mcp/{server}. None = all configured
+    # servers. A server must pass both this and the tenant's patterns —
+    # the tenant only narrows (same mechanics as allowed_models).
+    allowed_mcp_servers: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Concurrency admission (tier 27): max simultaneous UPSTREAM
@@ -145,6 +150,7 @@ class VirtualKey(Base):
             "tenant_id": self.tenant_id,
             "allowed_models": self.allowed_models,
             "allowed_tools": self.allowed_tools,
+            "allowed_mcp_servers": self.allowed_mcp_servers,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "max_concurrency": self.max_concurrency,
@@ -206,6 +212,10 @@ class Tenant(Base):
     # None = the tenant sets no tool policy; a tool must pass both the
     # key's and these patterns.
     allowed_tools: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    # Pooled MCP server policy: fnmatch patterns over server names
+    # binding every member key (None = the tenant sets none). A server
+    # must pass both the key's and these patterns.
+    allowed_mcp_servers: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Cost-plus billing: percent markup on the provider cost of every
@@ -253,6 +263,7 @@ class Tenant(Base):
             "is_active": self.is_active,
             "allowed_models": self.allowed_models,
             "allowed_tools": self.allowed_tools,
+            "allowed_mcp_servers": self.allowed_mcp_servers,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "pricing_markup_pct": self.pricing_markup_pct,

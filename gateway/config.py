@@ -834,6 +834,59 @@ class AuthConfig(BaseModel):
     jwt: JWTAuthConfig = Field(default_factory=JWTAuthConfig)
 
 
+class MCPServerConfig(BaseModel):
+    """One proxied MCP server (streamable HTTP upstream).
+
+    The gateway is the client toward this URL: every client POST is
+    relayed with the headers below — and *only* those plus the protocol
+    headers (the client's gateway credential never travels upstream;
+    the upstream's auth is the operator's concern, configured here).
+
+    ``headers`` are literal values (dev/tests); ``headers_env`` names an
+    environment variable per header, resolved at call time (secrets —
+    the same literal/env split ``ProviderConfig`` uses for keys). Env
+    entries win over literals on the same name.
+    """
+
+    name: str
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    headers_env: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: float | None = None
+
+    def resolve_headers(self) -> dict[str, str]:
+        import os
+
+        resolved = {k: v for k, v in self.headers.items()}
+        for name, env in self.headers_env.items():
+            value = os.environ.get(env)
+            if value is not None:
+                resolved[name] = value
+        return resolved
+
+
+class MCPConfig(BaseModel):
+    """The MCP proxy surface (tier 33): ``POST /v1/mcp/{server}`` speaking
+    the MCP Streamable HTTP transport, proxying to the configured
+    servers. ``enabled: false`` 404s the routes (like ``batch.enabled``).
+
+    Sessions: the gateway issues its OWN ``Mcp-Session-Id`` per
+    ``initialize`` and maps it to the upstream session + the negotiated
+    protocol version; idle sessions are swept after
+    ``session_ttl_seconds`` (a client that comes back re-initializes,
+    per the transport spec)."""
+
+    enabled: bool = False
+    session_ttl_seconds: float = 3600.0
+    servers: list[MCPServerConfig] = Field(default_factory=list)
+
+    def server(self, name: str) -> MCPServerConfig | None:
+        for server in self.servers:
+            if server.name == name:
+                return server
+        return None
+
+
 class GatewayConfig(BaseModel):
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     models: list[ModelConfig] = Field(default_factory=list)
@@ -871,6 +924,7 @@ class GatewayConfig(BaseModel):
     runaway: RunawayConfig = Field(default_factory=RunawayConfig)
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @classmethod

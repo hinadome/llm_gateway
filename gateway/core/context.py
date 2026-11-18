@@ -32,6 +32,10 @@ class AuthContext:
     # a tool must pass BOTH the key's and the tenant's patterns, so the
     # tenant can only narrow). None = the tenant sets no tool policy.
     tenant_allowed_tools: list[str] | None = None
+    # Pooled MCP server policy (tier 33): fnmatch patterns over the MCP
+    # server names member keys may reach (/v1/mcp/{server}). None = the
+    # tenant sets none; a server must pass BOTH lists — tenant narrows.
+    tenant_allowed_mcp_servers: list[str] | None = None
     tenant_rpm_limit: int | None = None
     tenant_tpm_limit: int | None = None
     tenant_max_budget_usd: float | None = None
@@ -60,6 +64,10 @@ class AuthContext:
     # declaring a tool that matches neither the key's nor the tenant's
     # patterns 400s tool_not_allowed. Admin/env keys exempt.
     allowed_tools: list[str] | None = None
+    # MCP proxy (tier 33): fnmatch patterns over the MCP server names
+    # this key may reach through /v1/mcp/{server}. None = all configured
+    # servers; a server must pass both this and the tenant's patterns.
+    allowed_mcp_servers: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
     # Concurrency admission (tier 27): max simultaneous UPSTREAM

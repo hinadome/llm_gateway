@@ -25,7 +25,7 @@ logger = logging.getLogger("gateway.auth")
 # separately like batch — a key may chat without holding live sessions,
 # and sessions consume concurrency slots for their whole life.
 ENDPOINT_SCOPES = frozenset(
-    {"chat", "embeddings", "images", "audio", "models", "batch", "realtime"}
+    {"chat", "embeddings", "images", "audio", "models", "batch", "realtime", "mcp"}
 )
 
 
@@ -49,6 +49,11 @@ def required_scope(path: str) -> str | None:
     # without being allowed to hold live sessions).
     if path == "/v1/realtime":
         return "realtime"
+    # The MCP proxy surface: its own scope for the same reason — a key
+    # that may chat or declare tools is not automatically allowed to
+    # drive MCP servers (which hold upstream sessions of their own).
+    if path == "/v1/mcp" or path.startswith("/v1/mcp/"):
+        return "mcp"
     # Feedback is commentary on chat traffic — the chat scope covers it
     # (a key that may rate is a key that may chat).
     if path == "/v1/feedback":
