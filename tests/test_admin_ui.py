@@ -363,6 +363,24 @@ async def test_admin_ui_forecast_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_forecast_alerts_surface(env):
+    # Tier 48: the forecast panel shows what on-call was paged for —
+    # the "paged" badge (fire-once state from the evaluator's
+    # settings row) beside the verdict, with the condition and the
+    # since-timestamp in the tooltip — and the visible say-so when
+    # budget alert delivery is off. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        "fcAlertBadge",
+        "on-call was paged",
+        ">paged</span>",
+        "budget alerts off",
+        "f.alerts.enabled",
+        "section.alert",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

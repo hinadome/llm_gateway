@@ -35,6 +35,7 @@ from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
 from ..core import billing as billing_core
 from ..core import finops as finops_core
+from ..core import forecast_alerts as forecast_alerts_core
 from ..core import forecasts as forecasts_core
 from ..core import migration as migration_core
 from ..core import promotion as promotion_core
@@ -1891,10 +1892,17 @@ async def spend_forecast(
     day-one noise themselves). No budget set → projected pct and
     verdict null, never a fake zero.
 
-    Read at request time — no loop, no state, no config. Tenant
-    admins see their own tenant only (the scope is forced, even
-    when they ask for another); platform admins may filter
-    ``?tenant_id=`` or read the whole platform.
+    The forecast itself is read at request time — no loop, no
+    config; the state on this surface is tier 48's delivery state,
+    not the math's. Tenant admins see their own tenant only (the
+    scope is forced, even when they ask for another); platform
+    admins may filter ``?tenant_id=`` or read the whole platform.
+
+    Tier 48 attaches each section's persisted budget-alert state
+    (``alert``: firing, condition, since — what on-call was already
+    paged for, from the same settings row the evaluator wrote;
+    ``null`` when never fired or recovered) and echoes the
+    ``forecast_alerts:`` delivery config.
     """
     effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
     sessionmaker = get_sessionmaker()
@@ -1902,8 +1910,30 @@ async def spend_forecast(
         data = await forecasts_core.forecast(
             session, month, tenant_id=effective_tenant
         )
+        state = await forecast_alerts_core.alert_state(session)
+    # The alert state rides every section it belongs to: each tenant
+    # (the pooled budget) and every key (its own), matched by month —
+    # last month's pages never surface on this month's statement.
+    for section in [*data["tenants"], *data["unassigned"]]:
+        if section["tenant_id"] is not None:
+            section["alert"] = state.get(
+                forecast_alerts_core.entity_name(
+                    data["month"], "tenant", section["tenant_id"]
+                )
+            )
+        for key in section["keys"]:
+            key["alert"] = (
+                state.get(
+                    forecast_alerts_core.entity_name(
+                        data["month"], "key", key["key_id"]
+                    )
+                )
+                if key["key_id"] is not None
+                else None
+            )
     return {
         "object": "forecast",
+        "alerts": raw_request.app.state.config.forecast_alerts.model_dump(),
         **data,
     }
 

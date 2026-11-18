@@ -60,7 +60,7 @@ INVOICE_CSV_COLUMNS = (
 )
 
 
-def parse_month(value: str | None) -> tuple[str, datetime, datetime]:
+def parse_month(value: str | None, now: datetime | None = None) -> tuple[str, datetime, datetime]:
     """Pure: an invoice month to its (month, since, until) bounds.
 
     ``None`` means the current UTC month. Calendar months in UTC —
@@ -68,10 +68,12 @@ def parse_month(value: str | None) -> tuple[str, datetime, datetime]:
     fancier (day-of-month anchors, timezones) is a later tier, not a
     hidden surprise. A malformed month or one in the future is a 400:
     an invoice for a period that has not happened must not pretend to
-    be empty.
+    be empty. ``now`` pins the clock both resolve against (the
+    forecast evaluator's tests pass their own; every production
+    caller leaves it at the real time).
     """
+    now = now or datetime.now(timezone.utc)
     if value is None:
-        now = datetime.now(timezone.utc)
         month = f"{now.year:04d}-{now.month:02d}"
     else:
         month = value
@@ -91,7 +93,6 @@ def parse_month(value: str | None) -> tuple[str, datetime, datetime]:
                 "invalid_request_error",
                 param="month",
             )
-        now = datetime.now(timezone.utc)
         if (year, mon) > (now.year, now.month):
             raise GatewayError(
                 400,

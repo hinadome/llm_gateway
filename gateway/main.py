@@ -52,6 +52,7 @@ from .core.canary import CanaryProber
 from .core.idempotency import IdempotencyStore
 from .core.pii_scan import PIIScanner
 from .core.slo_alerts import SLOAlertEvaluator
+from .core.forecast_alerts import ForecastAlertEvaluator
 from .core.cache import ResponseCache
 from .core.events import EventBus
 from .core.cost import CostCalculator
@@ -401,6 +402,14 @@ def create_app(
     slo_alert_evaluator = SLOAlertEvaluator(
         client=alert_http_client, events=events_bus
     )
+    # Budget forecast alert evaluator (tier 48): the tier-47
+    # projections turned into fire-once/re-arm transitions. Same
+    # discipline — shares the alert HTTP client (alert POSTs are not
+    # request traffic), tests drive evaluate_once() directly, and the
+    # lifespan loop below is the only scheduled driver.
+    forecast_alert_evaluator = ForecastAlertEvaluator(
+        client=alert_http_client, events=events_bus
+    )
     # PII/secret scanner: pure computation over stored log bodies —
     # rebuilt on config swap (detectors depend on pii_scan settings).
     pii_scanner = PIIScanner(config.pii_scan)
@@ -516,6 +525,34 @@ def create_app(
 
         slo_alert_task = asyncio.create_task(_slo_alert_loop())
 
+        # Budget forecast alert evaluation (tier 48): one forecast
+        # pass per interval — the tier-47 month-end projections turned
+        # into the two transitions (fire when a key or tenant trends
+        # at_risk or over its budget, recover when the projection is
+        # provably back within plan; the early month holds — hours of
+        # evidence never page). Always started (not gated on
+        # alerts.enabled) so hot-enabling takes effect from the next
+        # pass; re-reads app.state.config.forecast_alerts each
+        # iteration. Under pytest (ASGITransport skips the lifespan)
+        # this loop never starts — tests drive evaluate_once()
+        # directly.
+        async def _forecast_alert_loop() -> None:
+            while True:
+                current = app.state.config.forecast_alerts
+                if current.enabled:
+                    try:
+                        async with get_sessionmaker()() as session:
+                            await forecast_alert_evaluator.evaluate_once(
+                                session, app.state.config
+                            )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("forecast alert evaluation failed")
+                await asyncio.sleep(
+                    current.evaluation_interval_seconds if current.enabled else 30.0
+                )
+
+        forecast_alert_task = asyncio.create_task(_forecast_alert_loop())
+
         # MCP session TTL: evict gateway-issued sessions idle past
         # mcp.session_ttl_seconds. The registry is the gateway's OWN
         # state (survives hot-reloads — a client mid-conversation is
@@ -593,6 +630,7 @@ def create_app(
             batch_task.cancel()
         canary_task.cancel()
         slo_alert_task.cancel()
+        forecast_alert_task.cancel()
         mcp_sweep_task.cancel()
         if vault_invalidation_task is not None:
             vault_invalidation_task.cancel()
@@ -609,6 +647,7 @@ def create_app(
         await client.aclose()
         await alerts.aclose()
         await slo_alert_evaluator.aclose()
+        await forecast_alert_evaluator.aclose()
         await audit.aclose()
         # Authenticators that own resources (JWKS HTTP client).
         for step in app.state.auth_chain.steps:
@@ -661,6 +700,9 @@ def create_app(
     app.state.canary = canary_prober
     # SLO alert evaluator (admin-plane; tests drive evaluate_once()).
     app.state.slo_alerts = slo_alert_evaluator
+    # Budget forecast alert evaluator (admin-plane; tests drive
+    # evaluate_once(), optionally pinning the pass's clock).
+    app.state.forecast_alerts = forecast_alert_evaluator
     # PII/secret scanner (admin-plane GETs; rebuilt on config swap).
     app.state.pii_scanner = pii_scanner
     # Prompt library (admin-plane CRUD routes live in api/admin.py).

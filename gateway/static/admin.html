@@ -1948,20 +1948,33 @@ function fcTrendCell(section) {
   return `<span class="b ${section.trend_ratio >= 1 ? "b-amber" : "b-green"}" title="${esc(tip)}">${section.trend_ratio}x</span>`;
 }
 
+function fcAlertBadge(section) {
+  // Tier 48: the persisted fire-once alert state — what on-call was
+  // already paged for, from the same settings row the evaluator
+  // wrote. Shown only while firing; a recovery (or a new month)
+  // clears it, and the verdict badge beside it still tells the
+  // money story.
+  if (!section.alert || !section.alert.firing)
+    return "";
+  const tip = `on-call was paged: ${esc(section.alert.condition.replace(/_/g, " "))} since ${esc(section.alert.since)}`;
+  return `<span class="b b-red" title="${tip}">paged</span> `;
+}
+
 function fcVerdictCell(section) {
   if (section.verdict == null)
     return '<span class="b b-gray" title="no monthly budget set — nothing to compare against">—</span>';
   const tip = `projected ${Math.round(section.projected_pct_of_budget)}% of ${fmtUsd(section.monthly_budget_usd)} by month end — the ${section.verdict_based_on} projection`;
-  return `<span class="b ${FC_VERDICT[section.verdict]}" title="${esc(tip)}">${Math.round(section.projected_pct_of_budget)}% ${esc(section.verdict.replace(/_/g, " "))}</span>`;
+  return `${fcAlertBadge(section)}<span class="b ${FC_VERDICT[section.verdict]}" title="${esc(tip)}">${Math.round(section.projected_pct_of_budget)}% ${esc(section.verdict.replace(/_/g, " "))}</span>`;
 }
 
 async function loadForecasts() {
   const month = state.invMonth || new Date().toISOString().slice(0, 7);
   const f = await api("/admin/forecasts?month=" + encodeURIComponent(month));
   const t = f.totals;
-  $("#forecast-period").textContent = f.month_complete
+  $("#forecast-period").textContent = (f.month_complete
     ? `${month} is complete — these are the actuals, not a projection`
-    : `${f.elapsed_days.toFixed(1)} of ${f.days_in_month} days elapsed · ${f.remaining_days.toFixed(1)} remaining`;
+    : `${f.elapsed_days.toFixed(1)} of ${f.days_in_month} days elapsed · ${f.remaining_days.toFixed(1)} remaining`)
+    + (f.alerts && f.alerts.enabled === false ? " · budget alerts off" : "");
   const projected = t.recent_pace.daily_usd != null
     ? t.recent_pace.projected_month_usd
     : t.run_rate.projected_month_usd;

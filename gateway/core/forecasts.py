@@ -397,12 +397,12 @@ async def forecast(
 ) -> dict[str, Any]:
     """The composed surface: the month's bounds and clock context
     beside the forecast statement. ``month`` is the invoice's own
-    parameter (``None`` = the current UTC month; malformed or future
-    months raise the invoice's 400s). A complete month skips the
-    recent-pace query entirely — the pace of a finished month
+    parameter (``None`` = the current UTC month — of ``now``; malformed
+    or future months raise the invoice's 400s). A complete month skips
+    the recent-pace query entirely — the pace of a finished month
     projects nothing, and asking for it would imply otherwise."""
-    month, since, until = parse_month(month)
     now = now or datetime.now(timezone.utc)
+    month, since, until = parse_month(month, now=now)
     month_complete = now >= until
     days_in_month = float((until - since).days)
     # The clock context: how much month has elapsed (a fraction — the

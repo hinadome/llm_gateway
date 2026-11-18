@@ -8,6 +8,50 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Budget forecast alerts (tier 48) — the tier-47 projections get
+  teeth. A forecast nobody reads is a spreadsheet, so a background
+  evaluator (the canary-loop shape: always started, re-reading
+  `forecast_alerts:` each pass; one pass = the same `forecast()` the
+  admin endpoint serves, so an alert is decided by exactly the
+  numbers the dashboard shows) turns the month-end projections into
+  the two transitions on-call consumes:
+  - **`forecast.alert`** when a budgeted entity starts trending badly —
+    the recent projection puts it over its `monthly_budget_usd`
+    (`trending_over`) or at risk ≥80% (`trending_at_risk`). Both levels
+    alert: a key against its own budget, a tenant against the pooled
+    one. Paging on where the month is *going* — actual spend crossings
+    stay the tier-2 threshold alerts' job.
+  - **`forecast.recovered`** when the projection is provably back within
+    plan — often because the operator raised the budget: an honest fix
+    recovers honestly, with the healed numbers in the payload.
+
+  Fire-once / re-arm per **(month, entity)**, persisted on the settings
+  KV table (`{month}|{kind}:{id}` — a restart never re-pages, and a
+  new month is a new plan: December trends get paged even if
+  November already paged); recovery is what re-arms within a month.
+  The honesty rules: **`min_elapsed_days`** (default 2) gates the
+  early month — a day-one straight-line extrapolation is hours of
+  evidence dressed as a trend and never reaches a webhook — and **no
+  budget means no bar**: sections without one never fire, and a
+  budget removed while firing drops the state silently (nothing to
+  recover to; a re-added budget starts cold). Delivery is best-effort
+  (bounded retries, `gateway_alerts_total{kind="forecast",
+  outcome=sent|failed|skipped}`); without a webhook URL the POST is a
+  skipped no-op while the observer events still fire;
+  `forecast_alerts.enabled: false` is the kill switch — no state, no
+  events — while the forecast keeps serving.
+
+  `GET /admin/forecasts` now attaches each section's persisted alert
+  state (`alert`: firing, condition, since — what on-call was already
+  paged for, `null` when never fired or recovered) and echoes the
+  `forecast_alerts:` delivery config. The dashboard's forecast panel
+  shows a red "paged" badge beside the verdict while firing (condition
+  + since in the tooltip) and a "budget alerts off" say-so in the
+  period line when delivery is disabled. `parse_month` gained an
+  optional clock pin so the evaluator's tests (and any future
+  caller) can fix the month under evaluation; production callers are
+  unchanged. 11 tests + a UI pin in `tests/test_forecast_alerts.py`
+  / `tests/test_admin_ui.py`; the suite stands at 1241.
 - Spend forecasts (tier 47) — the invoice's forward-looking sibling:
   where will this month land? `GET /admin/forecasts` (`month=YYYY-MM`,
   the invoice's own month contract) projects the final bill per key and

@@ -804,6 +804,48 @@ class FinopsConfig(BaseModel):
     min_baseline_requests: int = Field(default=10, ge=1)
 
 
+class ForecastAlertsConfig(BaseModel):
+    """Budget forecast alert delivery (tier 48): webhook + events when
+    a key's or tenant's month-end PROJECTION (tier 47) trends at_risk
+    or over its ``monthly_budget_usd`` — paging on where the month is
+    going, before the money is spent (actual spend crossings are the
+    tier-2 threshold alerts' job). One pass = the same ``forecast()``
+    the admin endpoint serves, so an alert is decided by exactly the
+    numbers the dashboard shows. Fire-once / re-arm per (month,
+    entity), persisted on the settings KV table so restarts never
+    re-page; recovery fires when the projection is provably back
+    within plan (often because the operator raised the budget — an
+    honest fix recovers honestly). ``min_elapsed_days`` is the
+    early-month honesty gate: before it, a day-one straight-line
+    extrapolation is hours of evidence dressed as a trend and never
+    reaches a webhook. Delivery is best-effort with bounded retries;
+    without a ``webhook_url`` (or ``url_env``) the webhook is a no-op
+    that still counts as ``skipped`` on ``gateway_alerts_total
+    {kind="forecast"}`` — the ``forecast.alert`` / ``forecast.recovered``
+    observer events fire either way. ``enabled: false`` turns the
+    whole evaluator off (no state writes, no events, no webhooks)
+    while the forecast keeps serving at ``GET /admin/forecasts``
+    (with each section's persisted alert state and this config
+    echoed)."""
+
+    enabled: bool = True
+    webhook_url: str | None = None
+    url_env: str | None = None  # env var that overrides webhook_url when set
+    timeout_seconds: float = 5.0
+    max_attempts: int = 2  # 1 retry, 0.5s backoff (budget-alert pacing)
+    # The early-month gate (default: the forecast's trend threshold —
+    # under two days of month there is no honest trend to page on).
+    min_elapsed_days: float = Field(default=2.0, ge=0)
+    # The evaluator's pace. Money trends move slower than SLO windows;
+    # one pass = one full-platform forecast.
+    evaluation_interval_seconds: float = Field(default=300.0, gt=0)
+
+    def resolve_url(self) -> str | None:
+        if self.url_env and os.environ.get(self.url_env):
+            return os.environ[self.url_env]
+        return self.webhook_url
+
+
 class PIIScanConfig(BaseModel):
     """PII/secret scan over *stored* request/response bodies — the
     audit that answers "did secrets or PII land in the request log?".
@@ -1200,6 +1242,7 @@ class GatewayConfig(BaseModel):
     canary: CanaryConfig = Field(default_factory=CanaryConfig)
     slos: SLOsConfig = Field(default_factory=SLOsConfig)
     finops: FinopsConfig = Field(default_factory=FinopsConfig)
+    forecast_alerts: ForecastAlertsConfig = Field(default_factory=ForecastAlertsConfig)
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)

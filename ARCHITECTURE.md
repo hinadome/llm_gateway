@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 89 Python files, ~32,900 lines, 1229 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 90 Python files, ~33,400 lines, 1241 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -620,6 +620,17 @@ gateway/
 │                           the response itself; require_admin
 │                           with the invoice's tenant scoping;
 │                           the math lives in core/forecasts.py),
+│                           spend forecast alert delivery (tier 48,
+│                           riding the same envelope: every
+│                           section carries its persisted alert
+│                           state — firing/condition/since, what
+│                           on-call was already paged for, from
+│                           the same settings row the evaluator
+│                           wrote, null when never fired or
+│                           recovered — and the forecast_alerts
+│                           delivery config echoes beside it; the
+│                           evaluator itself lives in core/
+│                           forecast_alerts.py),
 │                           routing/guardrail introspection
 │                           (/admin/routing echoes each model's
 │                           context_window, the cost_aware flag and
@@ -1425,6 +1436,54 @@ gateway/
 │   │                       window is a module constant and
 │   │                       parse_month the invoice's own contract
 │   │                       (same months, same 400s)
+│   ├── forecast_alerts.py  Budget forecast alert delivery (tier 48):
+│   │                       the tier-47 projections get teeth.
+│   │                       alert_condition is the pure (firing,
+│   │                       condition) machine over one forecast
+│   │                       section — the verdicts verbatim:
+│   │                       over_budget fires trending_over, at_risk
+│   │                       trending_at_risk, within_budget provably
+│   │                       healthy; no verdict (no budget) is NOT
+│   │                       alertable — never fires, and a firing
+│   │                       entry drops from the state when the
+│   │                       bar is removed (nothing to recover to; a
+│   │                       re-added budget starts cold). Both levels
+│   │                       alert: a key against its own
+│   │                       monthly_budget_usd, a tenant against the
+│   │                       pooled one. ForecastAlertEvaluator.
+│   │                       evaluate_once reuses forecasts.forecast()
+│   │                       so an alert is decided by exactly the
+│   │                       numbers the dashboard serves; the state
+│   │                       is a JSON map on the settings KV table
+│   │                       (forecast_alert_state: "{month}|{kind}:
+│   │                       {id}" -> firing/condition/since — the
+│   │                       month rides in the key, so a new month
+│   │                       is a new plan and everything re-arms),
+│   │                       persisted BEFORE delivery, surviving
+│   │                       restarts (single-writer: the lifespan
+│   │                       loop; tests pin evaluate_once's clock);
+│   │                       fire-once per (month, entity), re-arms on
+│   │                       genuine recovery (often the operator
+│   │                       raising the budget — an honest fix
+│   │                       recovers honestly). The honesty gate:
+│   │                       min_elapsed_days of month before
+│   │                       anything fires — a day-one straight-
+│   │                       line extrapolation is hours of evidence
+│   │                       dressed as a trend and never reaches a
+│   │                       webhook. Transitions emit forecast.alert
+│   │                       / forecast.recovered observer events and
+│   │                       POST self-sufficient payloads (entity +
+│   │                       month + condition + the projections +
+│   │                       the human message) to the
+│   │                       forecast_alerts webhook — bounded
+│   │                       retries, gateway_alerts_total{kind=
+│   │                       "forecast",outcome=sent|failed|
+│   │                       skipped}; no URL = skipped no-op while
+│   │                       events still fire; enabled=false turns
+│   │                       the evaluator off entirely while the
+│   │                       forecast keeps serving — with each
+│   │                       section's persisted alert state and the
+│   │                       delivery config echoed
 │   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
 │   │                       that answers "did secrets land in the request
 │   │                       log?"): detectors mirror the pii_redaction
@@ -2010,8 +2069,14 @@ gateway/
                             with the other a tooltip away, verdict
                             badges projected-vs-budget at the
                             80/100% thresholds ("—" when no
-                            budget), the clock context in the
-                            period line), the finops
+                            budget), a red "paged" badge beside the
+                            verdict while the tier-48 fire-once
+                            state says on-call was already paged
+                            (condition + since in the tooltip;
+                            recovery clears it), the clock context
+                            in the period line with a "budget
+                            alerts off" say-so when delivery is
+                            disabled), the finops
                             flags panel (tier 46: the invoice's
                             follow-up — is any of this unusual?
                             reads GET /admin/anomalies right after
@@ -3507,6 +3572,36 @@ tests/
 │                        replay project toward nothing). A sixth
 │                        UI pin covers the forecast panel
 │                        (tests/test_admin_ui.py)
+├── test_forecast_alerts.py  Budget forecast alert delivery (tier 48):
+│                        pure units — the (firing, condition)
+│                        machine (the verdicts verbatim; no budget
+│                        not alertable in either direction), the
+│                        self-sufficient payloads (entity + month +
+│                        condition + projections + message, the
+│                        effective projection the verdicts trust)
+│                        and the delivery outcomes (no URL = a
+│                        skipped no-op, bounded retries then
+│                        honest failure, sent); e2e with the
+│                        evaluator's clock PINNED (a mid-month now
+│                        deterministic on any real date): fires
+│                        once at both levels and the state
+│                        survives a restart, the budget-raise fix
+│                        recovers and re-arms (re-fires against the
+│                        new bar), at_risk pages trending_at_risk,
+│                        the early-month gate holds (nothing
+│                        delivered, nothing written) then fires
+│                        once the month has days, no-budget keys
+│                        never alert and a removed budget drops
+│                        the state silently (re-added starts
+│                        cold), the month roll re-arms everything
+│                        (a new month is a new plan; last month's
+│                        entries dropped), the enabled=false kill
+│                        switch (no deliveries, no events, no
+│                        state; measurement untouched) and the
+│                        endpoint carrying each section's alert
+│                        state + the config echo. A seventh UI pin
+│                        covers the paged badge + the alerts-off
+│                        say-so (tests/test_admin_ui.py)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while
