@@ -174,6 +174,14 @@ class DeploymentConfig(BaseModel):
 class ModelConfig(BaseModel):
     name: str  # public name clients use
     deployments: list[DeploymentConfig]
+    # Advertised context window (total tokens: input + output) for the
+    # public model — the number the context_window guardrail enforces
+    # pre-flight (blocked/redirected *before* upstream quota is spent).
+    # None = unmanaged. The window is a property of the model, declared
+    # once here rather than in guardrail params, so other surfaces can
+    # reuse it. Heterogeneous deployments: set the window of the one
+    # that matters (e.g. the smallest fallback a request must fit).
+    context_window: int | None = None
 
 
 class GuardrailScope(BaseModel):

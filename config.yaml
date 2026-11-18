@@ -27,6 +27,10 @@ providers:
 
 models:
   - name: gpt-4o
+    # Advertised context window (total tokens, input + output) — the
+    # number the context_window guardrail enforces pre-flight. None =
+    # unmanaged. Declare it once here, not in guardrail params.
+    context_window: 128000
     deployments:
       - name: openai/gpt-4o
         provider: openai
@@ -250,6 +254,25 @@ guardrails:
       max_chars: 200000
       on_exceed: block        # block | redirect
       redirect_model: gpt-4o-mini
+
+  # Context-window management: fits the incoming request to the model's
+  # declared window (models[].context_window — set it there, once per
+  # model) BEFORE it burns upstream quota, with OpenAI-style
+  # context_length_exceeded wording and the actual numbers. Input is
+  # estimated at ~4 chars/token (the same heuristic as TPM) including
+  # the managed system prompt; the response budget is the caller's
+  # max_tokens, else reserve_output_tokens. on_exceed: redirect sends
+  # over-window requests to a bigger model instead of blocking
+  # (redirect_model must be a configured public model the calling key
+  # may use). Models with no declared window and no default_window are
+  # unmanaged (pass through); "window:" forces a specific number.
+  - name: context_window
+    enabled: false
+    params:
+      reserve_output_tokens: 1024
+      # default_window: 128000   # for models that declare none
+      on_exceed: block           # block | redirect
+      redirect_model: gpt-4o
 
   # Production-grade PII detection via Microsoft Presidio (optional
   # 'guardrails' extra). Replaces the regex heuristics above — disable

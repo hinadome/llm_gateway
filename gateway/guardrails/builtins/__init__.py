@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .context_window import ContextWindowGuardrail
 from .keyword_blocklist import KeywordBlocklistGuardrail
 from .output_moderation import OutputModerationGuardrail
 from .pii_redaction import PIIRedactionGuardrail
@@ -26,10 +27,12 @@ BUILTIN_GUARDRAILS: dict[str, type] = {
     OutputModerationGuardrail.name: OutputModerationGuardrail,
     ResponseSchemaGuardrail.name: ResponseSchemaGuardrail,
     RequestLimitsGuardrail.name: RequestLimitsGuardrail,
+    ContextWindowGuardrail.name: ContextWindowGuardrail,
 }
 
 __all__ = [
     "BUILTIN_GUARDRAILS",
+    "ContextWindowGuardrail",
     "KeywordBlocklistGuardrail",
     "OutputModerationGuardrail",
     "PIIRedactionGuardrail",

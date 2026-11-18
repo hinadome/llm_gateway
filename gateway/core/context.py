@@ -144,6 +144,11 @@ class RequestContext:
     # later retry with different parameters under the same
     # Idempotency-Key is rejected instead of served the wrong answer.
     idempotency_fingerprint: str | None = None
+    # The resolved public model's declared context window
+    # (ModelConfig.context_window), set at step 0 and re-resolved when
+    # a guardrail redirects (4.5). Read by the context_window
+    # guardrail; None = the model is unmanaged.
+    context_window: int | None = None
     # OpenTelemetry span for this request (None when tracing is disabled)
     otel_span: "Span | None" = None
     # Trace correlation ids (hex strings; None when tracing is disabled)

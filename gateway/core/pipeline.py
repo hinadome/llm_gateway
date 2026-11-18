@@ -177,6 +177,10 @@ class GatewayPipeline:
         # Configured public model names (for alias resolution: a real name
         # always wins over an alias of the same name).
         self._model_names = {m.name for m in config.models}
+        # Declared context windows per public model (ModelConfig.
+        # context_window) — stashed on the ctx at model resolution for
+        # the context_window guardrail. Rebuilt on apply_config.
+        self._model_windows = {m.name: m.context_window for m in config.models}
         # Optional semantic (similarity) cache layer; None = disabled.
         self.semantic = semantic
         # Versioned prompt library (prompt ops): resolves key
@@ -318,6 +322,10 @@ class GatewayPipeline:
             ctx.model = resolved
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", resolved)
+        # The resolved model's declared context window (None when the
+        # model doesn't declare one) — what the context_window guardrail
+        # enforces against.
+        ctx.context_window = self._model_windows.get(resolved)
 
         # 0.5 Prompt policy: the gateway-managed system prompt (per-key,
         # else prompts.system_prompt) is prepended when the request
@@ -424,6 +432,10 @@ class GatewayPipeline:
         if request.model != pre_guardrail_model:
             self._check_model_permission(ctx.auth, request.model)
             ctx.model = request.model
+            # The redirected model's window now applies (the guardrail
+            # that redirected ran against the original's — ordering is
+            # documented: guardrails within the phase are ordered).
+            ctx.context_window = self._model_windows.get(request.model)
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", request.model)
 
@@ -1783,6 +1795,7 @@ class GatewayPipeline:
         self.router.apply_config(config)
         self.cost_calculator = CostCalculator(config.pricing)
         self._model_names = {m.name for m in config.models}
+        self._model_windows = {m.name: m.context_window for m in config.models}
         if self.prompt_library is not None:
             self.prompt_library.cache_seconds = config.prompts.library_cache_seconds
         logger.info(

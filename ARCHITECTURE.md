@@ -613,6 +613,13 @@ gateway/
 │   └── builtins/           pii_redaction · prompt_injection · keyword_blocklist ·
 │                           output_moderation · response_schema · request_limits
 │                           (block or reject-and-redirect on exceed) ·
+│                           context_window (fits requests to the model's
+│                           declared models[].context_window pre-flight —
+│                           OpenAI-style 400 with the actual numbers, or
+│                           redirect to a bigger model; the window is model
+│                           metadata resolved onto ctx at step 0/4.5, the
+│                           guardrail's params are policy: window override,
+│                           default_window, reserve_output_tokens) ·
 │                           presidio_pii (Microsoft Presidio; optional 'guardrails' extra)
 │
 ├── providers/              ── Upstream translation layer ──
@@ -816,7 +823,7 @@ classDiagram
 
 All verdicts are recorded into `RequestContext.guardrail_actions` (→ request logs → admin API) and Prometheus (`gateway_guardrail_blocks_total`). Guardrails run **sequentially in config order**; a `MODIFY` feeds the modified value to the next guardrail (chaining, e.g. redaction before injection-scoring) — messages, model and fields all compose in one `model_copy` per guardrail.
 
-**Reject-and-redirect.** `GuardrailResult.redirect(model, reason)` turns a request-phase verdict into a routing decision — "this content is too expensive for the flagship model, serve it on the small one" instead of a 400. The pipeline re-checks the key's model allowlist after the guardrail phase (fail closed: a redirect can never bypass permissions), then routes, meters, logs and caches against the final model while `request_body` keeps what the client asked for. The built-in `request_limits` exposes the same pattern from config (`on_exceed: redirect` + `redirect_model`).
+**Reject-and-redirect.** `GuardrailResult.redirect(model, reason)` turns a request-phase verdict into a routing decision — "this content is too expensive for the flagship model, serve it on the small one" instead of a 400. The pipeline re-checks the key's model allowlist after the guardrail phase (fail closed: a redirect can never bypass permissions), then routes, meters, logs and caches against the final model while `request_body` keeps what the client asked for. Two built-ins expose the same pattern from config: `request_limits` (`on_exceed: redirect` + `redirect_model`, oversized → cheaper model) and `context_window` (over-window → bigger model, or an OpenAI-style `context_length_exceeded` 400 pre-flight — the window itself is *model metadata*, `models[].context_window`, resolved onto the ctx at model resolution and re-resolved when another guardrail redirects; the guardrail's params are policy — `window` override, `default_window`, `reserve_output_tokens`, the response budget assumed when the caller sets no `max_tokens`).
 
 **Mid-stream rewriting.** `check_stream_delta` can only block — by the time it fires, the flagged text has reached the client. A guardrail with `supports_stream_rewrite = True` implements `rewrite_stream_text(text, final)` and rewrites the stream *as it flows*: the manager chains rewriters (each sees the previous one's output plus its own held-back buffer), the pipeline flushes held-back text before the finish chunk and at the end of the stream, and the response body / cache entry store what the client actually saw. Block-style checks still see the **source** text — moderation judges what the model said, not the rewrite. `pii_redaction`'s `mask_in_stream` implements the reserve heuristic: hold back the last `stream_reserve_chars` (default 100) of each delta, because a match split across provider chunks must never leak half-redacted.
 

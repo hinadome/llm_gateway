@@ -1391,6 +1391,7 @@ async def routing_table(raw_request: Request, admin: Annotated[AuthContext, Depe
         "models": [
             {
                 "name": model.name,
+                "context_window": model.context_window,
                 "deployments": [
                     {
                         "name": d.name,

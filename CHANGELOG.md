@@ -8,6 +8,30 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Context-window management: declare `context_window` (total tokens,
+  input + output) once per public model and the `context_window`
+  guardrail fits incoming requests to it *before* they burn upstream
+  quota — estimated input (~4 chars/token, the same heuristic as TPM,
+  including the managed system prompt) plus the response budget (the
+  caller's max_tokens, else reserve_output_tokens) must fit. Over-window
+  requests get an OpenAI-style context_length_exceeded 400 with the
+  actual numbers ("maximum context length is 1000 tokens... 5001
+  total"), or — with on_exceed: redirect — are served by a bigger model
+  instead (reject-and-redirect, allowlist re-checked fail-closed). The
+  window is model metadata (models[].context_window), resolved onto the
+  request context at model resolution and re-resolved when another
+  guardrail redirects; the guardrail's params are policy: window
+  (force a number), default_window (govern models that declare none —
+  no declaration and no default = unmanaged, passes through) and
+  reserve_output_tokens (1024 default). Strictly-greater blocks:
+  input + max_tokens == window fits. Blocked requests 400 pre-dispatch
+  on every chat-family surface (streams included — the envelope, not
+  an SSE body); embeddings/images/audio unaffected. Like any guardrail
+  it composes with observe mode, scoping and per-key
+  disabled_guardrails. /admin/routing now echoes each model's
+  context_window. config.yaml: gpt-4o declares 128000 + a documented
+  disabled context_window guardrail entry. 14 new tests
+  (tests/test_context_window.py).
 - Idempotency keys: retry-safe chat completions on every chat-family
   surface (OpenAI chat, /v1/responses, native Anthropic /v1/messages,
   native Gemini :generateContent). A client sends an Idempotency-Key

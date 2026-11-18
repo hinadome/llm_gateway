@@ -24,7 +24,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Multimodal chat** | Audio input in chat (`input_audio` parts) on every inbound format — OpenAI chat, the Responses bridge, and native Gemini (`inlineData` audio) — with the full policy pipeline (guardrails see an `[audio]` placeholder, never the bytes). **Audio output**: `modalities: ["text", "audio"]` + `audio: {voice, format}` returns `message.audio` (transcript + base64 WAV, or raw `pcm16`) — OpenAI/Azure passthrough incl. streamed `delta.audio`; Gemini translates to `responseModalities` + `speechConfig` (voice map shared with TTS); guardrails see transcripts (block/redact text, never the bytes). Image-to-image chat: Gemini image models (`gemini-2.5-flash-image`) on the chat surface return generated images as `image_url` content parts, round-tripped through the native Gemini format |
 | **Native inbound formats** | Anthropic Messages API (`POST /v1/messages`) and Gemini format (`POST /v1/models/{model}:generateContent`, `:streamGenerateContent`, `:embedContent`, `:batchEmbedContents` — `/v1` and `/v1beta`) accepted natively: same keys, guardrails, budgets, routing and caching as the OpenAI surface, responses translated back to each format (verified against the real `anthropic` and `google-genai` SDKs) |
 | **Responses API bridge** | `POST /v1/responses` (the OpenAI Agents SDK's default transport) translated to the chat-completions core — input items, instructions, function tools, `text.format`, streaming SSE events; verified against the real OpenAI SDK and OpenAI Agents SDK (see [Agent frameworks](#agent-frameworks)). Deployments can additionally set `native_responses: true` to forward those requests to OpenAI's `/responses` endpoint **in their original shape** (see below) |
-| **Guardrails (in/out)** | Pluggable request/response/stream-phase checks: PII redaction (regex or Microsoft Presidio), prompt-injection heuristics, keyword blocklists, output moderation, response-schema validation, request limits. Request-phase guardrails can **modify** more than messages — rewrite `model` (reject-and-redirect: "too expensive for the flagship model, serve it on the small one"), sampling params and tools, with modifications **chaining** across guardrails. Stream-phase guardrails can **rewrite output as it streams** (PII masked mid-stream, never reaching the client, no matter how the provider chunked it). Any guardrail can run in **observe mode** (log & count would-be verdicts without enforcing) and can be **scoped** to certain keys/models/routes (`scope` with fnmatch globs; per-route policy like "strict checks on `/v1/chat/completions`, looser on the native formats"; per-key runtime overrides via `disabled_guardrails`) |
+| **Guardrails (in/out)** | Pluggable request/response/stream-phase checks: PII redaction (regex or Microsoft Presidio), prompt-injection heuristics, keyword blocklists, output moderation, response-schema validation, request limits, context-window management. Request-phase guardrails can **modify** more than messages — rewrite `model` (reject-and-redirect: "too expensive for the flagship model, serve it on the small one"), sampling params and tools, with modifications **chaining** across guardrails. Stream-phase guardrails can **rewrite output as it streams** (PII masked mid-stream, never reaching the client, no matter how the provider chunked it). Any guardrail can run in **observe mode** (log & count would-be verdicts without enforcing) and can be **scoped** to certain keys/models/routes (`scope` with fnmatch globs; per-route policy like "strict checks on `/v1/chat/completions`, looser on the native formats"; per-key runtime overrides via `disabled_guardrails`) |
 | **Model aliasing** | `model_aliases` maps client-requested names to your public model names — apps with hardcoded provider model names (`gpt-4o`, `claude-3-5-sonnet-...`) work unchanged; opt-in `default_model` catches any unknown name; real model names always win over aliases |
 | **Per-key model routing** | Each virtual key can carry its own `model_mappings` (requested name → public model) and `default_model` — per-team steering without code changes. Mappings apply before global aliases and win even over real public names; everything downstream (permissions, budgets, caches, logs) sees the resolved name |
 | **Managed system prompts** | A global `prompts.system_prompt` or a per-key `system_prompt` (admin API/UI, no restart) is prepended to requests that carry **no system message of their own** — the gateway manages the prompt for callers that don't provide one; a client-supplied system message (OpenAI `system`/`developer`, Anthropic `system`, Gemini `systemInstruction`, Responses `instructions`) always wins. Injection runs before guardrails and cache lookup, so the prompt that goes out is the prompt that gets checked and cached |
@@ -450,6 +450,33 @@ Config lives in the `idempotency:` section: TTL (default 24h — Stripe's idempo
 
 14 tests pin the contract (`tests/test_idempotency.py`).
 
+## Context-window management
+
+A request that can't fit the model's context window wastes everyone's time *and* the provider's quota: it fails upstream with a provider-shaped 400 after the gateway has already metered, routed and logged it. Declare the window once per public model and the `context_window` guardrail rejects (or redirects) over-window requests *before* any of that:
+
+```yaml
+models:
+  - name: gpt-4o
+    context_window: 128000   # total tokens: input + output
+    deployments: [...]
+
+guardrails:
+  - name: context_window
+    enabled: true
+    params:
+      reserve_output_tokens: 1024
+      on_exceed: block         # block | redirect
+      redirect_model: gpt-4o    # for on_exceed: redirect — a *bigger* model
+```
+
+- **The window is model metadata**, not a guardrail param: `models[].context_window` is declared once per public model (surfaced at `/admin/routing`), resolved onto the request at model resolution, and re-resolved when another guardrail redirects mid-chain. Guardrail params are policy: `window` forces a specific number (testing, or managing a model that declares none), `default_window` governs models without a declaration, and `reserve_output_tokens` is the response budget assumed when the caller doesn't set `max_tokens`.
+- **OpenAI-style refusal, with the actual numbers**: `This model's maximum context length is 1000 tokens. However, your messages were estimated at 401 tokens plus max_tokens=5000 — 5001 total. Reduce the length of the messages or the requested output.` The caller can fix the request without a support ticket.
+- **`on_exceed: redirect`** is reject-and-redirect in the other direction: "this document doesn't fit the small model, serve it on the big one." The pipeline re-checks the calling key's allowlist for the target (fail closed), and everything downstream — routing, logs, cache identity — sees the final model.
+- **The estimate is the same ~4-chars/token heuristic the rate limiter uses** (TPM), computed on the outgoing message list — the managed system prompt is counted (it's part of what goes upstream). Strictly-greater blocks: `input + max_tokens == window` fits. Image/audio parts count as their `[image]`/`[audio]` placeholders (a documented under-count, same trade-off as TPM); the provider's own 400 remains the final word at the boundary.
+- **Scope**: every chat-family surface (`/v1/chat/completions`, `/v1/responses`, native `/v1/messages`, native Gemini) — blocked requests 400 pre-dispatch, streams included; embeddings/images/audio are unaffected. Like any guardrail it composes with observe mode, scoping and per-key `disabled_guardrails`.
+
+14 tests pin the contract (`tests/test_context_window.py`).
+
 ## Architecture
 
 For a deep dive — module map, request lifecycle sequence diagrams, extension frameworks, coupling rules, and an honest modularity assessment — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
@@ -482,7 +509,8 @@ gateway/
 │   │                    # mid-stream rewriting hooks)
 │   ├── manager.py       # phase executor + registry + custom loading
 │   └── builtins/        # pii_redaction, prompt_injection, keyword_blocklist,
-│                        # output_moderation, response_schema, request_limits
+│                        # output_moderation, response_schema, request_limits,
+│                        # context_window
 ├── providers/           # openai (passthrough + native Responses), azure,
 │                        # anthropic, gemini adapters
 └── observability/       # Prometheus metrics + OpenTelemetry tracing setup
@@ -547,7 +575,7 @@ async def check_request(self, request, ctx):
     return None
 ```
 
-The pipeline re-checks the key's model allowlist after the guardrail phase — a redirect can never bypass permissions (fail closed: the request is refused, not silently rerouted). Everything downstream (routing, logs, metrics, cache identity) sees the final model, while `request_body` in the log keeps what the client originally asked for. The built-in `request_limits` guardrail exposes the same pattern from config: `on_exceed: redirect` + `redirect_model` sends oversized requests to a cheaper model instead of blocking them.
+The pipeline re-checks the key's model allowlist after the guardrail phase — a redirect can never bypass permissions (fail closed: the request is refused, not silently rerouted). Everything downstream (routing, logs, metrics, cache identity) sees the final model, while `request_body` in the log keeps what the client originally asked for. Two built-ins expose the same pattern from config: `request_limits` (`on_exceed: redirect` + `redirect_model` sends oversized requests to a cheaper model) and `context_window` (over-window requests to a bigger model, or an OpenAI-style 400 before quota is spent — see [Context-window management](#context-window-management)).
 
 #### Mid-stream rewriting
 
@@ -656,6 +684,7 @@ providers:            # upstream endpoints + API key env var names
 
 models:               # public name → deployments (priority: lower = preferred)
   - name: gpt-4o
+    context_window: 128000  # optional: enables the context_window guardrail
     deployments:
       - {name: openai/gpt-4o, provider: openai, model: gpt-4o}
       - {name: anthropic/fallback, provider: anthropic, model: claude-sonnet-4-5, priority: 200}
@@ -701,6 +730,9 @@ guardrails:           # built-ins by name, custom via `class:' — mode: observe
   - {name: request_limits, enabled: false,
      params: {max_messages: 100, max_chars: 200000,
               on_exceed: redirect, redirect_model: gpt-4o-mini}}  # oversized -> cheaper model, not blocked
+  - {name: context_window, enabled: false,
+     params: {reserve_output_tokens: 1024, on_exceed: block,
+              redirect_model: gpt-4o}}  # over models[].context_window -> 400 pre-flight, or bigger model
   # scope fields: keys / exclude_keys / models / exclude_models / routes /
   # exclude_routes (fnmatch globs; exclude wins; all present fields must
   # match; routes = chat | responses | messages | gemini). See "Guardrail
