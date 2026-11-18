@@ -901,8 +901,13 @@ class PIIScanConfig(BaseModel):
     Clients paste API keys into prompts; guardrails may be off, in
     observe mode, or only masking the *upstream* copy — the log keeps
     the original as received, so this is where exposure actually
-    shows. On-demand (no loop): ``GET /admin/pii-scan`` over recent
-    rows, ``GET /admin/logs/{id}/pii-scan`` for one.
+    shows. On demand: ``GET /admin/pii-scan`` over recent rows,
+    ``GET /admin/logs/{id}/pii-scan`` for one; and (tier 53) a
+    background sweep that finds what landed without an admin asking —
+    findings persist once per row, newly flagged rows fire
+    ``pii.found``, flagged rows are *quarantined* (bodies masked on
+    the full read, withheld from the replay export) and, with
+    ``purge_days``, their bodies are eventually deleted outright.
 
     Detectors mirror the ``pii_redaction`` guardrail (the same
     compiled patterns — "masked" and "found" never drift) plus
@@ -915,6 +920,18 @@ class PIIScanConfig(BaseModel):
 
     enabled: bool = True
     max_rows: int = 500  # bulk scan bound
+    # Quarantine (mask flagged rows' bodies on the full read + withhold
+    # them from the replay export). Opt out to serve raw bodies even
+    # for flagged rows — the findings stay visible either way.
+    quarantine: bool = True
+    # The sweep: one pass per interval over rows not yet scanned
+    # (bounded by sweep_max_rows per pass), then the purge leg.
+    sweep_interval_seconds: float = 3600.0
+    sweep_max_rows: int = 500
+    # Delete a flagged row's stored bodies this many days after its
+    # findings landed (metadata + findings stay for the audit trail;
+    # None = keep until general log retention).
+    purge_days: float | None = None
     extra_patterns: dict[str, str] = Field(default_factory=dict)  # name -> regex
     exclude_kinds: list[str] = Field(default_factory=list)  # built-ins to drop
 

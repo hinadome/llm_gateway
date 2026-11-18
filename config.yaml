@@ -563,14 +563,32 @@ canary:
 # never drift) plus jwt / private-key secret shapes; extra_patterns
 # adds name -> regex detectors, exclude_kinds drops noisy built-ins
 # (e.g. ipv4). Findings are kind + count only — never the matched
-# text, so the audit never becomes its own leak. Scans are pure reads
-# (idempotent, nothing persisted); flagged rows count on
-# gateway_pii_scan_findings_total{kind} and emit pii.found events.
+# text, so the audit never becomes its own leak.
+#
+# The teeth (findings are RECORDED, not just reported): the first scan
+# — on demand or by the sweep below — persists findings on the row,
+# exactly once (a guarded write; pii.found fires once per row ever).
+# A flagged row is quarantined: GET /admin/logs/{id} serves its bodies
+# MASKED (kind-tagged placeholders, structure preserved) and the
+# replay export withholds them (a body-less line with a skip_reason).
+# quarantine: false opts out — findings stay visible either way.
+# sweep_interval_seconds runs a background pass over rows not yet
+# scanned (bounded by sweep_max_rows per pass) — it finds what landed
+# without an admin asking; quiet traffic is covered too. purge_days:
+# delete a flagged row's stored bodies this many days after its
+# findings landed (metadata + findings stay for the audit trail;
+# null = keep until general log retention). Flagged rows count on
+# gateway_pii_scan_findings_total{kind} and emit pii.found events;
+# purged rows on gateway_pii_scan_purged_rows_total.
 # Note: stored bodies are truncated at logging.max_body_chars — a
 # secret past the boundary is invisible to the scan.
 pii_scan:
   enabled: true
   max_rows: 500
+  quarantine: true
+  sweep_interval_seconds: 3600   # one background pass per hour
+  sweep_max_rows: 500
+  #purge_days: 30               # delete flagged bodies 30 days after the findings landed
   extra_patterns: {}
   exclude_kinds: []
 

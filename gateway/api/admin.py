@@ -30,6 +30,7 @@ from ..core.auth import (  # noqa: F401 — _is_expired re-exported for the play
 )
 from ..core.context import AuthContext
 from ..config import GatewayConfig
+from ..core.pii_scan import recorded_log
 from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
@@ -927,6 +928,13 @@ def _log_row(row: RequestLog) -> dict:
         "trace_id": row.trace_id,
         "span_id": row.span_id,
         "auth_method": row.auth_method,
+        # PII-scan state (tier 53): the recorded findings (kind + count
+        # per direction, never the matched text; None = never scanned)
+        # and, when the purge deleted a flagged row's bodies, when. Any
+        # recorded finding = quarantined: the full-body read is masked,
+        # the replay export withholds the bodies.
+        "pii_findings": row.pii_findings,
+        "pii_purged_at": row.pii_purged_at.isoformat() if row.pii_purged_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
@@ -1037,6 +1045,21 @@ async def export_logs(
             # capture line.
             if row.request_body is None:
                 continue
+            pii_cfg = raw_request.app.state.config.pii_scan
+            if pii_cfg.enabled and pii_cfg.quarantine and row.pii_flagged:
+                # PII quarantine (tier 53): a flagged row's bodies never
+                # leave in a capture — the export is the leak vector the
+                # audit must not become. The line still appears (baseline
+                # metadata + findings, no bodies) with a skip_reason, so a
+                # replay of this file honestly skips it rather than the
+                # row vanishing from history.
+                line = _log_row(row)
+                line["comparable"] = False
+                line["skip_reason"] = (
+                    "pii quarantine — flagged row bodies are not exported"
+                )
+                yield json.dumps(line, default=str) + "\n"
+                continue
             line = _log_row(row)
             line["request_body"] = row.request_body
             comparable = row.status in ("success", "blocked")
@@ -1098,9 +1121,21 @@ async def replay_capture(
 @router.get("/admin/logs/{log_id}")
 async def get_log(
     log_id: int,
+    raw_request: Request,
     admin: Annotated[AuthContext, Depends(require_admin)],
 ) -> dict:
-    """One log row in full, including the stored request/response bodies."""
+    """One log row in full, including the stored request/response
+    bodies — except when the row is PII-quarantined (tier 53): a row
+    whose scan findings landed (``pii_flagged``) has its bodies served
+    MASKED, every detector match replaced with a kind-tagged
+    placeholder (structure preserved — a masked read is still a
+    readable body, just without the findings), and carries
+    ``pii_quarantined: true``. The wire capture is masked the same way
+    (the upstream request may hold the raw secret when redaction was
+    off). The raw bodies stay in storage until ``pii_scan.purge_days``
+    deletes them — masking on read is the containment while they
+    exist. Opt out with ``pii_scan.quarantine: false``; disabling the
+    scan disables its teeth."""
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         log = await session.get(RequestLog, log_id)
@@ -1118,6 +1153,17 @@ async def get_log(
     row["client_headers"] = log.client_headers
     row["upstream_request"] = log.upstream_request
     row["upstream_headers"] = log.upstream_headers
+    cfg = raw_request.app.state.config.pii_scan
+    if cfg.enabled and cfg.quarantine and log.pii_flagged:
+        # Quarantine: the same detector set that found the findings masks
+        # them (found and masked can never drift). Validators respected —
+        # a Luhn-failing card number is neither found nor masked.
+        scanner = raw_request.app.state.pii_scanner
+        for field in ("request_body", "response_body",
+                      "client_headers", "upstream_request", "upstream_headers"):
+            if row[field] is not None:
+                row[field] = scanner.mask_body(row[field])
+        row["pii_quarantined"] = True
     return row
 
 
@@ -1303,21 +1349,54 @@ async def canary_probe_now(
 
 
 async def _scan_and_record(raw_request: Request, rows: "list[RequestLog]") -> list[dict]:
-    """Scan rows once with the current scanner; count + emit per
-    flagged row. Returns every row's result (clean rows included —
-    the bulk view reports them too).
+    """Scan rows, landing findings ONCE per row (tier 53 — the teeth).
+
+    Unscanned rows are computed and persisted — a guarded UPDATE
+    (``pii_scanned_at IS NULL``) so only the first scan of a row
+    lands, and a row the background sweep recorded a moment earlier
+    still reports identically here without re-counting. Already-scanned
+    rows report their recorded findings (``recorded_log`` — same
+    shape as a fresh scan, callers cannot tell). Findings persist
+    before events fire (the budget rule: duplicate silence over
+    duplicate noise), and a row scanned by two paths at once fires
+    ``pii.found`` exactly once.
 
     Metrics count *rows* containing a kind (not raw occurrences —
-    one pasted key in a row is one exposure); ``pii.found`` events
-    carry the same per-row kinds so a subscriber can alert/ticket."""
+    one pasted key in a row is one exposure), now incremented once
+    per row ever; ``pii.found`` events carry the same per-row kinds
+    so a subscriber can alert/ticket."""
     scanner = raw_request.app.state.pii_scanner
     events = getattr(raw_request.app.state, "events", None)
-    results = []
-    for row in rows:
-        result = scanner.scan_log(row)
-        results.append(result)
-        if result["clean"]:
-            continue
+    # Split by scan state (Python-side — the rows are in hand; the
+    # datetime column would be SQL-safe too, but there is nothing to
+    # push down for a page this small).
+    unscanned = [row for row in rows if row.pii_scanned_at is None]
+    fresh: dict[int, dict] = {}
+    newly: list[tuple[RequestLog, dict]] = []
+    if unscanned:
+        now = datetime.now(timezone.utc)
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            for row in unscanned:
+                result = scanner.scan_log(row)
+                res = await session.execute(
+                    update(RequestLog)
+                    .where(
+                        RequestLog.id == row.id,
+                        RequestLog.pii_scanned_at.is_(None),
+                    )
+                    .values(
+                        pii_findings=result["findings"],
+                        pii_scanned_at=now,
+                        pii_flagged=not result["clean"],
+                    )
+                )
+                fresh[row.id] = result
+                if res.rowcount and not result["clean"]:
+                    newly.append((row, result))
+            # Persist before delivery.
+            await session.commit()
+    for row, result in newly:
         request_findings = result["findings"]["request"]
         response_findings = result["findings"]["response"]
         for kind in set(request_findings) | set(response_findings):
@@ -1335,7 +1414,9 @@ async def _scan_and_record(raw_request: Request, rows: "list[RequestLog]") -> li
                     for kind in sorted(set(request_findings) | set(response_findings))
                 },
             )
-    return results
+    return [
+        fresh[row.id] if row.id in fresh else recorded_log(row) for row in rows
+    ]
 
 
 @router.get("/admin/pii-scan")
@@ -1348,12 +1429,15 @@ async def pii_scan_bulk(
     status: str | None = None,
     tenant_id: str | None = None,
 ) -> dict:
-    """Scan recent request-log bodies for PII/secrets, on demand (a
-    pure read — idempotent, nothing persisted). Returns per-row
-    findings for the rows that have any, plus aggregates. Tenant
-    admins are scoped to their own tenant (forced, like /admin/logs).
-    Rows whose bodies were never stored report ``captured: false`` —
-    counted separately from clean rows, never blurred."""
+    """Scan recent request-log bodies for PII/secrets, on demand.
+    Findings land on the row exactly once (tier 53 — the teeth): the
+    first scan — here or by the background sweep — persists them, and
+    re-reads report the recorded findings without re-counting or
+    re-emitting. Returns per-row findings for the rows that have
+    any, plus aggregates. Tenant admins are scoped to their own
+    tenant (forced, like /admin/logs). Rows whose bodies were never
+    stored report ``captured: false`` — counted separately from clean
+    rows, never blurred."""
     config = raw_request.app.state.config.pii_scan
     if not config.enabled:
         raise GatewayError(404, "PII scan is disabled (pii_scan.enabled).",
@@ -1398,9 +1482,10 @@ async def pii_scan_one(
     admin: Annotated[AuthContext, Depends(require_admin)],
 ) -> dict:
     """PII/secret findings for one request-log row (kind + count
-    only — the matched text is never returned). Same access rule as
-    GET /admin/logs/{id}: tenant admins may scan their own tenant's
-    rows only."""
+    only — the matched text is never returned). Findings land on the
+    row exactly once (tier 53) — re-scans report the recorded
+    findings. Same access rule as GET /admin/logs/{id}: tenant admins
+    may scan their own tenant's rows only."""
     config = raw_request.app.state.config.pii_scan
     if not config.enabled:
         raise GatewayError(404, "PII scan is disabled (pii_scan.enabled).",

@@ -136,6 +136,12 @@ PII_FINDINGS = Counter(
     ["kind"],
 )
 
+PII_PURGED = Counter(
+    "gateway_pii_scan_purged_rows_total",
+    "Flagged request-log rows whose stored bodies were deleted by the "
+    "PII purge (pii_scan.purge_days) — metadata and findings stay.",
+)
+
 IDEMPOTENCY = Counter(
     "gateway_idempotency_total",
     "Idempotency-Key outcomes for requests carrying one (replayed / stored / rejected).",

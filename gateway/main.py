@@ -52,6 +52,7 @@ from .core.canary import CanaryProber
 from .core.expiry_alerts import ExpiryAlertManager
 from .core.idempotency import IdempotencyStore
 from .core.pii_scan import PIIScanner
+from .core.pii_sweep import PIISweepManager
 from .core.slo_alerts import SLOAlertEvaluator
 from .core.forecast_alerts import ForecastAlertEvaluator
 from .core.cache import ResponseCache
@@ -303,6 +304,11 @@ def create_app(
     # a sweep (the lifespan loop below) fires day-levels as expires_at
     # approaches. Shares the budget alerts' HTTP client and config.
     expiry_alerts = ExpiryAlertManager(config.alerts, client=alert_http_client, events=events_bus)
+    # PII-scan sweep (tier 53): records scan findings on log rows (once
+    # per row — the on-demand endpoints land the same state) and purges
+    # flagged bodies past pii_scan.purge_days. No HTTP client of its
+    # own: findings surface as events + metrics.
+    pii_sweep = PIISweepManager(events=events_bus)
     # Audit webhooks: same delivery story as alerts, for admin actions.
     audit = AuditLogger(config.audit, client=audit_http_client, events=events_bus)
     # Request logging: synchronous by default (a returned response
@@ -583,6 +589,31 @@ def create_app(
 
         expiry_alert_task = asyncio.create_task(_expiry_alert_loop())
 
+        # PII-scan sweep (tier 53): one pass per interval — record
+        # findings on unscanned rows (the same state the on-demand
+        # endpoints land; newly flagged rows fire pii.found), then the
+        # purge leg when pii_scan.purge_days is set. Always started
+        # (not gated on pii_scan.enabled) so hot-enabling takes effect
+        # from the next pass; the scanner and config are handed over
+        # fresh each iteration, so a reload of detectors or knobs
+        # applies live. Under pytest (ASGITransport skips the lifespan)
+        # this loop never starts — tests drive evaluate_once() directly.
+        async def _pii_sweep_loop() -> None:
+            while True:
+                current = app.state.config.pii_scan
+                if current.enabled:
+                    try:
+                        await pii_sweep.evaluate_once(
+                            app.state.pii_scanner, current
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("pii sweep failed")
+                await asyncio.sleep(
+                    current.sweep_interval_seconds if current.enabled else 30.0
+                )
+
+        pii_sweep_task = asyncio.create_task(_pii_sweep_loop())
+
         # MCP session TTL: evict gateway-issued sessions idle past
         # mcp.session_ttl_seconds. The registry is the gateway's OWN
         # state (survives hot-reloads — a client mid-conversation is
@@ -662,6 +693,7 @@ def create_app(
         slo_alert_task.cancel()
         forecast_alert_task.cancel()
         expiry_alert_task.cancel()
+        pii_sweep_task.cancel()
         mcp_sweep_task.cancel()
         if vault_invalidation_task is not None:
             vault_invalidation_task.cancel()
@@ -738,6 +770,9 @@ def create_app(
     # pinning the sweep's clock — the lifespan loop never starts under
     # ASGITransport).
     app.state.expiry_alerts = expiry_alerts
+    # PII-scan sweep (admin-plane; tests drive evaluate_once(), pinning
+    # the clock and passing the current scanner + config).
+    app.state.pii_sweep = pii_sweep
     # PII/secret scanner (admin-plane GETs; rebuilt on config swap).
     app.state.pii_scanner = pii_scanner
     # Prompt library (admin-plane CRUD routes live in api/admin.py).

@@ -6,9 +6,12 @@ the audit that finds what landed in storage. Detectors mirror the
 pii_redaction guardrail plus jwt/private-key shapes; findings are
 kind + count only (never the matched text — the audit must not
 become its own leak); clean and bodies-not-captured are separate
-facts; tenant admins are scoped like /admin/logs; the bulk scan is a
-pure read that counts rows-with-kind on
-gateway_pii_scan_findings_total and emits pii.found events.
+facts; tenant admins are scoped like /admin/logs. Findings LAND on
+the row exactly once (tier 53 — the sweep + quarantine + purge
+contract lives in test_pii_sweep.py): the first scan persists them
+and fires pii.found + the gateway_pii_scan_findings_total
+rows-with-kind count; re-reads report the recorded findings without
+re-counting.
 """
 
 from __future__ import annotations

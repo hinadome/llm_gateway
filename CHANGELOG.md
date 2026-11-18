@@ -8,6 +8,51 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- PII-scan teeth (tier 53) — the scan stops being a mirror. Findings
+  were informational: reported at scan time, evaporating into a
+  metric and an event, while the flagged bodies stayed fully
+  readable forever — through the full-body read, through the replay
+  export — until general retention deleted the row wholesale.
+  Exposure you have to remember to check for is exposure you find
+  at breach time.
+  - **Findings land once per row.** The first scan — on demand or by
+    the new background sweep — persists `pii_findings` (split
+    kind→count, never the matched text) + `pii_scanned_at` on the
+    row via a guarded UPDATE (`WHERE pii_scanned_at IS NULL`), so
+    the on-demand endpoints and the sweep can race and a row still
+    fires `pii.found` + `gateway_pii_scan_findings_total{kind}`
+    exactly once per row ever. Re-reads report the recorded
+    findings without re-counting.
+  - **The sweep** (`core/pii_sweep.py`, the tier-52 loop shape):
+    one pass per `sweep_interval_seconds` (default hourly) over
+    rows not yet scanned, bounded by `sweep_max_rows` — it finds
+    what landed without an admin asking; quiet traffic is covered
+    too. Bodiless rows are marked scanned-clean so the walk
+    converges. Scanner + config handed over fresh each pass: a
+    hot reload of detectors or knobs applies from the next pass.
+  - **Quarantine**: a flagged row's bodies never leave raw again —
+    `GET /admin/logs/{id}` serves them MASKED (kind-tagged
+    `[REDACTED:{kind}]` placeholders, structure preserved, wire
+    capture included; the same detector set that found them, so
+    masked and found can never drift — validators respected, a
+    Luhn-failing card is neither) and `GET /admin/logs/export`
+    withholds them: the line stays in history, body-less, with a
+    `skip_reason`. Opt out with `pii_scan.quarantine: false`;
+    `enabled: false` disables the scan and its teeth.
+  - **The purge**: `pii_scan.purge_days` (default `null` = keep
+    until general retention) deletes a flagged row's stored bodies
+    that many days after its findings landed — metadata and
+    findings stay (the audit trail outlives the exposure), counted
+    on `gateway_pii_scan_purged_rows_total`. Candidates selected
+    with SQL-safe columns only (`pii_flagged` Boolean +
+    `pii_purged_at` + the scanned-at cutoff — the JSON column's
+    NULL does not compare safely on SQLite); purged rows leave
+    the candidate set, so the leg cannot starve.
+  - New `RequestLog` columns auto-upgrade everywhere the house
+    already does (`pii_findings`, `pii_scanned_at`, `pii_flagged`,
+    `pii_purged_at`); `_log_row` echoes the findings state. 14 new
+    tests (`tests/test_pii_sweep.py`) + the landing-semantics
+    update to the scan suite.
 - Key-expiry warnings (tier 52) — the deadline's own pages. `expires_at`
   was always enforced (the 401 tells callers the moment a key dies) but
   never announced: on-call's first signal was the user complaint. A

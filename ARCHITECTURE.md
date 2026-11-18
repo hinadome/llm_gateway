@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 91 Python files, ~34,400 lines, 1297 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 92 Python files, ~34,900 lines, 1311 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -85,7 +85,12 @@ gateway/
 │                           log-retention background task, key-expiry warning
 │                           sweep (tier 52: one expiry_alerts pass per
 │                           alerts.expiry_interval_seconds — always started,
-│                           config re-read each pass), SIGHUP →
+│                           config re-read each pass), PII-scan sweep (tier
+│                           53: one pii_sweep pass per pii_scan.
+│                           sweep_interval_seconds, the current scanner +
+│                           knobs handed over each pass — reload applies
+│                           from the next pass; the purged/flagged state
+│                           lands via guarded UPDATE), SIGHUP →
 │                           reload, readiness flag, drain-before-close), reload_gateway
 │                           (one path for /admin/reload + SIGHUP), /healthz liveness
 │                           (never checks deps) + /readyz readiness (503 while
@@ -555,7 +560,21 @@ gateway/
 │                           bodies_not_captured counted separately from
 │                           clean, tenant scoping like /admin/logs; GET
 │                           /admin/logs/{id}/pii-scan for one row; kind +
-│                           count only, never matched text),
+│                           count only, never matched text; tier 53:
+│                           findings LAND once per row via a guarded
+│                           UPDATE — re-scans report the recorded state
+│                           without re-counting, and a row the sweep
+│                           already recorded answers identically),
+│                           log reads honor quarantine (tier 53: GET
+│                           /admin/logs/{id} serves a flagged row's
+│                           bodies MASKED — the scanner's own detector
+│                           set, wire capture included, structure
+│                           preserved, pii_quarantined: true — and
+│                           /admin/logs/export withholds flagged
+│                           bodies: the line stays, body-less, with a
+│                           skip_reason, so history is honest while
+│                           the capture file carries no exposure;
+│                           pii_scan.quarantine/enabled gate it),
 │                           stats
 │                           (by_tenant breakdown for platform admins),
 │                           usage export (CSV/JSON billing
@@ -1589,17 +1608,63 @@ gateway/
 │   │                       log keeps the ORIGINAL body as received
 │   │                       (ctx.request_body captured before the
 │   │                       guardrail phase), so this sees what storage
-│   │                       holds, not what the provider saw. Pure
-│   │                       computation over rows (GET endpoints in
-│   │                       admin.py, no writes): findings are kind +
-│   │                       count only — never the matched text (the
-│   │                       audit must not become its own leak) — and
-│   │                       clean vs bodies-not-captured are separate
-│   │                       facts (store_bodies=false rows report
-│   │                       captured=false, never "safe"). Scanner
-│   │                       rebuilt in create_app and on config swap
-│   │                       (reload_gateway); metrics/events fire from
-│   │                       the endpoint layer
+│   │                       holds, not what the provider saw. Findings
+│   │                       are kind + count only — never the matched
+│   │                       text (the audit must not become its own
+│   │                       leak) — and clean vs bodies-not-captured are
+│   │                       separate facts (store_bodies=false rows
+│   │                       report captured=false, never "safe").
+│   │                       Tier 53 gave the audit teeth, all inside the
+│   │                       scanner so found/masked/recorded never
+│   │                       drift: mask_text/mask_body (the quarantine
+│   │                       leg — the SAME detector set, validators
+│   │                       respected, structure preserved), recorded_log
+│   │                       (the persisted-state mirror of scan_log —
+│   │                       same shape, captured stays a live fact so a
+│   │                       purged row honestly reports captured=false
+│   │                       beside its recorded findings) and
+│   │                       findings_flagged (one helper shared by the
+│   │                       quarantine reads and the purge leg, so the
+│   │                       two can never disagree what flagged means).
+│   │                       Scanner rebuilt in create_app and on config
+│   │                       swap (reload_gateway)
+│   ├── pii_sweep.py       PII-scan sweep + purge (tier 53): findings
+│   │                       LAND once per row and a background pass
+│   │                       finds what landed without an admin asking.
+│   │                       evaluate_once(scanner, config, now) takes
+│   │                       the current scanner and knobs each pass
+│   │                       (the lifespan loop hands them over, so a
+│   │                       hot reload of detectors or thresholds
+│   │                       applies from the next pass; tests pin now).
+│   │                       The scan leg walks pii_scanned_at IS NULL
+│   │                       id-asc, bounded by sweep_max_rows — a
+│   │                       native-datetime filter, SQL-safe where a
+│   │                       JSON column's NULL is not (SQLite stores
+│   │                       Python None as literal 'null'); bodiless
+│   │                       rows are marked scanned-clean so the walk
+│   │                       converges instead of starving. The persist
+│   │                       is a guarded UPDATE (WHERE pii_scanned_at
+│   │                       IS NULL) — TWO writers exist (the
+│   │                       on-demand endpoints race this pass), so
+│   │                       unlike the single-writer alert tiers the
+│   │                       landing needs the CAS; a row scanned by
+│   │                       both paths still fires pii.found exactly
+│   │                       once (payloads captured as tuples before
+│   │                       commit — ORM rows expire; state before
+│   │                       delivery, the budget rule). The purge leg
+│   │                       (purge_days set) NULLs the stored bodies
+│   │                       of flagged rows past the window: candidates
+│   │                       selected with SQL-safe columns only
+│   │                       (pii_flagged Boolean + pii_purged_at +
+│   │                       pii_scanned_at cutoff), findings and
+│   │                       metadata stay — the audit trail outlives
+│   │                       the exposure — and PII_PURGED counts;
+│   │                       purged rows leave the candidate set, so
+│   │                       the leg cannot starve behind a backlog.
+│   │                       Quarantine itself (mask on read, export
+│   │                       withholding) lives in admin.py — the sweep
+│   │                       only records facts, the read paths act
+│   │                       on them
 │   ├── idempotency.py      Idempotency-Key replay: IdempotencyStore wraps
 │   │                       a response-cache backend (same selection
 │   │                       switch as the content cache — memory LRU or
@@ -2651,7 +2716,7 @@ Every stage boundary below is also an event emission (the full catalog with payl
 - **`request.routed`** — after deployment selection, on both the stream and non-stream paths (observer-only: the router's retry machinery has the provider call in flight — an in-band veto there would be unsafe, so routing is notification, not a checkpoint).
 - **`response.completed`** — the final non-streaming response, post-guardrails, pre-client, with usage and cost (and `surface` for the non-chat modalities). *Interceptable* — the last in-band veto point; an interceptor raising here fails the request instead of returning the body.
 - **`stream.started` / `stream.completed`** — first chunk / end of the streamed body, emitted from the stream wrapper's iteration and `finally` (any outcome; `ctx.status` says which). Coarse by design; never per-chunk.
-- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` / `runaway.released` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `runaway.trip` from phase 1.5 when the loop detector jails a key (observer-only — the jail is the decision, not negotiable by handlers); `concurrency.timeout` from phase 5.5 when a queue wait for a slot expires (observer-only — the 429 is the decision; carries key, model, cap, wait_seconds and actual waited seconds); `budget.threshold` from the alert manager (per crossed level); `expiry.threshold` from the key-expiry sweep (per crossed day-level, tier 52 — observer-only, carries key, key_name, level_days, days_remaining, expires_at); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure); `pii.found` from the PII scan endpoints (a scanned log row's stored bodies matched detectors); `mcp.session.opened` / `mcp.session.closed` from the MCP proxy (a gateway session created at initialize; dropped via DELETE / TTL sweep / lazy upstream-404 — `reason` says which) and `mcp.tool.blocked` from `handle_mcp`'s denial path (observer-only — the in-band JSON-RPC error IS the decision; carries server, tool, code, guardrail — and, tier 49, the denied method, so the stream says whether the denial was a `tools/call`, a `resources/read`, a `prompts/get` or a `completion/complete`).
+- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` / `runaway.released` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `runaway.trip` from phase 1.5 when the loop detector jails a key (observer-only — the jail is the decision, not negotiable by handlers); `concurrency.timeout` from phase 5.5 when a queue wait for a slot expires (observer-only — the 429 is the decision; carries key, model, cap, wait_seconds and actual waited seconds); `budget.threshold` from the alert manager (per crossed level); `expiry.threshold` from the key-expiry sweep (per crossed day-level, tier 52 — observer-only, carries key, key_name, level_days, days_remaining, expires_at); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure); `pii.found` when a row's findings LAND — first scan, from the on-demand endpoints or the background sweep (tier 53: exactly once per row ever, the guarded persist; observer-only, admin-plane); `mcp.session.opened` / `mcp.session.closed` from the MCP proxy (a gateway session created at initialize; dropped via DELETE / TTL sweep / lazy upstream-404 — `reason` says which) and `mcp.tool.blocked` from `handle_mcp`'s denial path (observer-only — the in-band JSON-RPC error IS the decision; carries server, tool, code, guardrail — and, tier 49, the denied method, so the stream says whether the denial was a `tools/call`, a `resources/read`, a `prompts/get` or a `completion/complete`).
 
 Emits enqueue observers *before* an interceptor's abort propagates — subscribers always see the event that was vetoed.
 
@@ -2738,6 +2803,10 @@ erDiagram
         json guardrail_actions "per-phase verdicts with reasons/details"
         json request_body "original as received (truncated)"
         json response_body "or assembled stream content"
+        json pii_findings "tier 53: recorded scan findings {request: {kind: n}, response: {kind: n}} — kind + count only, never the matched text; NULL = never scanned, both-empty = scanned clean (bodiless rows too), any count = flagged/quarantined"
+        datetime pii_scanned_at "when the findings landed (first scan — endpoint or sweep); the purge clock"
+        bool pii_flagged "SQL-safe mirror of any-recorded-count, so the purge walk needs no JSON filter (SQLite JSON NULL doesn't compare safely)"
+        datetime pii_purged_at "purge deleted this row's bodies (pii_scan.purge_days); findings + metadata stay"
         bool stream
         int prompt_tokens
         int completion_tokens
@@ -3742,6 +3811,46 @@ tests/
 │                        no-webhook = skipped metric while events
 │                        still fire, and rotation (tier 51) leaves
 │                        the expiry state alone
+├── test_pii_scan.py      PII/secret scan over stored bodies: the
+│                        original-not-the-mask contract (redaction
+│                        protects the provider, the audit sees what
+│                        storage holds), response-side findings when
+│                        redaction is off, clean vs bodies-not-captured
+│                        as separate facts, bulk aggregates + filters,
+│                        tenant scoping (forced, plus the foreign-row
+│                        404 wall), extra_patterns/exclude_kinds, the
+│                        once-per-row metric + pii.found event, and the
+│                        enabled=false 404s
+├── test_pii_sweep.py     PII-scan teeth (tier 53): the sweep with its
+│                        clock PINNED finds and persists findings
+│                        without an admin asking (payloads captured
+│                        as tuples, state at the pinned now), is
+│                        idempotent (second pass = 0, no re-count,
+│                        no re-emit), respects sweep_max_rows (one
+│                        row per pass, converged third), marks
+│                        bodiless rows scanned-clean so the walk
+│                        converges (captured=false honesty), and is a
+│                        no-op when disabled; on-demand scans land the
+│                        same state exactly once (re-scan = recorded
+│                        findings, no double metric/event, sweep
+│                        agrees); quarantine masks the flagged read
+│                        (placeholder present, secret absent,
+│                        structure preserved, response-side + wire
+│                        capture covered, pii_quarantined: true),
+│                        opts out (quarantine=false) and gates off
+│                        (enabled=false — even a pre-flagged row
+│                        serves raw and exports); the replay export
+│                        withholds flagged bodies (body-less line +
+│                        skip_reason, clean rows untouched); the
+│                        purge deletes flagged bodies past purge_days
+│                        via scanned_at time-travel (bodies NULL,
+│                        findings + purged_at stay, PII_PURGED +1,
+│                        idempotent re-pass, the honest captured=false
+│                        read) while purge_days=null keeps bodies
+│                        until general retention; and masking is the
+│                        scanner's own detector set (Luhn-failing
+│                        cards untouched, excluded kinds stay raw,
+│                        mask_body preserves structure)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while

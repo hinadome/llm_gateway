@@ -382,6 +382,24 @@ class RequestLog(Base):
     guardrail_actions: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     request_body: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     response_body: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
+    # PII-scan teeth (tier 53): findings recorded ONCE per row by the
+    # scan endpoints or the background sweep. pii_findings is the
+    # recorded split {"request": {kind: n}, "response": {kind: n}} —
+    # kind + count only, never the matched text; NULL = never scanned,
+    # both-empty = scanned clean (bodiless rows too — "nothing
+    # visible" recorded once so the sweep converges), any count =
+    # flagged. pii_scanned_at is when the findings landed (the purge
+    # clock). pii_flagged mirrors "any count" as a SQL-safe Boolean so
+    # the purge walk can select candidates without a JSON filter (the
+    # JSON column's NULL does not compare safely on SQLite); a flagged
+    # row is quarantined — its full-body read is masked and the replay
+    # export withholds its bodies. pii_purged_at marks rows whose
+    # bodies the purge deleted (pii_scan.purge_days): metadata and
+    # findings stay for the audit trail, the bodies are gone.
+    pii_findings: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
+    pii_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pii_flagged: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    pii_purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Wire capture (see observability/wire.py): the allowlisted subset of
     # the client's request headers (user-agent, SDK telemetry, correlation
     # ids — never credentials); the request as actually sent to the
