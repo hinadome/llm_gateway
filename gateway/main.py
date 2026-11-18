@@ -11,7 +11,7 @@ import logging
 import signal
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
 
@@ -66,6 +66,7 @@ from .core.redis_backends import (
     RedisCircuitBreakerRegistry,
     RedisRateLimiter,
     RedisResponseCache,
+    RedisVaultInvalidator,
 )
 from .core.router import Router, embed_fn_for
 from .core.semantic_cache import SemanticCache
@@ -203,6 +204,7 @@ def create_app(
         or config.rate_limit.backend == "redis"
         or config.routing.breaker.backend == "redis"
         or config.idempotency.backend == "redis"
+        or config.vault.backend == "redis"
     ):
         redis_client = aioredis.from_url(config.redis.resolve_url())
     breakers = None
@@ -214,9 +216,24 @@ def create_app(
     # and the encryption package is importable — otherwise it sits
     # disabled (provider-key endpoints 400 honestly; callers route with
     # the platform's configured keys, exactly as before).
+    # vault.backend: redis (tier 34): admin writes also publish an
+    # invalidation so every replica drops its cached entry (and its
+    # negative twin) immediately — the TTL remains the backstop.
+    vault_invalidator: RedisVaultInvalidator | None = None
+    if config.vault.backend == "redis" and redis_client is not None:
+        vault_invalidator = RedisVaultInvalidator(
+            redis_client,
+            channel=f"{config.redis.prefix}:vault-invalidation",
+        )
     vault = VaultService(
-        settings.vault_master_key, ttl_seconds=config.vault.ttl_seconds
+        settings.vault_master_key,
+        ttl_seconds=config.vault.ttl_seconds,
+        on_invalidation=(
+            vault_invalidator.publish if vault_invalidator is not None else None
+        ),
     )
+    if vault_invalidator is not None:
+        vault_invalidator.bind(vault)
     router = Router(config, providers, breakers=breakers, vault=vault)
     guardrails = GuardrailManager.from_config(config.guardrails, tracer=tracer)
     # Lifecycle events: the stage-boundary pub/sub layer (see
@@ -470,6 +487,20 @@ def create_app(
 
         mcp_sweep_task = asyncio.create_task(_mcp_sweep_loop())
 
+        # BYOK vault invalidation listener (tier 34): the subscriber
+        # half of vault.backend: redis — one loop per process, feeds
+        # published (tenant, provider) invalidations into the local
+        # cache drop. Best-effort by design (reconnects with backoff
+        # on Redis outages; the TTL is the backstop), cancelled at
+        # shutdown before the client closes. Under pytest
+        # (ASGITransport skips the lifespan) this loop never starts —
+        # tests drive listen() directly.
+        vault_invalidation_task: asyncio.Task | None = None
+        if vault_invalidator is not None:
+            vault_invalidation_task = asyncio.create_task(
+                vault_invalidator.listen()
+            )
+
         logger.info("LLM Gateway %s ready (models: %s)", __version__, config.public_models())
 
         # SIGHUP = reload config.yaml without dropping traffic (the same
@@ -509,6 +540,10 @@ def create_app(
             batch_task.cancel()
         canary_task.cancel()
         mcp_sweep_task.cancel()
+        if vault_invalidation_task is not None:
+            vault_invalidation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await vault_invalidation_task
         # In-flight background work (spend accounting, shadow mirrors,
         # prompt A/B) is drained before the resources it depends on go
         # away — bounded, so a wedged upstream cannot hang shutdown.
@@ -576,6 +611,10 @@ def create_app(
     # BYOK vault (admin-plane provider-key CRUD; the serving side lives
     # on the router/pipeline references).
     app.state.vault = vault
+    # The Redis invalidation fan-out when vault.backend: redis (None
+    # otherwise): tests spawn/drive listen() by hand — the lifespan
+    # loop never starts under ASGITransport.
+    app.state.vault_invalidator = vault_invalidator
     app.state.config = config
     # Env settings (DB URL, config path, ...): the reload path re-reads
     # config.yaml from settings.config_path; endpoints under /admin use

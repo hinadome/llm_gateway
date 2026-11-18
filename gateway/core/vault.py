@@ -31,10 +31,12 @@ never silently spend the platform's.
 
 Lookups are cached per (tenant, provider) for ``ttl_seconds`` (30 by
 default): the hot path adds one dict read, not a DB round trip.
-Writes invalidate the local cache immediately; other replicas of a
-multi-process fleet see changes within the TTL (documented — keep the
-TTL short if your fleet mutates keys often, and rotation is urgent
-business anyway). Cache entries hold decrypted keys in memory for
+Writes invalidate the local cache immediately; across a
+multi-process fleet, ``vault.backend: redis`` (tier 34) additionally
+publishes each invalidation on a Redis channel so every replica drops
+its cached entry the moment a write lands — the TTL is the backstop
+when a message is lost, and the whole mechanism when the backend is
+left at ``memory``. Cache entries hold decrypted keys in memory for
 their TTL — that is the point of a cache; process memory is the
 trust boundary the master key already lives in.
 
@@ -47,16 +49,19 @@ who hasn't stored a key.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy import delete, select
 
 from ..db import get_sessionmaker
 from ..errors import GatewayError
 from ..models import ProviderKey
+
+logger = logging.getLogger("gateway.vault")
 
 # Provider ids come from config.yaml (providers:) — lowercase slugs,
 # digits, dots, dashes, underscores.
@@ -109,6 +114,40 @@ class VaultKeyUnreadableError(GatewayError):
         )
 
 
+class ByokKeyRequiredError(GatewayError):
+    """vault.strict is on and the caller's tenant has no stored key for
+    ANY deployment of the requested model. The routing ladder for a
+    strict tenant only contains providers the tenant keyed; an empty
+    ladder means the request CANNOT run without spending the
+    platform's credentials — refuse, and say exactly what to key."""
+
+    def __init__(
+        self,
+        tenant_id: str,
+        tenant_name: str | None,
+        model: str,
+        providers: list[str],
+    ) -> None:
+        who = f"tenant '{tenant_name}' ({tenant_id})" if tenant_name else (
+            f"tenant '{tenant_id}'"
+        )
+        listed = ", ".join(sorted(providers)) or "none configured"
+        super().__init__(
+            status_code=403,
+            message=(
+                f"vault.strict is enabled: {who} has no stored provider "
+                f"key for any deployment of model '{model}' (its "
+                f"deployments run on: {listed}). The platform's own "
+                "credentials may not serve tenant traffic while strict "
+                "is on — store a provider key via PUT /admin/tenants/"
+                f"{tenant_id}/provider-keys/<provider>, or set "
+                "vault.strict: false."
+            ),
+            error_type="invalid_request_error",
+            code="byok_key_required",
+        )
+
+
 @dataclass(frozen=True)
 class VaultEntry:
     """A decrypted vault entry. ``key`` lives only in process memory —
@@ -142,8 +181,17 @@ class VaultService:
         self,
         master_key: str | None = None,
         ttl_seconds: int = 30,
+        on_invalidation: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
+        """``on_invalidation`` (tier 34) is fired with (tenant_id,
+        provider) after every admin write's LOCAL cache drop — the
+        Redis invalidator passes its ``publish`` here so a fleet of
+        replicas converges immediately instead of within the TTL.
+        Publishing is best-effort (the callback swallows its own
+        transport errors; the TTL stays the backstop); None keeps the
+        single-process behavior, byte for byte."""
         self.ttl_seconds = max(0, ttl_seconds)
+        self._on_invalidation = on_invalidation
         self._fernet: Any | None = None
         self._missing_package: str | None = None
         self._invalid_key_reason: str | None = None
@@ -198,6 +246,26 @@ class VaultService:
         if not self.enabled:
             raise VaultDisabledError(self.unavailable_reason or "no master key")
 
+    # -- invalidation -----------------------------------------------------------
+
+    async def _notify_invalidation(self, tenant_id: str, provider: str) -> None:
+        """Fan the local invalidation out (cross-replica) if a
+        notifier is wired. Never raises: the local drop already
+        happened, and a failed fan-out only means other replicas
+        converge via the TTL — the documented backstop."""
+        if self._on_invalidation is None:
+            return
+        try:
+            await self._on_invalidation(tenant_id, provider)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "vault invalidation fan-out failed for (%s, %s) — other "
+                "replicas converge within ttl_seconds",
+                tenant_id,
+                provider,
+                exc_info=True,
+            )
+
     # -- admin surface ----------------------------------------------------------
 
     @staticmethod
@@ -246,6 +314,7 @@ class VaultService:
             await session.refresh(row)
             result = row.to_public_dict()
         self.invalidate(tenant_id, provider)
+        await self._notify_invalidation(tenant_id, provider)
         return result
 
     async def delete(self, tenant_id: str, provider: str) -> bool:
@@ -261,6 +330,7 @@ class VaultService:
             await session.commit()
             deleted = bool(result.rowcount)
         self.invalidate(tenant_id, provider)
+        await self._notify_invalidation(tenant_id, provider)
         return deleted
 
     async def list_for_tenant(self, tenant_id: str) -> list[dict]:

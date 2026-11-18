@@ -92,7 +92,10 @@ gateway/
 │                           background_write, metrics incl. per_key,
 │                           prompts incl. system_prompt/variables, mcp (the proxy
 │                           surface: servers with url/auth headers/timeout +
-│                           session TTL), multipart upload cap)
+│                           session TTL), vault (ttl_seconds + backend for the
+│                           cache-invalidation fan-out + strict, the tenant-only
+│                           ladder stance — hot-reloadable, backend/TTL report
+│                           restart_required), multipart upload cap)
 ├── schemas.py              OpenAI-compatible pydantic models (request, response, chunks, admin);
 │                           ChatCompletionRequest carries private attrs (never serialized,
 │                           excluded from cache identity/logs) for the native Responses
@@ -285,7 +288,13 @@ gateway/
 │                           and see 404s for other tenants' keys/logs),
 │                           tenants CRUD (platform admins: slug + display
 │                           name + policy ceiling, budget re-arm on PATCH,
-│                           delete refused while keys reference it), the prompt
+│                           delete refused while keys reference it), the
+│                           BYOK vault surface — GET /admin/vault status
+│                           (tier 34: enabled/unavailable_reason/strict/
+│                           backend/TTL + admin_context; no secrets) and
+│                           the tenant provider-key CRUD (list/put/delete,
+│                           hints only, tenant admins pinned to their
+│                           own, cross-tenant 404), the prompt
 │                           library CRUD (create/version, summaries, per-name
 │                           versions, activate/candidate/fraction patch, delete —
 │                           every mutation audited), logs (list omits
@@ -658,7 +667,24 @@ gateway/
 │   │                       key follows the request through every
 │   │                       retry/fallback leg (per-candidate: an
 │   │                       unkeyed fallback provider rides the
-│   │                       platform's own). Platform traffic, keyless
+│   │                       platform's own). Tier 34 adds
+│   │                       _strict_filter/_enforce_strict for
+│   │                       vault.strict: the ladder is narrowed BEFORE
+│   │                       the walk — only deployments whose provider
+│   │                       the tenant keyed survive (the vault's
+│   │                       cached lookup, so a dict read), retries and
+│   │                       fallbacks can never cross to an unkeyed
+│   │                       provider, and an empty ladder raises
+│   │                       ByokKeyRequiredError (403, naming the
+│   │                       sorted providers + the PUT path). Both
+│   │                       ladder heads (_dispatch, complete_stream)
+│   │                       and the realtime connect-time ladder
+│   │                       (pipeline.handle_realtime) narrow
+│   │                       identically; platform callers (no tenant)
+│   │                       and the platform's own machinery are
+│   │                       untouched, and the stance is read off
+│   │                       router.config per request — hot-reloadable.
+│   │                       Platform traffic, keyless
 │   │                       tenants and disabled vaults get the config
 │   │                       untouched; an undecryptable entry raises
 │   │                       BEFORE the retry try/except — fail closed
@@ -688,7 +714,9 @@ gateway/
 │   ├── ratelimit.py        Sliding-window RPM/TPM, in-memory (async interface)
 │   ├── redis_backends.py   RedisRateLimiter + RedisResponseCache + RedisCircuitBreaker
 │   │                       Registry — shared windows, cache entries and circuit-breaker
-│   │                       state across workers/replicas, semantics preserved
+│   │                       state across workers/replicas, semantics preserved;
+│   │                       RedisVaultInvalidator (tier 34) fans BYOK cache
+│   │                       invalidations across the same fleet (see vault.py)
 │   ├── cache.py            Exact-match response cache + stream replay (async
 │   │                       interface); cache_key_for salts the normalized
 │   │                       request with the caller's response-policy token
@@ -706,8 +734,13 @@ gateway/
 │   │                       rotation: first encrypts, all decrypt) with
 │   │                       a per-(tenant,provider) TTL cache of
 │   │                       decrypted keys + a negative cache, both
-│   │                       invalidated on admin writes (other replicas
-│   │                       converge within the TTL — documented bound);
+│   │                       invalidated on admin writes; on_invalidation
+│   │                       (tier 34) fans the drop out cross-replica
+│   │                       when vault.backend is redis (publish-on-
+│   │                       write + RedisVaultInvalidator listeners —
+│   │                       both best-effort, the TTL the backstop),
+│   │                       while the memory default keeps the
+│   │                       converge-within-TTL bound;
 │   │                       double-checked lock around the DB read.
 │   │                       put/get/peek/delete/list_for_tenant; peek is
 │   │                       cache-only (observability after dispatch —
@@ -723,7 +756,11 @@ gateway/
 │   │                       byte-for-byte neutral. Undecryptable
 │   │                       (rotated-away key) 500s byok_key_unreadable
 │   │                       — fail closed, never a silent platform-key
-│   │                       fallback
+│   │                       fallback. Tier 34 adds ByokKeyRequiredError:
+│   │                       under vault.strict a tenant whose every
+│   │                       deployment is unkeyed refuses 403 naming
+│   │                       the providers to key (the ladder narrowing
+│   │                       itself lives in router.py)
 │   ├── cost.py             CostCalculator: per-1M-token pricing, longest-prefix lookup;
 │   │                       unit prices for non-token modalities (image_usd,
 │   │                       audio_usd_per_minute, speech_usd_per_1m_chars —
@@ -1516,7 +1553,8 @@ Two properties worth highlighting:
 flowchart TD
     REQ["request.model = public name"] --> RESOLVE["Router.resolve: sorted deployments by priority<br/>(shadow deployments are never returned)"]
     RESOLVE --> FILTER["drop deployments with open circuits<br/>(if all are open: keep everything)"]
-    FILTER --> PICK["weighted-random pick within the top priority tier"]
+    FILTER --> STRICT["vault.strict (tier 34): drop deployments whose<br/>provider the caller's tenant has NOT keyed —<br/>narrowing BEFORE the walk, so retries/fallbacks<br/>never cross to an unkeyed provider; an empty ladder<br/>refuses 403 byok_key_required naming the providers<br/>to key (tenant traffic only; platform callers,<br/>admins and platform machinery untouched)"]
+    STRICT --> PICK["weighted-random pick within the top priority tier"]
     PICK --> BYOK["resolve provider cfg PER CANDIDATE (tier 31): the<br/>tenant's stored vault key replaces the platform's<br/>when the caller's tenant keyed this provider — so<br/>retries and unkeyed fallback legs each resolve<br/>their own; undecryptable = fail closed here,<br/>before any upstream call"]
     BYOK --> CALL["call adapter.complete / adapter.stream"]
     CALL --> ERR{"ProviderError?"}
@@ -1530,7 +1568,7 @@ flowchart TD
     FB -->|"none left"| RAISE
 ```
 
-**Realtime sessions route at CONNECT time only.** A WebSocket session is a stateful commitment — the ladder above (resolve → breaker filter → BYOK resolution → candidate) runs in a single loop over `Router.resolve_realtime` results while the gateway opens the upstream handshake, failing over between refused handshakes, and then the session *stays on its leg*: there is no retry protocol for a stream that is already 40 minutes in. So a dead openai leg moves a *new* session to the azure fallback, but a leg that dies mid-session simply ends that session (the client reconnects, which re-runs the ladder). Residency filtering applies identically (the ladder is pre-filtered), and the breaker state the walk consults is the same shared machinery as HTTP routing.
+**Realtime sessions route at CONNECT time only.** A WebSocket session is a stateful commitment — the ladder above (resolve → breaker filter → strict narrowing → BYOK resolution → candidate) runs in a single loop over `Router.resolve_realtime` results while the gateway opens the upstream handshake, failing over between refused handshakes, and then the session *stays on its leg*: there is no retry protocol for a stream that is already 40 minutes in. So a dead openai leg moves a *new* session to the azure fallback, but a leg that dies mid-session simply ends that session (the client reconnects, which re-runs the ladder). Residency filtering applies identically (the ladder is pre-filtered), and the breaker state the walk consults is the same shared machinery as HTTP routing.
 
 **MCP messages do not route at all.** An MCP server is one configured URL (`mcp.servers[].url`), not a public model with a deployment ladder — there is nothing to rank, no breaker to consult, no BYOK to resolve (upstream auth is the operator's `headers`/`headers_env`, configured per server; the caller's gateway credential never travels upstream). The proxy's per-server state is its own session registry instead: gateway-issued ids mapped to upstream sessions, TTL-swept and lazily evicted (§8's sixth-surface note), with retry/failover deliberately absent — an MCP exchange is the client's own request/response round trip, and a server that is down relays its own error to the client's JSON-RPC layer rather than the gateway inventing a retry the caller cannot see.
 
@@ -1719,7 +1757,7 @@ erDiagram
     BATCH ||--o{ BATCH_RESULT : "batch_id"
 ```
 
-**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, `allowed_mcp_servers`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows, and so do `allowed_mcp_servers` patterns — a proxied MCP server must be granted on both the key and the tenant rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays. **BYOK vault (tier 31):** a tenant can additionally store its *own* provider credentials — one encrypted entry per (tenant, provider), `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every member request through that provider then authenticates with the tenant's key instead of the platform's configured one (see `core/vault.py`; the swap happens in `Router._resolve_provider_cfg`, per candidate inside the retry/fallback loop, so the stored key follows every leg and an unkeyed fallback provider rides the platform's credential alone — realtime sessions included: `handle_realtime` resolves per candidate at the upstream handshake, so a tenant that keyed the provider connects its WebSocket sessions with *their* credential, and the session row records `byok_provider` like any HTTP row). Raw keys are Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (env only; MultiFernet list = rotation), exist only in the PUT body and the upstream auth header, and are never echoed, logged or audited — the API and audit records speak `key_hint`, log rows `byok_provider` (the provider name). Undecryptable entries (a rotated-away master key) fail closed with `byok_key_unreadable` — a tenant that deliberately brought its own key is never silently re-billed to the platform's; platform callers are untouched. Tenant admins manage their own tenant's credentials only (cross-tenant 404, like everything tenant-scoped); without a master key the vault is simply off — endpoints 400 honestly, serving unchanged.
+**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, `allowed_mcp_servers`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows, and so do `allowed_mcp_servers` patterns — a proxied MCP server must be granted on both the key and the tenant rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays. **BYOK vault (tier 31):** a tenant can additionally store its *own* provider credentials — one encrypted entry per (tenant, provider), `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every member request through that provider then authenticates with the tenant's key instead of the platform's configured one (see `core/vault.py`; the swap happens in `Router._resolve_provider_cfg`, per candidate inside the retry/fallback loop, so the stored key follows every leg and an unkeyed fallback provider rides the platform's credential alone — realtime sessions included: `handle_realtime` resolves per candidate at the upstream handshake, so a tenant that keyed the provider connects its WebSocket sessions with *their* credential, and the session row records `byok_provider` like any HTTP row). Raw keys are Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (env only; MultiFernet list = rotation), exist only in the PUT body and the upstream auth header, and are never echoed, logged or audited — the API and audit records speak `key_hint`, log rows `byok_provider` (the provider name). Undecryptable entries (a rotated-away master key) fail closed with `byok_key_unreadable` — a tenant that deliberately brought its own key is never silently re-billed to the platform's; platform callers are untouched. Tenant admins manage their own tenant's credentials only (cross-tenant 404, like everything tenant-scoped); without a master key the vault is simply off — endpoints 400 honestly, serving unchanged. **Tier 34 hardening:** `vault.strict` is the platform-economics stance — a strict tenant's routing ladder is narrowed *before the walk* (`Router._enforce_strict` on both ladder heads and the realtime connect-time ladder), so retries and fallbacks can never cross to an unkeyed provider, and a model whose every deployment is unkeyed refuses 403 `byok_key_required` naming the sorted providers, the model and the `PUT` path; platform callers and the platform's own machinery are untouched, and the stance reads live off the config (hot-reloadable — `backend`/`ttl_seconds` report `restart_required`, `strict` does not). `vault.backend: redis` closes the multi-replica window: admin writes publish `(tenant_id, provider)` on `{redis.prefix}:vault-invalidation` and every replica's listener task drops the cached entry **and its negative twin** (the cached "no key stored" answer that would keep routing the platform's key after another replica stored one) — best-effort both directions (failed publish / malformed message / Redis outage → the TTL backstop, listener backs off 5s). `GET /admin/vault` reports the honest state (enabled or the reason naming the env var, strict, backend, TTL) plus `admin_context` — the tenant a tenant admin manages, so the dashboard's Vault tab serves platform admins (tenant select) and tenant admins (pinned) alike; no secrets anywhere in the payload.
 
 Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` (the `postgres` extra, asyncpg) with no code changes — only async SQLAlchemy is used. JSON columns compile to JSONB on PostgreSQL via a shared variant type (`JSONColumn` in `models.py`), which keeps the budget-alert compare-and-swap meaningful there (semantic JSONB equality; plain `json` has no `=` operator); PostgreSQL engines also pre-ping pooled connections so server-side drops recycle instead of surfacing as 500s. The whole test suite runs against either backend — `GATEWAY_TEST_DATABASE_URL` points `conftest` at a live PostgreSQL server, where each test gets its own database (created and dropped around the run; the `VACUUM INTO` backup tests skip, and a test pins the `pg_dump`-pointing 400 refusal). Online backups stay SQLite-only by construction.
 
@@ -1888,7 +1926,7 @@ routing:
   breaker: {backend: redis}
 ```
 
-Keys are namespaced by the prefix and expire shortly after their window/TTL, so idle state cleans itself up (breaker hashes carry a TTL well beyond the cooldown). `check` is one pipelined round trip (plus an `HMGET` for TPM); multi-command steps run inside `MULTI`/`EXEC` transactions. If Redis is unavailable, the breaker fails *open* — `allow` routes anyway and record calls are dropped with a warning (the breaker is protection, not correctness); admin snapshots/reset surface the error instead of lying. Rolling your own backend still only requires the interface (`check` / `record_request` / `record_usage`, `get` / `put` / `clear`, and the async breaker facade) — `create_app(redis_client=...)` accepts an injected client.
+Keys are namespaced by the prefix and expire shortly after their window/TTL, so idle state cleans itself up (breaker hashes carry a TTL well beyond the cooldown). `check` is one pipelined round trip (plus an `HMGET` for TPM); multi-command steps run inside `MULTI`/`EXEC` transactions. If Redis is unavailable, the breaker fails *open* — `allow` routes anyway and record calls are dropped with a warning (the breaker is protection, not correctness); admin snapshots/reset surface the error instead of lying. Rolling your own backend still only requires the interface (`check` / `record_request` / `record_usage`, `get` / `put` / `clear`, and the async breaker facade) — `create_app(redis_client=...)` accepts an injected client. Tier 34 adds the BYOK vault to the same fleet story: `vault.backend: redis` makes every admin write publish `(tenant_id, provider)` on `{prefix}:vault-invalidation` (`RedisVaultInvalidator`, one listener task per process in the lifespan), so each replica drops its decrypted-key cache entry **and its negative twin** the moment the message lands instead of within `vault.ttl_seconds` — best-effort by design (a failed publish never fails the admin write; a malformed message is skipped loudly; a Redis outage backs the listener off 5s), the TTL the backstop, `memory` (default) the single-process shape.
 
 **Run against Postgres**: `GATEWAY_DATABASE_URL=postgresql+asyncpg://...`. Tables are created on startup by the same `create_all`.
 
@@ -2173,6 +2211,20 @@ tests/
 │                        call (per-candidate: keyed openai leg rides the
 │                        tenant's key, unkeyed azure fallback the platform's),
 │                        row/metric/hint observability
+├── test_byok_hardening.py  BYOK hardening (tier 34): vault.strict (403
+│                        byok_key_required refusal naming providers/model/
+│                        PUT path, baseline strict-off, keyed tenant rides
+│                        their key, platform callers untouched, dual-ladder
+│                        hot-reload contrast with restart_required==[vault],
+│                        the no-master-key footgun, unreadable fail-closed
+│                        through the filter, streaming + realtime in-band
+│                        refusal), /admin/vault (shape, tenant-admin pin,
+│                        disabled reason, 403 for data-plane keys), the
+│                        Redis invalidation (publish observed, two-replica
+│                        convergence on both store and delete directions
+│                        with the listener task run by hand, memory backend
+│                        wires nothing, malformed/failed-publish
+│                        best-effort units)
 ├── test_realtime.py     Realtime surface (tier 32): hand-rolled WSClient
 │                        (drives the app's websocket scope over ASGI —
 │                        accept handshake, event queues, close 1008) + a

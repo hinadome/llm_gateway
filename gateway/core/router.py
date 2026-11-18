@@ -37,6 +37,7 @@ from ..observability import metrics
 from .breaker import CircuitBreakerRegistry
 from .context import AuthContext
 from .cost import CostCalculator
+from .vault import ByokKeyRequiredError
 
 
 def _trace_retry(deployment: DeploymentConfig, attempt: int, error: str) -> None:
@@ -309,6 +310,67 @@ class Router:
             )
         return cfg
 
+    def _strict_on(self, auth: "AuthContext | None") -> bool:
+        """vault.strict applies to TENANT traffic only — platform
+        callers (auth None: admin/env machinery) and platform admins
+        (no tenant) ride the platform's configured keys, exactly as
+        before. Shadow mirrors and canary probes never reach this
+        check: they resolve through the sync ``_provider_cfg``
+        (platform machinery rides platform credentials by design)."""
+        return bool(
+            self.config.vault.strict
+            and auth is not None
+            and auth.tenant_id is not None
+        )
+
+    async def _strict_filter(
+        self,
+        deployments: list[DeploymentConfig],
+        auth: "AuthContext | None",
+    ) -> list[DeploymentConfig]:
+        """The vault.strict ladder filter (tier 34): keep only
+        deployments whose provider the caller's tenant has a stored
+        key for, so retries and fallbacks can never cross to an
+        unkeyed provider — a strict tenant's request either rides
+        THEIR credentials or fails. The lookup is the vault's cached
+        one (a dict read after the first miss); an entry that exists
+        but cannot be decrypted still raises byok_key_unreadable
+        (fail closed, unchanged). Returns the list untouched when
+        strict is off or the caller is not tenant-scoped."""
+        if not self._strict_on(auth):
+            return deployments
+        # No vault wired (only direct constructions): strict means
+        # nothing is keyed — an empty ladder, the honest refusal.
+        if self.vault is None or not self.vault.enabled:
+            return []
+        keyed: list[DeploymentConfig] = []
+        for deployment in deployments:
+            entry = await self.vault.get(auth.tenant_id, deployment.provider)
+            if entry is not None:
+                keyed.append(deployment)
+        return keyed
+
+    async def _enforce_strict(
+        self,
+        deployments: list[DeploymentConfig],
+        auth: "AuthContext | None",
+        model: str,
+    ) -> list[DeploymentConfig]:
+        """Strict wrapper for the ladder head: filter, then refuse —
+        with the exact providers to key — when nothing remains. The
+        breaker filter runs FIRST and keeps its own all-open rule (an
+        open-but-keyed deployment still serves; strict only removes
+        deployments, never re-adds them)."""
+        eligible = await self._strict_filter(deployments, auth)
+        if not eligible and self._strict_on(auth):
+            raise ByokKeyRequiredError(
+                tenant_id=auth.tenant_id,
+                tenant_name=auth.tenant_name,
+                model=model,
+                providers=sorted({d.provider for d in deployments}),
+            )
+        return eligible
+
     async def _resolve_provider_cfg(
         self,
         deployment: DeploymentConfig,
@@ -386,9 +448,16 @@ class Router:
         the BYOK vault, so a tenant's stored key follows the request
         through EVERY retry and fallback — the fallback may cross to a
         provider the tenant did not key, and that leg (alone) rides
-        the platform's credential (see _resolve_provider_cfg)."""
+        the platform's credential (see _resolve_provider_cfg).
+        vault.strict (tier 34) narrows the ladder FIRST: a strict
+        tenant's fallback never crosses to an unkeyed provider —
+        those deployments are removed before the walk, and an empty
+        ladder refuses with 403 byok_key_required (see
+        _enforce_strict)."""
         deployments = self.resolve(model, residencies)
         remaining = await self._available(deployments)
+        # vault.strict: only providers the tenant keyed may serve it.
+        remaining = await self._enforce_strict(remaining, auth, model)
         last_error: ProviderError | None = None
         tried: set[str] = set()
 
@@ -552,10 +621,14 @@ class Router:
         else — same fail-closed contract as ``_dispatch``. ``auth`` is
         the caller's snapshot: a tenant's BYOK key follows the request
         through every failover attempt (per-candidate resolution, the
-        same contract as ``_dispatch``).
+        same contract as ``_dispatch``), and vault.strict narrows the
+        ladder identically (unkeyed deployments removed before the
+        walk; an empty ladder refuses with 403 byok_key_required).
         """
         deployments = self.resolve(request.model, residencies)
         remaining = await self._available(deployments)
+        # vault.strict: only providers the tenant keyed may serve it.
+        remaining = await self._enforce_strict(remaining, auth, request.model)
         last_error: ProviderError | None = None
         tried: set[str] = set()
 

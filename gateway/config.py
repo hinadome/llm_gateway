@@ -476,12 +476,33 @@ class VaultConfig(BaseModel):
     ``ttl_seconds`` is how long a decrypted credential is cached in
     process memory per (tenant, provider): the hot path is a dict
     read, not a DB round trip. Admin writes invalidate the local
-    cache immediately; other replicas of a multi-process fleet see
-    writes within the TTL (and a key ROTATED OUT of the master-key
-    list simply starts failing decryption — fail closed — until
-    entries are re-stored).
+    cache immediately (and a key ROTATED OUT of the master-key list
+    simply starts failing decryption — fail closed — until entries
+    are re-stored).
+
+    ``backend`` selects how that invalidation crosses a
+    multi-process fleet: ``memory`` (per process — other replicas
+    converge within the TTL, the documented backstop) or ``redis``
+    (admin writes also PUBLISH an invalidation on a Redis channel and
+    every replica drops its cached entry — and its negative twin —
+    the moment the message lands; the TTL remains the backstop if a
+    message is lost). Infra-bound (a client + a listener task), so
+    changes report restart_required.
+
+    ``strict`` is the platform-economics stance: tenant traffic may
+    ONLY ride credentials the tenant stored — a deployment whose
+    provider the tenant has not keyed is removed from its routing
+    ladder entirely (retries and fallbacks stay within the tenant's
+    keyed providers), and a request whose every deployment is unkeyed
+    fails 403 byok_key_required naming the providers to key. Platform
+    callers (no tenant) and the platform's own machinery (shadow
+    mirrors, canary probes) are untouched. Fail-closed like the rest
+    of the vault: strict with no master key configured means tenant
+    traffic CANNOT run — set the master key before turning it on.
     """
 
+    backend: str = "memory"  # memory | redis (cache invalidation fan-out)
+    strict: bool = False
     ttl_seconds: int = 30
 
 

@@ -8,6 +8,49 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- BYOK hardening (tier 34) — three load-bearing additions to the
+  tenant-owned-credential vault:
+  - `vault.strict` — the platform-economics stance: tenant traffic may
+    ONLY ride credentials the tenant stored. The routing ladder for a
+    strict tenant is narrowed BEFORE the walk (deployments whose
+    provider the tenant has not keyed are removed — cached vault
+    lookups, so the hot path stays a dict read), which means retries
+    and fallbacks can never cross to an unkeyed provider; a model
+    whose every deployment is unkeyed refuses 403 `byok_key_required`,
+    naming the sorted provider list, the model and the exact
+    `PUT /admin/tenants/{id}/provider-keys/<provider>` path that fixes
+    it. Both ladder heads (buffered and streaming) and the realtime
+    connect-time ladder narrow identically — a realtime refusal is
+    delivered in-band (OpenAI-shaped error event + close 1008).
+    Platform callers (no tenant), platform admins and the platform's
+    own machinery (shadow mirrors, canary probes) are untouched;
+    undecryptable entries still fail closed (`byok_key_unreadable`)
+    through the filter. The stance reads live off the config per
+    request — hot-reloadable — while `vault.backend`/`ttl_seconds`
+    report `restart_required` (they build the service). Documented
+    footgun, made loud: strict with no master key means tenant traffic
+    cannot run at all.
+  - `vault.backend: redis` — cross-replica cache invalidation: admin
+    writes publish `{"tenant_id", "provider"}` on
+    `{redis.prefix}:vault-invalidation` and every replica's listener
+    task (one per process, in the lifespan) drops the named decrypted-
+    key cache entry and its NEGATIVE twin — the cached "no key
+    stored" answer that would otherwise keep routing the platform's
+    key for up to `ttl_seconds` after another replica stored one.
+    Best-effort by design: a failed publish never fails the admin
+    write, malformed messages are skipped loudly, Redis outages back
+    the listener off 5s, and the TTL remains the backstop. `memory`
+    (the default) keeps the single-process shape byte for byte.
+  - `GET /admin/vault` (admins) — the honest status surface the
+    dashboard needs: `enabled` or the `unavailable_reason` naming the
+    env var to set (never a value), the live `strict` stance, the
+    `invalidation_backend`, `ttl_seconds`, and `admin_context` — the
+    tenant a *tenant admin* manages (the only one the provider-key
+    endpoints let them touch); platform admins get null and pick from
+    the list. No secrets anywhere in the payload. The admin UI gains a
+    Vault tab (between Tenants and Prompts): status panel + the
+    credential manager for both admin kinds, key input type=password
+    cleared after every store, hints only ever shown.
 - MCP proxy — `POST /v1/mcp/{server}` (plus `DELETE` for session
   termination, `GET` answered 405), the sixth inbound surface and the
   first whose payload is not for the gateway's models at all: a

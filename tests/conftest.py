@@ -42,6 +42,7 @@ from gateway.config import (
     ProviderConfig,
     RoutingConfig,
     SemanticCacheConfig,
+    VaultConfig,
 )
 from gateway.db import dispose_engine, init_engine, reset_engine_for_tests
 from gateway.main import create_app
@@ -114,6 +115,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     runaway = cache_overrides.pop("runaway", None) or RunawayConfig()
     concurrency = cache_overrides.pop("concurrency", None) or ConcurrencyConfig()
     mcp = cache_overrides.pop("mcp", None) or MCPConfig()
+    vault = cache_overrides.pop("vault", None) or VaultConfig()
     cache = cache_overrides.pop("cache", None) or CacheConfig(
         enabled=True, ttl_seconds=300, max_entries=128
     )
@@ -181,6 +183,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         concurrency=concurrency,
         events=events,
         mcp=mcp,
+        vault=vault,
     )
     if redis_backends:
         config.cache.backend = "redis"

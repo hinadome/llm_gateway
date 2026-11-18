@@ -10,12 +10,13 @@ async def test_admin_ui_served_without_auth(env):
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/html")
     body = resp.text
-    # The shell renders the seven dashboard tabs and targets the JSON API.
+    # The shell renders the dashboard tabs and targets the JSON API.
     for marker in (
         "LLM Gateway",
         'id="tab-overview"',
         'id="tab-keys"',
         'id="tab-tenants"',
+        'id="tab-vault"',
         'id="tab-prompts"',
         'id="tab-logs"',
         'id="tab-routing"',

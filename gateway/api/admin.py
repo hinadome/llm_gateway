@@ -525,6 +525,42 @@ async def _vault_tenant_guard(
     return tenant
 
 
+@router.get("/admin/vault")
+async def vault_status(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """The BYOK vault at a glance (tier 34): enabled or the honest
+    reason it is not, the strict stance, the cache TTL and the
+    invalidation backend. No secrets anywhere in the payload — the
+    unavailable reason names the missing SETTING, never a value.
+
+    ``admin_context`` tells the dashboard which tenant a *tenant
+    admin* manages (their own — the only one the provider-key
+    endpoints let them touch), so the Vault tab works for both admin
+    kinds; platform admins get null and pick a tenant from the list.
+    """
+    vault: VaultService = raw_request.app.state.vault
+    config = raw_request.app.state.config
+    return {
+        "enabled": vault.enabled,
+        "unavailable_reason": (
+            None if vault.enabled else vault.unavailable_reason
+        ),
+        "strict": config.vault.strict,
+        "ttl_seconds": config.vault.ttl_seconds,
+        "invalidation_backend": config.vault.backend,
+        "admin_context": (
+            None
+            if admin.tenant_id is None
+            else {
+                "tenant_id": admin.tenant_id,
+                "tenant_name": admin.tenant_name,
+            }
+        ),
+    }
+
+
 @router.get("/admin/tenants/{tenant_id}/provider-keys")
 async def list_provider_keys(
     tenant_id: str,

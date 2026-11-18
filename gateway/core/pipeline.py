@@ -986,6 +986,15 @@ class GatewayPipeline:
                         "invalid_request_error",
                         code="realtime_unavailable",
                     )
+                # vault.strict (tier 34): the same ladder narrowing as
+                # HTTP, at the one point a realtime session routes — a
+                # strict tenant's session may only open on a provider
+                # it keyed. The refusal raises ByokKeyRequiredError,
+                # which this surface delivers in-band (error event +
+                # close 1008) exactly like every other gate.
+                capable = await self.router._enforce_strict(
+                    capable, auth, ctx.model
+                )
 
                 # Connect-time failover: walk the ladder, first
                 # handshake that accepts wins. The session then stays
@@ -3336,6 +3345,7 @@ class GatewayPipeline:
                 "metrics",
                 "alerts",
                 "audit",
+                "vault",
             )
             if getattr(config, field) != getattr(self.config, field)
         ]

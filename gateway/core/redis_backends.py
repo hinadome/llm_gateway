@@ -37,7 +37,10 @@ The pipeline depends only on the method interfaces (check /
 record_request / record_usage, get / put / clear, and the async breaker
 facade), so selecting backends is a one-line config change
 (``rate_limit.backend: redis``, ``cache.backend: redis``,
-``routing.breaker.backend: redis``) — see ``main.py``.
+``routing.breaker.backend: redis``) — see ``main.py``. Tier 34 adds
+``RedisVaultInvalidator``, the BYOK vault's cache-invalidation fan-out
+(``vault.backend: redis``): publish-on-write + a per-replica subscriber
+loop, both best-effort with the vault TTL as the backstop.
 """
 
 from __future__ import annotations
@@ -462,9 +465,128 @@ class RedisCircuitBreakerRegistry:
         }
 
 
+class RedisVaultInvalidator:
+    """Cross-replica cache invalidation for the BYOK vault (tier 34).
+
+    The vault's decrypted-key cache (and its negative twin) is
+    per-process by design — process memory is the trust boundary the
+    master key already lives in. With ``vault.backend: redis``, every
+    admin write (``VaultService.put`` / ``.delete``) fires this
+    object's ``publish`` and every replica's ``listen()`` loop drops
+    the named entry the moment the message lands, instead of serving
+    it — or serving "absent", the negative cache — for up to
+    ``vault.ttl_seconds`` more.
+
+    Both directions are best-effort and never fail the admin write:
+    a failed publish only slows convergence back to the TTL (the
+    documented backstop), and a lost or malformed message is skipped
+    with a warning. Delivery is at-most-once per replica: dropping an
+    entry twice is a no-op, so self-delivery (the writing replica is
+    also subscribed) is harmless — its entry was already dropped
+    locally before the publish.
+
+    The listener reconnects on Redis errors with a short backoff:
+    invalidation is a liveness optimization, so the loop treats
+    outages as "converge via TTL for a while" rather than crashing
+    the process.
+    """
+
+    def __init__(self, client: aioredis.Redis, channel: str) -> None:
+        self._client = client
+        self._channel = channel
+        # The vault whose cache entries the listener drops. Bound
+        # after construction (the vault is built with this object's
+        # ``publish`` as its invalidation callback — the two hold each
+        # other, so one link is wired by hand in main.py).
+        self._vault: Any | None = None
+
+    def bind(self, vault: Any) -> None:
+        """Attach the vault this listener invalidates."""
+        self._vault = vault
+
+    async def publish(self, tenant_id: str, provider: str) -> None:
+        """Announce one (tenant, provider) invalidation to the fleet.
+        Never raises: the local drop has already happened, and other
+        replicas converge within the TTL when this fails."""
+        payload = json.dumps({"tenant_id": tenant_id, "provider": provider})
+        try:
+            await self._client.publish(self._channel, payload)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "vault invalidation publish failed for (%s, %s) — "
+                "replicas converge within ttl_seconds",
+                tenant_id,
+                provider,
+                exc_info=True,
+            )
+
+    async def listen(self) -> None:
+        """The subscriber loop (one background task per process).
+
+        Runs forever; cancelled by shutdown. Malformed payloads are
+        skipped with a warning (a foreign publisher on the channel
+        must not wedge the loop); Redis outages reconnect after a
+        short backoff.
+        """
+        import asyncio
+
+        if self._vault is None:
+            return
+        while True:
+            pubsub = self._client.pubsub()
+            try:
+                await pubsub.subscribe(self._channel)
+                while True:
+                    message = await pubsub.get_message(timeout=1.0)
+                    if message is None or message.get("type") != "message":
+                        continue
+                    self._apply(message.get("data"))
+            except asyncio.CancelledError:
+                try:
+                    await pubsub.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "vault invalidation listener error — reconnecting in 5s "
+                    "(replicas converge via ttl_seconds meanwhile)",
+                    exc_info=True,
+                )
+                try:
+                    await pubsub.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(5.0)
+
+    def _apply(self, data: Any) -> None:
+        """Drop the named local cache entry. A malformed or foreign
+        payload is skipped loudly — never a crash, never a
+        wrong-credential risk (an unparseable name simply matches
+        nothing)."""
+        try:
+            if isinstance(data, (bytes, bytearray, str)):
+                payload = json.loads(data)
+            else:
+                payload = data
+            if not isinstance(payload, dict):
+                raise ValueError("not a JSON object")
+            tenant_id = payload["tenant_id"]
+            provider = payload["provider"]
+            if not isinstance(tenant_id, str) or not isinstance(provider, str):
+                raise ValueError("tenant_id/provider must be strings")
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "vault invalidation listener: skipping malformed message %r", data
+            )
+            return
+        self._vault.invalidate(tenant_id, provider)
+
+
 __all__ = [
     "RedisCircuitBreakerRegistry",
     "RedisRateLimiter",
     "RedisResponseCache",
+    "RedisVaultInvalidator",
     "cache_key_for",
 ]

@@ -176,6 +176,7 @@
   <button data-tab="overview" class="active">Overview</button>
   <button data-tab="keys">Keys</button>
   <button data-tab="tenants">Tenants</button>
+  <button data-tab="vault">Vault</button>
   <button data-tab="prompts">Prompts</button>
   <button data-tab="logs">Request logs</button>
   <button data-tab="routing">Routing &amp; breakers</button>
@@ -236,6 +237,28 @@
         </div>
       </div>
       <div style="overflow-x:auto"><table id="tenants-table"></table></div>
+    </div>
+  </section>
+
+  <!-- BYOK vault: tenant-owned provider credentials -->
+  <section class="tab" id="tab-vault">
+    <div class="panel">
+      <div class="ph">Vault status
+        <div class="right"><span class="muted" style="font-weight:400;font-size:12px">tenant-owned provider credentials &middot; Fernet-encrypted at rest &middot; this dashboard never sees a key, only its hint (&bull;&bull;&bull;&bull;1234)</span></div>
+      </div>
+      <div id="vault-status" class="muted" style="padding:8px 2px">Loading…</div>
+    </div>
+    <div class="panel">
+      <div class="ph">Provider credentials
+        <div class="right"><select id="vault-tenant" style="max-width:220px"></select></div>
+      </div>
+      <div class="pb toolbar" id="vault-toolbar">
+        <input id="vault-provider" placeholder="provider (config.yaml slug, e.g. openai)" class="mono" style="width:240px">
+        <input id="vault-label" placeholder="label (optional)" style="width:180px">
+        <input id="vault-key" type="password" placeholder="provider API key — stored encrypted, shown back as a hint only" style="flex:1;min-width:220px">
+        <button class="primary small" id="btn-vault-put">Store / replace</button>
+      </div>
+      <div style="overflow-x:auto"><table id="vault-table"></table></div>
     </div>
   </section>
 
@@ -499,6 +522,8 @@ const state = {
   openPrompt: null,       // expanded prompt-library name
   platformAdmin: null,    // null = not probed yet; set at sign-in
   tenantNames: {},        // tenant id -> slug (name badges, selects)
+  vaultTenant: null,      // tenant id selected on the Vault tab (null = none yet)
+  vaultAdminContext: null, // tenant admin's own tenant (from /admin/vault; null = platform admin)
 };
 
 // ---------- helpers ----------------------------------------------------
@@ -649,6 +674,7 @@ async function refresh() {
     if (state.tab === "overview") await loadOverview();
     else if (state.tab === "keys") await loadKeys();
     else if (state.tab === "tenants") await loadTenants();
+    else if (state.tab === "vault") await loadVault();
     else if (state.tab === "prompts") await loadPrompts();
     else if (state.tab === "logs") await loadLogs();
     else if (state.tab === "routing") await loadRouting();
@@ -1069,6 +1095,106 @@ $("#tenants-table").addEventListener("click", async e => {
     } catch (err) { toast(err.message, true); }
   }
 });
+
+// ---------- vault --------------------------------------------------------
+
+// The BYOK vault tab: status + the per-tenant credential manager.
+// Works for both admin kinds — a platform admin picks any tenant from
+// the select; a tenant admin is pinned to their own (admin_context
+// from /admin/vault, which also carries the honest disabled/strict
+// state). The key input is type=password and cleared after every
+// store; the API only ever echoes a hint back.
+async function loadVault() {
+  const status = await api("/admin/vault");
+  state.vaultAdminContext = status.admin_context || null;
+
+  // Status line: enabled badge (or the honest reason), the strict
+  // stance, the invalidation backend and the cache TTL.
+  const enabled = status.enabled
+    ? '<span class="b b-green" title="GATEWAY_VAULT_MASTER_KEY is set and the encryption package imports">enabled</span>'
+    : '<span class="b b-red">disabled</span> <span class="muted" style="font-size:12px">' +
+      esc(status.unavailable_reason || "") + " — reads stay empty, stores are refused 400, tenant traffic rides the platform's configured keys.</span>";
+  const strict = status.strict
+    ? ' <span class="b b-purple" title="vault.strict: a tenant\'s routing ladder only contains providers it keyed — an unkeyed model refuses with 403 byok_key_required. Platform callers and the platform\'s own machinery (shadow mirrors, canary probes) are untouched.">strict</span>'
+    : ' <span class="b b-gray" title="Tenants without a stored key ride the platform\'s configured keys (the tier-31 default)">strict off</span>';
+  const backend = status.invalidation_backend === "redis"
+    ? ' <span class="b b-blue" title="Admin writes publish an invalidation on Redis; every replica drops its cached entry immediately. The TTL is the backstop.">redis invalidation</span>'
+    : ' <span class="b b-gray" title="Per-process cache; other replicas converge within the TTL">memory invalidation</span>';
+  $("#vault-status").innerHTML = enabled + strict + backend +
+    ' <span class="muted" style="font-size:12px">&middot; decrypted-key cache TTL ' + status.ttl_seconds + "s</span>";
+
+  // Which tenant the manager edits: tenant admins are pinned to
+  // their own; platform admins pick from the list.
+  let tenantId;
+  const sel = $("#vault-tenant");
+  if (status.admin_context) {
+    tenantId = status.admin_context.tenant_id;
+    sel.style.display = "none";
+  } else {
+    sel.style.display = "";
+    const ids = Object.keys(state.tenantNames)
+      .sort((a, b) => state.tenantNames[a].localeCompare(state.tenantNames[b]));
+    if (!ids.length) {
+      sel.innerHTML = '<option value="">— no tenants —</option>';
+      $("#vault-table").innerHTML =
+        "<tbody><tr><td class='empty'>Create a tenant first (Tenants tab), then store its provider credentials here.</td></tr></tbody>";
+      return;
+    }
+    if (!state.vaultTenant || !ids.includes(state.vaultTenant)) state.vaultTenant = ids[0];
+    tenantId = state.vaultTenant;
+    sel.innerHTML = ids
+      .map(id => `<option value="${esc(id)}"${id === tenantId ? " selected" : ""}>${esc(state.tenantNames[id])}</option>`)
+      .join("");
+  }
+
+  // Credential rows: provider, label, hint, timestamps, delete.
+  const list = await api(`/admin/tenants/${encodeURIComponent(tenantId)}/provider-keys`).catch(() => null);
+  const rows = ((list && list.data) || []).map(k => `<tr>
+      <td class="mono"><b>${esc(k.provider)}</b></td>
+      <td>${k.label ? esc(k.label) : '<span class="muted">—</span>'}</td>
+      <td class="mono">${esc(k.key_hint)}</td>
+      <td class="muted" style="font-size:12px">${fmtWhen(k.updated_at || k.created_at)}</td>
+      <td style="white-space:nowrap"><button class="small danger" data-vdel="${esc(k.provider)}">Delete</button></td>
+    </tr>`).join("");
+  $("#vault-table").innerHTML =
+    "<thead><tr><th>Provider</th><th>Label</th><th>Key hint</th><th>Updated</th><th></th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="5" class="empty">No credentials stored — everything this tenant sends bills the platform\'s provider accounts.</td></tr>') +
+    "</tbody>";
+}
+
+$("#vault-tenant").addEventListener("change", e => { state.vaultTenant = e.target.value; loadVault(); });
+
+$("#btn-vault-put").addEventListener("click", async () => {
+  const tenantId = state.vaultAdminContext ? state.vaultAdminContext.tenant_id : state.vaultTenant;
+  const provider = $("#vault-provider").value.trim();
+  const key = $("#vault-key").value.trim();
+  const label = $("#vault-label").value.trim() || null;
+  if (!tenantId || !provider || !key) { toast("Pick a tenant, and fill provider + key", true); return; }
+  try {
+    const meta = await api(
+      `/admin/tenants/${encodeURIComponent(tenantId)}/provider-keys/${encodeURIComponent(provider)}`,
+      { method: "PUT", body: JSON.stringify({ key, label }) });
+    $("#vault-key").value = ""; // never keep the secret around
+    toast(`Stored '${provider}' — hint ${meta.key_hint}`);
+    loadVault();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#vault-table").addEventListener("click", async e => {
+  const del = e.target.closest("button[data-vdel]");
+  if (!del) return;
+  const provider = del.dataset.vdel;
+  const tenantId = state.vaultAdminContext ? state.vaultAdminContext.tenant_id : state.vaultTenant;
+  if (!confirm(`Delete the stored '${provider}' credential? Requests from this tenant ride the platform's key for that provider from the next request.`)) return;
+  try {
+    await api(
+      `/admin/tenants/${encodeURIComponent(tenantId)}/provider-keys/${encodeURIComponent(provider)}`,
+      { method: "DELETE" });
+    toast(`'${provider}' credential deleted`);
+    loadVault();
+  } catch (err) { toast(err.message, true); }
+});
+
 
 function openTenantDialog(t) {
   state.editingTenant = t ? t.id : null;
