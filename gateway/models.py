@@ -217,6 +217,17 @@ class RequestLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[str] = mapped_column(String(64), index=True)
     key_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # The calling virtual key's id (NULL for admin-key traffic and rows
+    # written before the column existed). The replay harness resolves
+    # the *current* key row by id when re-executing captured requests —
+    # names are unique today, but ids are the exact-caller identity.
+    key_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # Which inbound surface served the request ("chat" | "responses" |
+    # "messages" | "gemini"; NULL for batch lines and rows written
+    # before the column existed). Guardrail route scoping matches on
+    # this, so the replay harness re-executes each captured request on
+    # its original surface.
+    route: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # The tenant the calling key belonged to (NULL = platform key / no
     # tenant — also admin-key requests, which carry no key row). Copied
     # from the auth snapshot so per-tenant queries never join.

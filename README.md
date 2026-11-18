@@ -46,6 +46,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Synthetic canary probes** | A background loop sends a tiny chat request straight to every configured deployment's provider on a schedule (`canary:` config, disabled by default) — upstream health is *measured*, not inferred from traffic. Direct adapter calls: no pipeline, no log rows, no spend, no breaker accounting. `GET /admin/canaries` fleet view, `POST /admin/canaries/probe` for on-demand waves; `canary.failed` / `canary.recovered` events; `gateway_canary_probes_total{deployment,provider,outcome}` (see [Canary probes](#canary-probes)) |
 | **PII/secret scan** | On-demand audit over *stored* request bodies (`GET /admin/pii-scan` bulk, `GET /admin/logs/{id}/pii-scan` per row): the log keeps the original as received, so this is where exposure actually shows — clients paste API keys into prompts; guardrails may be off or only masking the upstream copy. Detectors mirror the `pii_redaction` guardrail plus jwt/private-key shapes, extendable via `pii_scan.extra_patterns`; findings are kind + count only, never the matched text (see [PII scan](#pii-scan)) |
 | **Idempotency keys** | Retry-safe chat completions: send an `Idempotency-Key` header on any chat-family surface (OpenAI chat, `/v1/responses`, native Anthropic/Gemini) and retried POSTs replay the stored successful response instead of re-executing — no double generation, no double billing (replays are zero-cost `cache_hit` log rows, `X-Gateway-Cache: IDEMPOTENT`). Only successes are stored; key reuse with different parameters is a 400; in-flight duplicates wait for the original. Same backend selection as the response cache, namespaced apart (see [Idempotency](#idempotency)) |
+| **Capture-replay harness** | Config-change safety net built on the request log: `GET /admin/logs/export` captures real traffic as JSONL (bodies + the recorded baseline: caller, route, model, status, deployment, guardrail verdicts), `POST /admin/replay` re-executes those requests through the request-policy phases ONLY — resolution, prompt policy, permissions, guardrails, routing selection — with no upstream calls, no counters, no spend, no log rows, then **diffs** each line against the record. Replays run as the recorded caller's *current* key (edited/revoked keys replay under what they are *now* — a revoked key shows up as would-now-401), guardrail counters are suppressed so a harness run can never trip block alerts, and tenant admins replay only their own tenant's traffic (see [Capture-replay harness](#capture-replay-harness)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model |
@@ -476,6 +477,61 @@ guardrails:
 - **Scope**: every chat-family surface (`/v1/chat/completions`, `/v1/responses`, native `/v1/messages`, native Gemini) — blocked requests 400 pre-dispatch, streams included; embeddings/images/audio are unaffected. Like any guardrail it composes with observe mode, scoping and per-key `disabled_guardrails`.
 
 14 tests pin the contract (`tests/test_context_window.py`).
+
+## Capture-replay harness
+
+Every hot reload changes policy. Today you eyeball the YAML, apply it, and hope. The harness closes the loop: the request log already records real traffic (bodies, caller, route, guardrail verdicts, routing, outcome) — **capture** that traffic, **replay** it against a candidate config, and **read the diff** before clients ever see it.
+
+```bash
+# 1. Capture: the replayable request log as JSONL (rows with stored
+#    bodies; shadow mirrors excluded; same filters as /admin/logs)
+curl -H "Authorization: Bearer $ADMIN_KEY" \
+  "http://localhost:8000/admin/logs/export?status=success&limit=100" > capture.jsonl
+
+# 2. Apply the candidate config (hot reload) — or don't: replay works
+#    against whatever is live.
+
+# 3. Replay + diff: re-executes each captured request through the
+#    request-policy phases ONLY, as the recorded caller's CURRENT key.
+curl -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"entries\": $(cat capture.jsonl | python3 -c 'import sys,json; print(json.dumps([json.loads(l) for l in sys.stdin]))')}" \
+  http://localhost:8000/admin/replay
+```
+
+The report, one result per line plus a summary:
+
+```json
+{
+  "replayed": 100, "changed": 2, "unchanged": 95, "not_comparable": 3, "errors": 0,
+  "results": [
+    {
+      "result": "changed",              // changed | unchanged | not_comparable | error
+      "changes": ["status", "guardrail_actions"],
+      "predicted": {                    // what the CURRENT config would do
+        "model": "test-model", "status": "blocked",
+        "guardrail_actions": [{"guardrail": "keyword_blocklist", "phase": "request", "action": "block"}],
+        "prompt_policy_applied": true,  // reported, not diffed
+        "deployments": ["openai/primary", "openai/fallback"],  // priority ladder, no dispatch
+        "error": {"code": "content_blocked", "message": "..."}
+      },
+      "recorded": { "model": "test-model", "status": "success", "deployment": "openai/primary", "guardrail_actions": [] }
+    }
+  ]
+}
+```
+
+What a replay is — and deliberately isn't:
+
+- **Policy only, no execution.** Each captured request runs the *exact* code a live one does for policy — model resolution, prompt policy, permissions, the request-phase guardrails, redirect re-validation, routing selection (the priority ladder; weighted tiers pick randomly, so membership is the honest signal, not the single pick). No upstream call, no rate-limit/budget/idempotency counters (a retry would hit them; a replay must not), no cache, no spend, no request-log row, no lifecycle events.
+- **Dry-run means invisible.** Guardrail verdicts are recorded on the replay result but never touch `gateway_guardrail_blocks_total` / `..._observed_total` — a harness run can never trip block alerts. Line outcomes count on `gateway_replay_total{result}`.
+- **The caller is replayed at their *current* policy.** The key row is re-loaded fresh: a key edited or revoked since the capture replays under what it is *now* — a revoked key surfaces as `changed` (would now 401). That's the regression you're hunting.
+- **Honest comparability.** Rows recorded as `error` export with a `skip_reason` (their outcome was upstream/counter state a dry run cannot re-run) and produce a prediction but no diff. Entries with no virtual-key identity — bare requests, admin-key captures — replay as the *calling* admin's context. Entries from another tenant are skipped (`entry belongs to another tenant`) — tenant admins replay only their own traffic, the same boundary as everywhere else.
+- **The diff compares what policy decides**: status, model, request-phase guardrail verdicts (response/stream-phase verdicts can't be predicted — the replay stops at the request phase), deployment-ladder membership. Prompt-policy application is *reported* (`prompt_policy_applied`) rather than diffed, since the record predates it.
+
+Config lives in the `replay:` section: `enabled` (default true — `POST /admin/replay` answers 404 `replay_disabled` when false) and `max_entries` (default 500, a 400 beyond — sample traffic, don't re-execute history). Both are read live off the running config.
+
+16 tests pin the contract (`tests/test_replay.py`).
 
 ## Architecture
 

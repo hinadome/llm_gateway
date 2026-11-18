@@ -57,6 +57,8 @@ class LoggingService:
             log = RequestLog(
                 request_id=ctx.request_id,
                 key_name=ctx.auth.key_name,
+                key_id=ctx.auth.key_id,
+                route=ctx.route,
                 tenant_id=ctx.auth.tenant_id,
                 model=ctx.model,
                 provider=ctx.provider,

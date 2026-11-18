@@ -8,6 +8,50 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Capture-replay harness: a config-change safety net built on the
+  request log. GET /admin/logs/export captures the replayable traffic
+  as JSONL (rows with stored bodies; shadow mirrors excluded; same
+  scoping/filters as /admin/logs) with each line's recorded baseline —
+  caller identity, inbound route, model, status, deployment, guardrail
+  verdicts, plus comparable/skip_reason. POST /admin/replay re-executes
+  captured requests through the request-policy phases ONLY — model
+  resolution, prompt policy, permissions, request-phase guardrails,
+  redirect re-validation, routing selection (the priority ladder, no
+  dispatch) — then diffs each line against the record: changed lines
+  are what the current config would change about that traffic. Replays
+  are dry runs: no upstream calls, no rate-limit/budget/idempotency
+  counters, no cache, no spend, no request-log rows, no lifecycle
+  events — and ctx.dry_run suppresses the guardrail enforcement/
+  observed counters in the manager, so a harness run can never trip
+  block alerts. Line outcomes count on
+  gateway_replay_total{result=changed|unchanged|not_comparable|error}.
+  The caller is replayed at their CURRENT policy — the key row is
+  re-loaded fresh, so keys edited or revoked since the capture surface
+  as findings (would now 401) rather than being assumed to still work;
+  entries with no virtual-key identity (bare requests, admin-key
+  captures) replay as the calling admin's context; tenant admins skip
+  other tenants' traffic ("entry belongs to another tenant").
+  Comparability is honest: rows recorded as error predict but don't
+  diff (upstream/counter outcomes are state, not policy), response-/
+  stream-phase verdicts are not compared (replay stops at the request
+  phase), auth-rejection predictions flag status only (model is None),
+  and prompt-policy application is reported
+  (prompt_policy_applied) rather than diffed. To make replay run the
+  exact policy code live traffic does, steps 0-1 and 4-4.5 were
+  extracted from GatewayPipeline._handle into shared helpers
+  (_prepare_request_policy / _apply_request_guardrails) used by both
+  paths (extraction is behavior-neutral — the full suite pins it).
+  RequestLog gains key_id (the exact calling key) and route (the
+  inbound surface) columns — nullable, auto-upgrade adds them —
+  persisted by the logging service; /admin/logs gains a ?key_id=
+  filter. config.yaml: a replay: section (enabled — POST /admin/replay
+  answers 404 replay_disabled when false — and max_entries, default
+  500, a 400 beyond; both read live off the running config, so hot
+  reload applies). 16 new tests (tests/test_replay.py).
+  Implementation note: export filters NULL bodies in Python, not SQL —
+  SQLAlchemy's JSON type stores Python None as the literal string
+  'null' on SQLite, so an IS NOT NULL filter would diverge between
+  the SQLite and PostgreSQL/JSONB variants.
 - Context-window management: declare `context_window` (total tokens,
   input + output) once per public model and the `context_window`
   guardrail fits incoming requests to it *before* they burn upstream

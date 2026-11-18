@@ -149,6 +149,12 @@ class RequestContext:
     # a guardrail redirects (4.5). Read by the context_window
     # guardrail; None = the model is unmanaged.
     context_window: int | None = None
+    # True only in replay-harness executions (POST /admin/replay):
+    # the guardrail manager suppresses its enforcement/observed
+    # counters so would-be verdicts never pollute live alert
+    # metrics; verdicts still land in guardrail_actions (the replay
+    # result is built from them). Never set on client traffic.
+    dry_run: bool = False
     # OpenTelemetry span for this request (None when tracing is disabled)
     otel_span: "Span | None" = None
     # Trace correlation ids (hex strings; None when tracing is disabled)

@@ -433,3 +433,15 @@ class PromptPatchRequest(BaseModel):
     candidate: bool | None = None
     ab_fraction: float | None = None
     notes: str | None = Field(default=None, max_length=500)
+
+
+class ReplayRequest(BaseModel):
+    """POST /admin/replay — capture lines (GET /admin/logs/export
+    output, or a JSONL of it parsed into a list) re-executed against
+    the current config. Each entry needs ``request_body``; the
+    recorded fields a capture line also carries (key identity, status,
+    model, deployment, guardrail verdicts, route) enable the diff.
+    A bare chat request works too — it replays blind (prediction, no
+    diff)."""
+
+    entries: list[dict] = Field(min_length=1)

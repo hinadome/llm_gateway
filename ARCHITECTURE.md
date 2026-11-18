@@ -241,7 +241,16 @@ gateway/
 │                           versions, activate/candidate/fraction patch, delete —
 │                           every mutation audited), logs (list omits
 │                           bodies, /admin/logs/{id} returns
-│                           them in full; tenant scoping forced for tenant
+│                           them in full; ?key_id= filter beside key_name
+│                           — the replay harness pins exact callers by it;
+│                           GET /admin/logs/export streams the replayable
+│                           rows as JSONL — the capture leg of the
+│                           capture-replay harness, same scoping/filters,
+│                           shadow mirrors and bodiless rows excluded,
+│                           each line carrying the recorded baseline +
+│                           comparable/skip_reason; POST /admin/replay is
+│                           the replay+diff leg — see core/replay.py;
+│                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
 │                           filters + GET /admin/feedback/stats — overall /
@@ -276,6 +285,14 @@ gateway/
 ├── core/                   ── Policy & orchestration (framework-agnostic; no FastAPI types) ──
 │   ├── pipeline.py         GatewayPipeline: the chat request lifecycle (see §5) + the
 │   │                       embeddings path (same pre-flight checks, no guardrails);
+│   │                       steps 0-1 (model resolution + window, prompt
+│   │                       policy, permissions) and 4-4.5 (request-phase
+│   │                       guardrails + redirect re-validation) live in
+│   │                       shared helpers — _prepare_request_policy /
+│   │                       _apply_request_guardrails — that both _handle
+│   │                       and the replay harness's replay_request call,
+│   │                       so a replayed request passes through the exact
+│   │                       policy code a live one does;
 │   │                       _serve_simple is the shared wrapper for every non-chat
 │   │                       surface (embeddings, images, audio: context, in-flight
 │   │                       metric, span, error-path logging — streaming-aware, like
@@ -558,6 +575,39 @@ gateway/
 │   │                       non-streams, and the stream finally. The
 │   │                       in-flight map is in-process: cross-replica
 │   │                       Redis dedups completed entries only
+│   ├── replay.py           Capture-replay harness (the config-change
+│   │                       safety net): /admin/logs/export *is* the
+│   │                       capture (request-log rows with stored
+│   │                       bodies as JSONL, shadow rows excluded,
+│   │                       plus the recorded baseline — key identity,
+│   │                       route, model, status, deployment, guardrail
+│   │                       verdicts; key_id/route are new RequestLog
+│   │                       columns, auto-upgrade adds them). This
+│   │                       module re-executes each captured request
+│   │                       via pipeline.replay_request — the shared
+│   │                       _prepare_request_policy/_apply_request_
+│   │                       guardrails helpers (steps 0-1 + 4-4.5,
+│   │                       extracted from _handle so replay runs the
+│   │                       *exact* policy code live traffic does) —
+│   │                       with no upstream calls, counters, cache,
+│   │                       spend, log rows or lifecycle events, as
+│   │                       the recorded caller's CURRENT key (row
+│   │                       re-loaded fresh: deleted/revoked/expired
+│   │                       keys surface as would-now-401 findings;
+│   │                       bare/admin-key entries replay as the
+│   │                       calling admin; tenant admins skip other
+│   │                       tenants' traffic). ctx.dry_run suppresses
+│   │                       guardrail counter increments in the
+│   │                       manager's _record, so a harness run can
+│   │                       never trip block alerts. The per-line diff
+│   │                       compares status, model, request-phase
+│   │                       verdicts (response/stream verdicts are
+│   │                       unpredictable — replay stops at the
+│   │                       request phase) and deployment-ladder
+│   │                       membership; error-recorded rows are
+│   │                       exported but not comparable (their
+│   │                       outcome was state, not policy); outcomes
+│   │                       count on gateway_replay_total{result}.
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -1701,14 +1751,14 @@ Three pillars, all wired from `create_app` and all testable in-process:
 | Pillar | Status | Where |
 |---|---|---|
 | **Metrics** | Always on — Prometheus, 24 series at `/metrics` (per-key family opt-in); optional OTLP mirror | `observability/metrics.py`, `observability/metrics_bridge.py` |
-| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`); optional JSON stdout + OTel logs pipeline; wire capture: allowlisted client request headers, the upstream request as sent to the provider and allowlisted provider response headers; streamed rows carry `ttft_ms` (time-to-first-token) and the derived decode rate | `core/logging_svc.py`, `observability/logs.py`, `observability/wire.py` |
+| **Logs** | Always on — one `RequestLog` row per request (now with `trace_id`/`span_id`, and `key_id`/`route` — the exact-caller + inbound-surface columns the capture-replay harness pins replays by); optional JSON stdout + OTel logs pipeline; wire capture: allowlisted client request headers, the upstream request as sent to the provider and allowlisted provider response headers; streamed rows carry `ttft_ms` (time-to-first-token) and the derived decode rate | `core/logging_svc.py`, `observability/logs.py`, `observability/wire.py` |
 | **Traces** | Opt-in (`GATEWAY_OTEL_ENABLED=true`) — OpenTelemetry, W3C propagation, configurable sampling & batching | `observability/tracing.py` |
 
 A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, Prometheus with alert rules, Grafana dashboard) ships in `deploy/` — see §10.5.
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_pii_scan_findings_total{kind}` (scanned request-log rows whose stored bodies matched a PII/secret detector kind) · `gateway_idempotency_total{outcome}` (Idempotency-Key outcomes: replayed / stored / rejected) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_pii_scan_findings_total{kind}` (scanned request-log rows whose stored bodies matched a PII/secret detector kind) · `gateway_idempotency_total{outcome}` (Idempotency-Key outcomes: replayed / stored / rejected) · `gateway_replay_total{result}` (capture-replay harness line outcomes: changed / unchanged / not_comparable / error — POST /admin/replay; guardrail enforcement counters are suppressed during replay, so harness runs never touch `gateway_guardrail_blocks_total`) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 

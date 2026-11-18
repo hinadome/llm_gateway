@@ -91,6 +91,13 @@ IDEMPOTENCY = Counter(
     ["outcome"],
 )
 
+REPLAY = Counter(
+    "gateway_replay_total",
+    "Capture-replay harness line outcomes (POST /admin/replay): "
+    "changed / unchanged / not_comparable / error.",
+    ["result"],
+)
+
 TTFT = Histogram(
     "gateway_stream_ttft_seconds",
     "Time from request start to the first streamed chunk delivered to the client.",

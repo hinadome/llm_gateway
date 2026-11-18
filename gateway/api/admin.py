@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from sqlalchemy import func, select
 
 from ..core.alerts import BudgetAlertManager
 from ..core.context import AuthContext
 from ..core.prompt_library import PromptLibrary
+from ..core.replay import replay_entries
 from ..db import get_sessionmaker
 from ..errors import GatewayError
 from ..models import Feedback, RequestLog, Tenant, VirtualKey
@@ -25,6 +32,7 @@ from ..schemas import (
     KeyUpdateRequest,
     PromptCreateRequest,
     PromptPatchRequest,
+    ReplayRequest,
     TenantCreateRequest,
     TenantUpdateRequest,
 )
@@ -603,6 +611,8 @@ def _log_row(row: RequestLog) -> dict:
         "id": row.id,
         "request_id": row.request_id,
         "key_name": row.key_name,
+        "key_id": row.key_id,
+        "route": row.route,
         "tenant_id": row.tenant_id,
         "model": row.model,
         "provider": row.provider,
@@ -638,6 +648,7 @@ async def list_logs(
     offset: int = Query(0, ge=0),
     status: str | None = None,
     key_name: str | None = None,
+    key_id: str | None = None,
     model: str | None = None,
     request_id: str | None = None,
     trace_id: str | None = None,
@@ -657,6 +668,8 @@ async def list_logs(
             stmt = stmt.where(RequestLog.status == status)
         if key_name:
             stmt = stmt.where(RequestLog.key_name == key_name)
+        if key_id:
+            stmt = stmt.where(RequestLog.key_id == key_id)
         if model:
             stmt = stmt.where(RequestLog.model == model)
         if request_id:
@@ -670,6 +683,125 @@ async def list_logs(
         rows = result.scalars().all()
         data = [_log_row(row) for row in rows]
     return {"object": "list", "total": total, "limit": limit, "offset": offset, "data": data}
+
+
+@router.get("/admin/logs/export")
+async def export_logs(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    limit: int = Query(1000, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    status: str | None = None,
+    key_name: str | None = None,
+    key_id: str | None = None,
+    model: str | None = None,
+    request_id: str | None = None,
+    trace_id: str | None = None,
+    tenant_id: str | None = None,
+) -> StreamingResponse:
+    """Capture for the replay harness (see POST /admin/replay and
+    core/replay.py): the replayable request log as JSONL — rows with a
+    stored request body, shadow mirrors excluded — one line per
+    request with the recorded baseline (caller identity, route, model,
+    status, deployment, guardrail verdicts) the replay diffs against.
+
+    Same scoping as /admin/logs: tenant admins export only their own
+    tenant's rows. ``comparable`` marks the rows a replay can diff
+    (recorded success/blocked); rows recorded as ``error`` carry a
+    skip_reason — their outcome was upstream/counter state, which a
+    dry run cannot re-run.
+    """
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        # NOTE: bodies are filtered in Python, not SQL. The JSON column
+        # stores Python None as the literal string 'null' on SQLite
+        # (IS NOT NULL would diverge between the SQLite and JSONB
+        # variants), so the page limit bounds *scanned* rows.
+        stmt = (
+            select(RequestLog)
+            .order_by(RequestLog.id.desc())
+            .where(RequestLog.shadow.isnot(True))
+        )
+        effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+        if effective_tenant:
+            stmt = stmt.where(RequestLog.tenant_id == effective_tenant)
+        if status:
+            stmt = stmt.where(RequestLog.status == status)
+        if key_name:
+            stmt = stmt.where(RequestLog.key_name == key_name)
+        if key_id:
+            stmt = stmt.where(RequestLog.key_id == key_id)
+        if model:
+            stmt = stmt.where(RequestLog.model == model)
+        if request_id:
+            stmt = stmt.where(RequestLog.request_id == request_id)
+        if trace_id:
+            stmt = stmt.where(RequestLog.trace_id == trace_id)
+        rows = (await session.execute(stmt.limit(limit).offset(offset))).scalars().all()
+
+    def lines():
+        for row in rows:
+            # Python-side body filter (see the NOTE above the query):
+            # NULL bodies are not replayable and don't belong in a
+            # capture line.
+            if row.request_body is None:
+                continue
+            line = _log_row(row)
+            line["request_body"] = row.request_body
+            comparable = row.status in ("success", "blocked")
+            line["comparable"] = comparable
+            line["skip_reason"] = (
+                None
+                if comparable
+                else "recorded error outcome — upstream/counter state a replay cannot re-run"
+            )
+            yield json.dumps(line, default=str) + "\n"
+
+    return StreamingResponse(
+        lines(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": "attachment; filename=gateway-capture.jsonl"
+        },
+    )
+
+
+@router.post("/admin/replay")
+async def replay_capture(
+    body: ReplayRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Replay a capture against the *current* config and diff it.
+
+    Each entry re-executes through the request-policy phases only —
+    resolution, prompt policy, permissions, guardrails, routing
+    selection — as the recorded caller's *current* key (re-loaded
+    fresh: edited or revoked keys replay under what they are now). No
+    upstream calls, counters, cache, spend, log rows or lifecycle
+    events; guardrail counters are suppressed (ctx.dry_run) so the
+    harness never trips block alerts. The report's ``changed`` lines
+    are what this config would change about that traffic — the safety
+    net for a hot reload.
+    """
+    pipeline = raw_request.app.state.pipeline
+    cfg = pipeline.config.replay
+    if not cfg.enabled:
+        raise GatewayError(
+            404,
+            "The replay harness is disabled (replay.enabled: false).",
+            "invalid_request_error",
+            code="replay_disabled",
+        )
+    if len(body.entries) > cfg.max_entries:
+        raise GatewayError(
+            400,
+            f"Too many entries: {len(body.entries)} (replay.max_entries is "
+            f"{cfg.max_entries}). Replay a sample, not all of history.",
+            "invalid_request_error",
+            code="too_many_replay_entries",
+        )
+    return await replay_entries(pipeline, body.entries, admin)
 
 
 @router.get("/admin/logs/{log_id}")

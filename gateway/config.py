@@ -573,6 +573,35 @@ class IdempotencyConfig(BaseModel):
     backend: str = "memory"  # memory | redis
 
 
+class ReplayConfig(BaseModel):
+    """Capture-to-replay harness: a config-regression safety net.
+
+    ``GET /admin/logs/export`` writes the replayable request log
+    (rows with stored bodies) as JSONL — the *capture*. ``POST
+    /admin/replay`` re-executes captured requests through the
+    request-policy phases *only* — model resolution, prompt policy,
+    permissions, guardrails, routing selection — with no upstream
+    calls, no rate-limit/budget/idempotency counters, no cache, no
+    spend, no request-log rows and no lifecycle events, as the
+    recorded caller (the key row is re-loaded fresh, so a key edited
+    or revoked since capture replays under its *current* policy).
+    Each line is diffed against what the capture recorded (model,
+    status, guardrail verdicts, deployment) — the diff is what a
+    candidate config would change about real traffic, *before* it
+    is hot-reloaded onto it.
+
+    Rows recorded as ``error`` are exported but marked not
+    comparable (the replay cannot re-run transient upstream or
+    counter outcomes); their policy outcome is simply reported.
+    """
+
+    enabled: bool = True
+    # Upper bound on capture lines accepted per replay call (and
+    # rows per export page): the harness is for sampling real
+    # traffic, not re-executing history.
+    max_entries: int = 500
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -663,6 +692,7 @@ class GatewayConfig(BaseModel):
     canary: CanaryConfig = Field(default_factory=CanaryConfig)
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
+    replay: ReplayConfig = Field(default_factory=ReplayConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 

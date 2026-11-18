@@ -220,12 +220,18 @@ class GuardrailManager:
         )
         # Surface verdicts as events on the current span: the phase span for
         # request/response checks, the gateway.chat span for stream checks.
+        # Replay-harness executions (ctx.dry_run) record verdicts on the
+        # ctx — the replay result is built from them — but must NOT touch
+        # the enforcement counters: a would-be verdict from POST
+        # /admin/replay is not live traffic, and gateway_guardrail_blocks_
+        # total drives alerts.
         span = trace.get_current_span()
         if observed:
             if action in ("block", "modify"):
-                GUARDRAIL_OBSERVED.labels(
-                    guardrail=guardrail.name, phase=phase, action=action
-                ).inc()
+                if not ctx.dry_run:
+                    GUARDRAIL_OBSERVED.labels(
+                        guardrail=guardrail.name, phase=phase, action=action
+                    ).inc()
                 span.add_event(
                     "gateway.guardrail.observed",
                     {
@@ -237,7 +243,8 @@ class GuardrailManager:
                 )
             return
         if action == "block":
-            GUARDRAIL_BLOCKS.labels(guardrail=guardrail.name, phase=phase).inc()
+            if not ctx.dry_run:
+                GUARDRAIL_BLOCKS.labels(guardrail=guardrail.name, phase=phase).inc()
             span.add_event(
                 "gateway.guardrail.blocked",
                 {

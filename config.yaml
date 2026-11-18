@@ -519,6 +519,22 @@ idempotency:
   inflight_wait_seconds: 30
   backend: memory           # memory | redis
 
+# Capture-to-replay harness — the safety net for config changes. The
+# request log *is* the capture (store_bodies above); GET /admin/logs/
+# export writes it as JSONL, and POST /admin/replay re-executes those
+# requests through the request-policy phases ONLY (resolution, prompt
+# policy, permissions, guardrails, routing selection — no upstream
+# calls, no counters, no spend, no log rows) as the recorded caller's
+# CURRENT key, then diffs the outcome against what the capture
+# recorded. The changed lines are what a candidate config would do to
+# real traffic — replay before a hot reload, read the diff, then keep
+# or roll back. Guardrail counters are suppressed during replay, so
+# the harness can never trip block alerts. max_entries bounds one
+# replay call: sample traffic, don't re-execute history.
+replay:
+  enabled: true
+  max_entries: 500
+
 # Lifecycle events: subscribe handlers to the request-stage boundaries
 # (request.received / request.routed / response.completed / stream.* /
 # auth.rejected / key.* / budget.threshold / batch.* ...). Two kinds:

@@ -28,6 +28,7 @@ from gateway.config import (
     GuardrailConfig,
     IdempotencyConfig,
     JWTAuthConfig,
+    ReplayConfig,
     LoggingConfig,
     MetricsConfig,
     ModelConfig,
@@ -104,6 +105,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     canary = cache_overrides.pop("canary", None) or CanaryConfig()
     pii_scan = cache_overrides.pop("pii_scan", None) or PIIScanConfig()
     idempotency = cache_overrides.pop("idempotency", None) or IdempotencyConfig()
+    replay = cache_overrides.pop("replay", None) or ReplayConfig()
     cache = cache_overrides.pop("cache", None) or CacheConfig(
         enabled=True, ttl_seconds=300, max_entries=128
     )
@@ -166,6 +168,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         canary=canary,
         pii_scan=pii_scan,
         idempotency=idempotency,
+        replay=replay,
         events=events,
     )
     if redis_backends:

@@ -293,22 +293,101 @@ class GatewayPipeline:
             self._finish_span(ctx)
             return response
 
-    async def _handle(
+    async def replay_request(
         self,
         request: ChatCompletionRequest,
-        ctx: RequestContext,
-        idempotency_key: str | None = None,
-    ) -> Response:
-        # Lifecycle event: authenticated + parsed, before any policy. The
-        # one in-band veto point before the request starts — an
-        # interceptor raising here aborts through the normal error path.
-        await self._emit(
-            "request.received",
-            ctx,
+        auth: AuthContext,
+        route: str | None = None,
+    ) -> dict:
+        """Dry-run one captured request through the request-policy
+        phases — the capture-replay harness's executor (see
+        core/replay.py and POST /admin/replay).
+
+        Runs the exact shared code a live request runs (``_prepare_
+        request_policy`` then ``_apply_request_guardrails``) and
+        nothing else: no upstream call, no rate-limit/budget/
+        idempotency evaluation, no cache access, no spend, no
+        request-log row, no lifecycle events, and (via ctx.dry_run)
+        no guardrail-counter pollution. The caller is the *current*
+        key policy — the harness re-resolved it fresh from the
+        database, so edited or revoked keys replay under what they
+        are now, which is the regression being hunted.
+
+        Returns the predicted decision record: the final model (post
+        resolution + redirects), whether the managed prompt policy
+        applied, the guardrail verdicts, the predicted status
+        (success / blocked / error, mirroring the statuses a live
+        request logs) and, on success, the deployment ladder that
+        would serve it (priority order — membership is the honest
+        diff signal, since weighted tiers pick randomly).
+        """
+        ctx = RequestContext(
+            request_id=f"replay_{uuid.uuid4().hex}",
+            auth=auth,
             model=request.model,
             stream=request.stream,
-            key_name=ctx.auth.key_name,
+            route=route,
+            request_body=request.model_dump(exclude_none=True),
+            dry_run=True,
         )
+        try:
+            request = await self._prepare_request_policy(request, ctx)
+            request = await self._apply_request_guardrails(request, ctx)
+        except GuardrailBlocked as exc:
+            return {
+                "model": ctx.model,
+                "prompt_policy_applied": ctx.effective_request is not None,
+                "guardrail_actions": list(ctx.guardrail_actions),
+                "status": "blocked",
+                "error": {"code": exc.code, "message": exc.message},
+                "deployments": None,
+            }
+        except GatewayError as exc:
+            return {
+                "model": ctx.model,
+                "prompt_policy_applied": ctx.effective_request is not None,
+                "guardrail_actions": list(ctx.guardrail_actions),
+                "status": "error",
+                "error": {"code": exc.code, "message": exc.message},
+                "deployments": None,
+            }
+        # Routing selection without dispatch: the priority ladder the
+        # request would draw from (a 404/503 here is a prediction too —
+        # an unknown model or all-shadow deployments).
+        try:
+            ladder = [d.name for d in self.router.resolve(request.model)]
+        except GatewayError as exc:
+            return {
+                "model": ctx.model,
+                "prompt_policy_applied": ctx.effective_request is not None,
+                "guardrail_actions": list(ctx.guardrail_actions),
+                "status": "error",
+                "error": {"code": exc.code, "message": exc.message},
+                "deployments": None,
+            }
+        return {
+            "model": ctx.model,
+            "prompt_policy_applied": ctx.effective_request is not None,
+            "guardrail_actions": list(ctx.guardrail_actions),
+            "status": "success",
+            "error": None,
+            "deployments": ladder,
+        }
+
+    async def _prepare_request_policy(
+        self, request: ChatCompletionRequest, ctx: RequestContext
+    ) -> ChatCompletionRequest:
+        """Steps 0-1 of the chat pipeline: model resolution (with the
+        context window), prompt policy and the model-permission check.
+
+        Shared by ``_handle`` and the replay harness
+        (``replay_request``) so a replayed request passes through the
+        *exact* policy code a live one does — that is the point of the
+        harness: what would change about this traffic under the current
+        config. Counter phases (rate limit, idempotency, budget) are
+        deliberately NOT here; live execution runs them between this
+        and the guardrail phase.
+        """
         # 0. Model aliases / default routing. Resolved before every check
         # so permissions, rate limits, guardrail model scopes, cache
         # identity, logs and the echoed response "model" all see one
@@ -373,6 +452,60 @@ class GatewayPipeline:
         # 1. Model permission: key allowlist (platform admins bypass
         # inside) + the tenant's allowlist, which binds every member.
         self._check_model_permission(ctx.auth, request.model)
+        return request
+
+    async def _apply_request_guardrails(
+        self, request: ChatCompletionRequest, ctx: RequestContext
+    ) -> ChatCompletionRequest:
+        """Steps 4-4.5: the request-phase guardrails (with modification
+        chaining) and the redirect allowlist re-check. Shared by
+        ``_handle`` and ``replay_request`` for the same reason as
+        ``_prepare_request_policy``."""
+        # 4. Guardrails: request phase
+        pre_guardrail_model = request.model
+        effective_request = await self.guardrails.run_request_phase(request, ctx)
+        if effective_request is not request:
+            ctx.effective_request = effective_request.model_dump(exclude_none=True)
+            request = effective_request
+
+        # 4.5 Guardrail redirect re-validation. A guardrail may have
+        # redirected the model (reject-and-redirect instead of blocking).
+        # The allowlist is a hard boundary: redirect must never bypass it,
+        # so permissions are re-checked against the new model, fail closed
+        # (admins bypass, as at step 1). ctx.model and the span attribute
+        # are updated so rate-limit series, logs, response-phase guardrail
+        # scopes, accounting and cache identity all see the final model —
+        # the redirect is simply where the request goes. The redirected
+        # name is used as-is (no alias re-resolution: a guardrail redirect
+        # targets a public model); an unknown target 404s in the router.
+        if request.model != pre_guardrail_model:
+            self._check_model_permission(ctx.auth, request.model)
+            ctx.model = request.model
+            # The redirected model's window now applies (the guardrail
+            # that redirected ran against the original's — ordering is
+            # documented: guardrails within the phase are ordered).
+            ctx.context_window = self._model_windows.get(request.model)
+            if ctx.otel_span is not None:
+                ctx.otel_span.set_attribute("gateway.model", request.model)
+        return request
+
+    async def _handle(
+        self,
+        request: ChatCompletionRequest,
+        ctx: RequestContext,
+        idempotency_key: str | None = None,
+    ) -> Response:
+        # Lifecycle event: authenticated + parsed, before any policy. The
+        # one in-band veto point before the request starts — an
+        # interceptor raising here aborts through the normal error path.
+        await self._emit(
+            "request.received",
+            ctx,
+            model=request.model,
+            stream=request.stream,
+            key_name=ctx.auth.key_name,
+        )
+        request = await self._prepare_request_policy(request, ctx)
 
         # 2. Rate limit (pre-flight)
         estimated_tokens = sum(
@@ -412,32 +545,7 @@ class GatewayPipeline:
         # 3. Budget (pre-flight)
         self._check_budget(ctx)
 
-        # 4. Guardrails: request phase
-        pre_guardrail_model = request.model
-        effective_request = await self.guardrails.run_request_phase(request, ctx)
-        if effective_request is not request:
-            ctx.effective_request = effective_request.model_dump(exclude_none=True)
-        request = effective_request
-
-        # 4.5 Guardrail redirect re-validation. A guardrail may have
-        # redirected the model (reject-and-redirect instead of blocking).
-        # The allowlist is a hard boundary: redirect must never bypass it,
-        # so permissions are re-checked against the new model, fail closed
-        # (admins bypass, as at step 1). ctx.model and the span attribute
-        # are updated so rate-limit series, logs, response-phase guardrail
-        # scopes, accounting and cache identity all see the final model —
-        # the redirect is simply where the request goes. The redirected
-        # name is used as-is (no alias re-resolution: a guardrail redirect
-        # targets a public model); an unknown target 404s in the router.
-        if request.model != pre_guardrail_model:
-            self._check_model_permission(ctx.auth, request.model)
-            ctx.model = request.model
-            # The redirected model's window now applies (the guardrail
-            # that redirected ran against the original's — ordering is
-            # documented: guardrails within the phase are ordered).
-            ctx.context_window = self._model_windows.get(request.model)
-            if ctx.otel_span is not None:
-                ctx.otel_span.set_attribute("gateway.model", request.model)
+        request = await self._apply_request_guardrails(request, ctx)
 
         # 5. Cache lookup: exact match first, then semantic (similarity).
         #    Both are salted by the caller's response-policy token: a hit
