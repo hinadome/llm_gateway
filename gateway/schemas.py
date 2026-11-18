@@ -541,3 +541,19 @@ class TrialCreateRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1)
     concurrency: int | None = Field(default=None, ge=1)
     max_cost_usd: float | None = Field(default=None, gt=0)
+
+
+class PromotionRequest(BaseModel):
+    """POST /admin/migration/plan and /admin/migration/promote (tier 38)
+    — turn a go verdict into serving traffic through config.yaml
+    itself. ``model`` is the public model the candidate is promoted
+    INTO; ``deployment`` the candidate the evidence is about. ``weight``
+    is the canary weight the candidate serves at inside the incumbent's
+    priority tier (1-100 — a share, not a percentage above it; promote
+    again at a higher weight to shift more traffic). ``force`` (promote
+    only) promotes past a no_go verdict, audited — plan ignores it."""
+
+    model: str = Field(min_length=1, max_length=128)
+    deployment: str = Field(min_length=1, max_length=128)
+    weight: int = Field(default=10, ge=1, le=100)
+    force: bool = False

@@ -8,7 +8,7 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import (
@@ -25,6 +25,7 @@ from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
 from ..core import migration as migration_core
+from ..core import promotion as promotion_core
 from ..core import trials as trials_core
 from ..core.vault import VaultService
 from ..db import get_sessionmaker
@@ -34,6 +35,7 @@ from ..observability.metrics import PII_FINDINGS
 from ..schemas import (
     KeyCreateRequest,
     KeyUpdateRequest,
+    PromotionRequest,
     PromptCreateRequest,
     PromptPatchRequest,
     ProviderKeyUpsertRequest,
@@ -1855,6 +1857,198 @@ async def migration_verdicts(
             }
         )
     return {"data": data, "thresholds": config.migration.model_dump()}
+
+
+# -- migration promotion (tier 38) -----------------------------------------
+# The deliberate act: a go verdict turned into serving traffic through
+# config.yaml itself — plan renders the exact edits, promote applies
+# them (backup -> write -> the existing hot-reload path -> audit), so
+# the file stays the single routing truth. Platform-admin-only: this
+# REWRITES the routing configuration.
+
+
+async def _promotion_evidence(
+    app: Any, model: str, deployment: str
+) -> tuple[dict, dict, str]:
+    """The evidence a promotion is judged on, at apply time: the
+    standing mirror group for (model, candidate) — live traffic, the
+    loudest evidence when it exists — else the latest completed trial
+    for the pair (deliberate replay), else an empty group (which
+    verdicts insufficient_evidence). Returns ``(group, recommendation,
+    source)`` with ``source`` saying which leg the verdict came from."""
+    config = app.state.config
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        agg = await shadow_aggregate(session, model=model)
+        group = next(
+            (g for g in agg["groups"] if g["deployment"] == deployment), None
+        )
+        source = "mirror"
+        if group is None:
+            row = (
+                await session.execute(
+                    select(Trial)
+                    .where(
+                        Trial.model == model,
+                        Trial.deployment == deployment,
+                        Trial.status == "completed",
+                    )
+                    .order_by(Trial.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                group, source = {}, "none"
+            else:
+                group = await trials_core.run_summary(session, row.id)
+                source = f"trial:{row.id}"
+        recommendation = migration_core.evaluate(group, config.migration)
+    return group, recommendation, source
+
+
+def _promotion_plan(app: Any, body: PromotionRequest) -> dict:
+    """Build the plan against the config file as it is RIGHT NOW (the
+    running config is the ground truth for what the candidate is; the
+    file is what gets edited). PromotionError maps straight onto the
+    OpenAI-style error envelope — the message is the whole story."""
+    path = Path(app.state.settings.config_path)
+    if not path.exists():
+        raise GatewayError(
+            409,
+            f"Config file not found at {path} — promotion edits the file "
+            "the gateway loads, so the file must exist.",
+            "invalid_request_error",
+            code="config_file_missing",
+        )
+    text = promotion_core.read_config_text(path)
+    try:
+        return promotion_core.build_plan(
+            text, app.state.config, body.model, body.deployment, body.weight
+        )
+    except promotion_core.PromotionError as exc:
+        raise GatewayError(
+            exc.status_code, exc.message, "invalid_request_error", code=exc.code
+        ) from exc
+
+
+@router.post("/admin/migration/plan")
+async def migration_promotion_plan(
+    raw_request: Request,
+    body: PromotionRequest,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Render the exact config.yaml edits a promotion would apply —
+    and the verdict justifying them — with NO side effects: the file
+    is read, never written, nothing is audited, no evidence moves.
+
+    The response carries the promotion mode (``shadow_flip`` — a shadow
+    twin flips to serving; ``rebalance`` — an already-serving
+    deployment's weight changes; ``cross_model_insert`` — a candidate
+    living on another model is copied into the target model's
+    deployments), the structured ``changes`` list, a unified ``diff`` of
+    the file, the candidate's resulting ``canary_share`` of its
+    priority tier, the evidence ``recommendation`` (go / hold / no_go /
+    insufficient_evidence with per-check numbers) and which leg it
+    came from (``evidence_source``: mirror / trial:<id> / none).
+    ``promote`` re-builds the plan at apply time — this preview is
+    never applied stale."""
+    plan = _promotion_plan(raw_request.app, body)
+    _group, recommendation, source = await _promotion_evidence(
+        raw_request.app, body.model, body.deployment
+    )
+    plan.pop("new_text")  # the diff is the preview; the text is apply's
+    return {**plan, "recommendation": recommendation, "evidence_source": source}
+
+
+@router.post("/admin/migration/promote")
+async def migration_promote(
+    raw_request: Request,
+    body: PromotionRequest,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Apply a promotion: flip the candidate to serving (or rebalance
+    its weight, or insert it into the target model) at ``weight`` in
+    the incumbent's priority tier — through config.yaml itself, so the
+    file stays the single routing truth.
+
+    The gate: the evidence at apply time must not verdict ``no_go``
+    (answers diverge, or the candidate fails the traffic it is given)
+    unless ``force=true`` — a forced promotion is audited as forced.
+    A ``hold`` or ``insufficient_evidence`` verdict does not block; the
+    concern rides along as a warning on the promotion. The incumbent
+    is never demoted or removed — promotion only adds serving
+    capacity, and nothing is ever auto-removed: repeat promote at a
+    higher weight to climb the canary ladder.
+
+    The apply: timestamped backup -> write -> the same hot-reload path
+    POST /admin/reload takes (an invalid edit leaves the running
+    config live and the file restored from the backup) -> audit
+    ``promotion.applied``. The response carries the plan (mode,
+    changes, diff, canary_share, warnings), the verdict it was judged
+    on, the backup name and the reload summary."""
+    plan = _promotion_plan(raw_request.app, body)
+    _group, recommendation, source = await _promotion_evidence(
+        raw_request.app, body.model, body.deployment
+    )
+    if (
+        recommendation["verdict"] == migration_core.RECOMMENDATION_NO_GO
+        and not body.force
+    ):
+        reasons = "; ".join(recommendation["reasons"]) or "no reasons recorded"
+        raise GatewayError(
+            409,
+            f"Promotion blocked: the evidence ({source}) for "
+            f"'{body.model}' / '{body.deployment}' verdicts no_go — "
+            f"{reasons}. Address the findings, collect fresh evidence, "
+            "or promote anyway with force=true (audited).",
+            "invalid_request_error",
+            code="promotion_blocked",
+        )
+    if recommendation["verdict"] != migration_core.RECOMMENDATION_GO:
+        plan["warnings"].append(
+            f"evidence verdict is '{recommendation['verdict']}' ({source}): "
+            + ("; ".join(recommendation["reasons"]) or "no reasons recorded")
+        )
+
+    path = Path(raw_request.app.state.settings.config_path)
+    backup = promotion_core.write_with_backup(path, plan["new_text"])
+
+    from ..main import reload_gateway  # same import stance as /admin/reload
+
+    try:
+        reload_summary = await reload_gateway(raw_request.app, source="promotion")
+    except Exception as exc:  # noqa: BLE001 — any load/validate failure
+        promotion_core.restore_backup(backup, path)
+        raise GatewayError(
+            400,
+            f"Promotion failed: the edited config did not reload (running "
+            f"config unchanged, file restored from {backup.name}): {exc}",
+            "invalid_request_error",
+            code="config_invalid",
+        ) from exc
+
+    raw_request.app.state.audit.record(
+        "promotion.applied",
+        actor=admin,
+        model=body.model,
+        deployment=body.deployment,
+        weight=body.weight,
+        mode=plan["mode"],
+        verdict=recommendation["verdict"],
+        evidence_source=source,
+        force=body.force,
+        backup=backup.name,
+        changes=plan["changes"],
+    )
+    plan.pop("new_text")
+    return {
+        **plan,
+        "recommendation": recommendation,
+        "evidence_source": source,
+        "forced": body.force,
+        "backup": backup.name,
+        "reload": reload_summary,
+    }
 
 
 # -- candidate trials (tier 36) -------------------------------------------

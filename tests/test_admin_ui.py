@@ -133,6 +133,31 @@ async def test_admin_ui_migration_verdicts_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_promotion_surface(env):
+    # Tier 38: every shadow-diff row carries a Promote… button opening
+    # the promotion dialog — weight input + force checkbox, a plan
+    # preview that re-plans on every weight change (POST
+    # /admin/migration/plan, the diff is the preview) and the apply
+    # (POST /admin/migration/promote) that toasts and refreshes the
+    # routing tables. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="dlg-promotion"',
+        'id="form-promotion"',
+        'id="promotion-weight"',
+        'id="promotion-force"',
+        'id="promotion-plan"',
+        'id="promotion-err"',
+        "data-promote-model",
+        "openPromotion",
+        "loadPromotionPlan",
+        "/admin/migration/plan",
+        "/admin/migration/promote",
+        "Promote&hellip;",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

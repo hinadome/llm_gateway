@@ -8,6 +8,62 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Migration promotion (tier 38) — the deliberate act that turns a go
+  verdict into serving traffic, through config.yaml itself. Tier 37
+  ended at the recommendation; the operator reading "go" still had to
+  edit config.yaml by hand — drop the `shadow:` lines, pick a weight,
+  align the priority tier, reload, and hope no typo took the gateway
+  down mid-edit. Now that edit is a two-step API, and config.yaml
+  stays the single routing truth (no DB overlay, no side state — the
+  file, the reload and the audit trail all tell the same story):
+  - **`POST /admin/migration/plan` — preview, no side effects.**
+    Renders the exact line-level config.yaml edits for promoting a
+    `deployment` into a `model` at `weight` (1–100, default 10), plus
+    the evidence verdict justifying them. The response carries the
+    promotion `mode` (`shadow_flip` — a shadow twin flips to serving;
+    `rebalance` — an already-serving deployment's weight changes;
+    `cross_model_insert` — a candidate on another model is copied
+    into the target), a structured `changes` list, a unified `diff` of
+    the file, the resulting `canary_share` of the serving tier's
+    weight, `warnings`, and the `recommendation` with its
+    `evidence_source` (the standing mirror group, else the latest
+    completed trial for the pair, else none — thin evidence honestly
+    labeled). The file is read, never written; nothing is audited.
+  - **`POST /admin/migration/promote` — apply.** Re-builds the plan
+    from the file *at apply time* — a preview is never applied stale
+    — gates on the verdict, then: timestamped backup → write → the
+    same hot-reload path `POST /admin/reload` takes → audit
+    `promotion.applied` (model, deployment, weight, mode, verdict,
+    evidence source, force, backup, changes). If the reload refuses,
+    the backup is restored, the running config never moved, and the
+    operator gets a 400 saying exactly that.
+  - **Canary semantics, nothing auto-removed.** A flipped candidate
+    serves inside the incumbent's priority tier — the canary ladder a
+    manual edit would climb: promote again at a higher weight to
+    shift more traffic. The incumbent is never demoted or removed; a
+    cross-model insert is a copy, its original untouched; a
+    rebalance to the weight a deployment already has is an honest
+    no-op (empty changes, byte-identical file).
+  - **The gate.** A `no_go` verdict is a 409 `promotion_blocked`
+    with the reasons in the message, unless `force: true` — a forced
+    promotion applies and is audited as forced. A `hold` or
+    `insufficient_evidence` verdict does not block; the concern
+    rides along as a warning on the promotion.
+  - **Honestly bounded text surgery.** The edits are line-level over
+    config.yaml's canonical block form only (dash line + indented
+    `key: value` lines): comments between entries survive
+    byte-for-byte, CRLF files stay CRLF, and anything the surgery
+    cannot edit exactly is refused with a clear 409 — flow-style
+    entries (`yaml_flow_style`) and a file that disagrees with the
+    running config (`yaml_mismatch`) — never best-effort-edited.
+  The admin dashboard's Routing tab puts a "Promote…" button on every
+  shadow-diff row, opening a dialog that re-plans on every weight
+  change (the diff *is* the preview) and applies with the same
+  backup → reload → audit flow; a blocked promotion stays in the
+  dialog so force is one checkbox away. Both endpoints are
+  platform-admin-only. 16 tests + a UI-surface pin
+  (`tests/test_promotion.py`, `tests/test_admin_ui.py`); the suite
+  stands at 1132.
 - Migration verdicts (tier 37) — the go/no-go recommendation engine
   over the migration evidence. Tiers 13/35/36 collected the evidence:
   mirrored pairs scored raw-vs-raw, candidate trials replayed on
@@ -59,7 +115,7 @@ All notable changes to the LLM Gateway are documented here. Format follows
   the admin dashboard's Routing tab renders a "Go / no-go" badge on
   each shadow-diff row and each trial run (failed-check reasons in
   the tooltip). 17 tests + a UI-surface pin (`tests/test_migration.py`,
-  `tests/test_admin_ui.py`); the suite stands at 1114.
+  `tests/test_admin_ui.py`); the suite stands at 1115.
 - Candidate trials (tier 36) — the deliberate-replay leg of provider
   migration. Shadow mirroring + diffing is passive evidence: only the
   traffic a model actually gets, only candidates wired as `shadow:

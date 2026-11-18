@@ -550,6 +550,31 @@
   <form method="dialog" class="df"><button>Close</button></form>
 </dialog>
 
+<!-- migration promotion (tier 38): plan the exact config.yaml edits, then apply -->
+<dialog id="dlg-promotion">
+  <form id="form-promotion" method="dialog" style="min-width:760px;max-width:940px">
+    <div class="dh" id="promotion-title">Promote candidate</div>
+    <div class="db" style="max-height:64vh;overflow:auto">
+      <div class="muted" style="font-size:12.5px;margin-bottom:10px">Promotion edits config.yaml itself (timestamped backup, hot-reload): the candidate starts serving at the weight below, inside the incumbent&rsquo;s priority tier. The incumbent is never demoted or removed &mdash; promote again at a higher weight to shift more traffic.</div>
+      <div style="display:flex;gap:14px;align-items:end;flex-wrap:wrap">
+        <label class="fld">Weight (its share of the serving tier, 1&ndash;100)
+          <input type="number" id="promotion-weight" min="1" max="100" value="10">
+        </label>
+        <label class="fld" style="display:flex;gap:6px;align-items:center;font-weight:400">
+          <input type="checkbox" id="promotion-force"> Promote despite a no-go verdict (force, audited)
+        </label>
+        <button type="button" class="small ghost" id="promotion-replan">Re-plan</button>
+      </div>
+      <div id="promotion-plan" style="margin-top:12px"></div>
+      <div class="err" id="promotion-err"></div>
+    </div>
+    <div class="df">
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="ok" class="primary">Promote</button>
+    </div>
+  </form>
+</dialog>
+
 <div id="toasts"></div>
 
 <script>
@@ -1679,6 +1704,7 @@ async function loadShadowDiff() {
       <td>
         <button class="small ghost" data-pairs-model="${esc(g.model)}" data-pairs-deployment="${esc(g.deployment)}">Pairs</button>
         ${g.divergent > 0 ? `<button class="small ghost" data-pairs-model="${esc(g.model)}" data-pairs-deployment="${esc(g.deployment)}" data-pairs-verdict="divergent">Divergent ${g.divergent}</button>` : ""}
+        <button class="small ghost" data-promote-model="${esc(g.model)}" data-promote-deployment="${esc(g.deployment)}">Promote&hellip;</button>
       </td></tr>`;
   }
   $("#shadow-diff-table").innerHTML = html + "</tbody>";
@@ -1687,6 +1713,91 @@ $("#shadow-diff-table").addEventListener("click", e => {
   const btn = e.target.closest("button[data-pairs-model]");
   if (!btn) return;
   openShadowPairs(btn.dataset.pairsModel, btn.dataset.pairsDeployment, btn.dataset.pairsVerdict || null);
+});
+
+// ---------- migration promotion (tier 38): plan, then apply ----------
+
+const promotion = { model: null, deployment: null };
+
+async function loadPromotionPlan() {
+  // POST /admin/migration/plan renders the exact config.yaml edits for
+  // the current weight — no side effects; the diff + recommendation
+  // ARE the preview. Every render re-plans, so the preview can never
+  // go stale against the weight input.
+  const box = $("#promotion-plan");
+  const err = $("#promotion-err");
+  err.textContent = "";
+  box.innerHTML = '<span class="muted">Planning the exact config.yaml edits…</span>';
+  try {
+    const plan = await api("/admin/migration/plan", {
+      method: "POST",
+      body: JSON.stringify({
+        model: promotion.model,
+        deployment: promotion.deployment,
+        weight: Number($("#promotion-weight").value) || 10,
+      }),
+    });
+    const rec = plan.recommendation || {};
+    const reasons = rec.reasons && rec.reasons.length ? rec.reasons.join(" · ") : "clears every migration threshold";
+    const recBadge = !rec.verdict
+      ? '<span class="muted">—</span>'
+      : `<span class="b ${MIGRATION_BADGE[rec.verdict] || "b-gray"}" title="${esc(reasons)}">${esc(rec.verdict.replace(/_/g, " "))}</span>`;
+    const warns = (plan.warnings || []).map(esc).join("<br>");
+    box.innerHTML = `
+      <div style="margin-bottom:8px">${recBadge}
+        <span class="muted" style="font-size:12px">evidence: ${esc(plan.evidence_source)} · mode: ${esc(plan.mode)} · resulting priority ${esc(plan.priority)} · canary share ${plan.canary_share == null ? "—" : Math.round(plan.canary_share * 100) + "%"}</span>
+      </div>
+      ${warns ? `<div class="b b-amber" style="display:block;margin-bottom:8px">${warns}</div>` : ""}
+      <pre style="max-height:260px;overflow:auto;font-size:12px;line-height:1.45;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--panel2)">${esc(plan.diff)}</pre>`;
+  } catch (e) {
+    box.innerHTML = "";
+    err.textContent = e.message || String(e);
+  }
+}
+
+function openPromotion(model, deployment) {
+  Object.assign(promotion, { model, deployment });
+  $("#promotion-title").textContent = `Promote ${deployment} into ${model}`;
+  $("#promotion-force").checked = false;
+  $("#promotion-err").textContent = "";
+  $("#dlg-promotion").showModal();
+  loadPromotionPlan();
+}
+
+$("#shadow-diff-table").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-promote-model]");
+  if (!btn) return;
+  openPromotion(btn.dataset.promoteModel, btn.dataset.promoteDeployment);
+});
+$("#promotion-replan").addEventListener("click", loadPromotionPlan);
+$("#promotion-weight").addEventListener("change", loadPromotionPlan);
+
+$("#form-promotion").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (e.submitter && e.submitter.value === "cancel") {
+    $("#dlg-promotion").close();
+    return;
+  }
+  const err = $("#promotion-err");
+  err.textContent = "Applying — backup, edit, hot-reload…";
+  try {
+    const result = await api("/admin/migration/promote", {
+      method: "POST",
+      body: JSON.stringify({
+        model: promotion.model,
+        deployment: promotion.deployment,
+        weight: Number($("#promotion-weight").value) || 10,
+        force: $("#promotion-force").checked,
+      }),
+    });
+    $("#dlg-promotion").close();
+    toast(`Promoted ${promotion.deployment} at weight ${result.weight} (backup ${result.backup})`);
+    loadRouting(); // routing table, shadow-diff rows and trials all changed
+  } catch (e) {
+    // e.g. promotion_blocked: the message says what the evidence found —
+    // the operator can check force and submit again.
+    err.textContent = e.message || String(e);
+  }
 });
 
 function pairSideHtml(label, side, missingText) {

@@ -679,6 +679,7 @@ async def _make_env(
     audit_client=None,
     vault_master_key=None,
     mcp_mock=None,
+    config_path=None,
 ):
     """Build a full app (fresh DB + mock upstream) as an async generator.
 
@@ -688,6 +689,11 @@ async def _make_env(
     suite against a real PostgreSQL server instead: every test gets its
     own database, created before and dropped after the run — the same
     isolation story as the per-test SQLite files.
+
+    ``config_path`` points ``settings.config_path`` at a test-owned
+    YAML file (promotion tests write one under tmp_path); it must
+    NEVER default to the repo's ./config.yaml for anything that
+    writes or reloads it.
     """
     reset_engine_for_tests()
     db_url, drop_test_database = await _test_database(tmp_path)
@@ -709,12 +715,18 @@ async def _make_env(
     else:
         transport = httpx.MockTransport(mock.handler)
     http_client = httpx.AsyncClient(transport=transport)
-    settings = Settings(
-        admin_key=ADMIN_KEY,
-        database_url=db_url,
-        cors_allow_origins=cors_allow_origins,
-        vault_master_key=vault_master_key,
-    )
+    # Only pass config_path when the test chose one: Settings defaults
+    # it to ./config.yaml, and an explicit None would override that
+    # with an invalid value (pydantic-settings treats None as set).
+    settings_kwargs: dict = {
+        "admin_key": ADMIN_KEY,
+        "database_url": db_url,
+        "cors_allow_origins": cors_allow_origins,
+        "vault_master_key": vault_master_key,
+    }
+    if config_path is not None:
+        settings_kwargs["config_path"] = config_path
+    settings = Settings(**settings_kwargs)
     app = create_app(
         settings=settings,
         config=config or make_config(),

@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 83 Python files, ~28,600 lines, 1114 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 84 Python files, ~29,400 lines, 1132 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -352,6 +352,33 @@ gateway/
 │                           no_go / insufficient_evidence
 │                           recommendations, thresholds echoed live
 │                           (?model=/?deployment=/?since= narrow);
+│                           POST /admin/migration/plan +
+│                           /admin/migration/promote (tier 38, same
+│                           platform-admin boundary — they rewrite
+│                           the routing configuration) turn a go
+│                           verdict into serving traffic through
+│                           config.yaml itself: plan renders the
+│                           exact line edits (mode shadow_flip /
+│                           rebalance / cross_model_insert,
+│                           structured changes, unified diff, canary
+│                           share) + the evidence verdict justifying
+│                           them with NO side effects (file read,
+│                           never written; evidence_source says
+│                           which leg — standing mirror group, else
+│                           latest completed trial, else none);
+│                           promote re-builds the plan from the file
+│                           at apply time (never a stale preview),
+│                           gates on the verdict (no_go → 409
+│                           promotion_blocked with the reasons,
+│                           unless force=true — audited as forced;
+│                           hold/insufficient_evidence promote with
+│                           the concern as a plan warning), then
+│                           timestamped backup → write → the same
+│                           hot-reload path /admin/reload takes →
+│                           promotion.applied audit; on reload
+│                           refusal the backup is restored and the
+│                           running config never moved — see
+│                           core/promotion;
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -1234,6 +1261,40 @@ gateway/
 │   │                       re-verdicts) and echoed by the endpoints.
 │   │                       A RECOMMENDATION, not a gate — nothing
 │   │                       promotes automatically.
+│   ├── promotion.py        Migration promotion (tier 38): the deliberate
+│   │                       act that turns a go verdict into serving
+│   │                       traffic, through config.yaml itself (no DB
+│   │                       overlay, no side state — the file stays the
+│   │                       single routing truth). build_plan is a PURE
+│   │                       function over (file text, running config):
+│   │                       the config is the ground truth for WHAT the
+│   │                       candidate is (shadow? owning model? current
+│   │                       weight/priority), the text is what gets
+│   │                       edited, and any disagreement between the
+│   │                       two is a 409 refusal, never a best-effort
+│   │                       guess. Modes: shadow_flip (drop the
+│   │                       shadow:/shadow_fraction: lines, serve at the
+│   │                       requested weight inside the incumbent's
+│   │                       priority tier — the canary ladder: promote
+│   │                       again at a higher weight to shift traffic),
+│   │                       rebalance (an already-serving deployment's
+│   │                       weight; asking for what it has is an honest
+│   │                       no-op), cross_model_insert (a candidate on
+│   │                       another model is inserted as a block-form
+│   │                       copy, original untouched — nothing is ever
+│   │                       auto-removed, the incumbent never demoted).
+│   │                       Line surgery over the canonical BLOCK form
+│   │                       only: comments between entries preserved
+│   │                       byte-for-byte, flow-style entries and
+│   │                       yaml_mismatch refusals with clear 409s.
+│   │                       Returns mode / structured changes / unified
+│   │                       diff / canary_share (weight over the
+│   │                       serving tier's total) / warnings / new_text.
+│   │                       write_with_backup (timestamped copy before
+│   │                       the write) + restore_backup are the apply
+│   │                       side's safety net; read_config_text refuses
+│   │                       newline translation so CRLF files survive
+│   │                       byte-for-byte.
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -1438,7 +1499,20 @@ gateway/
                             (keyed model + deployment), the trials table
                             renders each run's folded recommendation (once
                             the run has pairs); the badge tooltips carry
-                            the failed-check reasons verbatim —
+                            the failed-check reasons verbatim. Tier 38 puts
+                            a Promote... button on every shadow-diff row,
+                            opening the promotion dialog: weight input
+                            (1-100) + force checkbox, a plan preview that
+                            re-plans on every weight change (POST
+                            /admin/migration/plan — the unified diff IS
+                            the preview, with the verdict badge, evidence
+                            source, mode/priority/canary-share line and
+                            warnings) and the apply (POST
+                            /admin/migration/promote) that toasts the
+                            backup name and refreshes the routing tables;
+                            a promotion_blocked 409 stays in the dialog,
+                            message verbatim, so the operator can check
+                            force and resubmit —
                             guardrail inventory, system (health/readiness,
                             config reload, backups). A test enforces the
                             no-external-resources invariant.
@@ -2199,7 +2273,13 @@ tests/
 │                        fresh temp SQLite DB per test (or, with
 │                        GATEWAY_TEST_DATABASE_URL, a per-test database on a real
 │                        PostgreSQL server — same suite, same isolation);
-│                        ASGITransport client
+│                        ASGITransport client; _make_env(config_path=…)
+│                        points settings.config_path at a test-owned YAML —
+│                        the kwarg is passed to Settings ONLY when set (an
+│                        explicit None would override the ./config.yaml
+│                        default), and the promotion tests use it so they
+│                        write and reload files under tmp_path, never the
+│                        repo's ./config.yaml
 ├── test_guardrails.py   Unit tests per builtin + manager chaining/blocking + observe mode
 ├── test_guardrail_scoping.py  Scope matching matrix (keys/models include+exclude globs,
 │                        admin-as-key-name, AND across fields) + per-key overrides
@@ -2427,6 +2507,43 @@ tests/
 │                        (trial_baselines wiring) and the not_comparable
 │                        honesty pin (a rewritten primary → insufficient,
 │                        match_rate honestly skipped)
+├── test_promotion.py   Migration promotion (tier 38): build_plan units — the
+│                        canonical flip (shadow: line removed, weight line
+│                        added after the entry's keys, comments between
+│                        entries preserved byte-for-byte, file re-parses
+│                        with the twin serving in the incumbent's tier),
+│                        explicit-knob normalization (shadow_fraction
+│                        dropped alongside shadow, out-of-tier priority
+│                        rewritten into the tier, priority line lands
+│                        before weight), rebalance + the honest no-op
+│                        (same effective weight = empty changes,
+│                        byte-identical file), the cross-model insert
+│                        (pure-addition diff, original entry untouched,
+│                        entry order stable), no-incumbent warning
+│                        (candidate's own priority kept, canary share
+│                        1.0), unknown model/deployment 400s, flow-style
+│                        refusals (a flow entry AND a valid-YAML
+│                        deployments: [] target), the yaml_mismatch
+│                        refusal (config says shadow, file has no
+│                        shadow: line), weight bounds; e2e — the full
+│                        ladder (mirrored traffic verdicts go, plan
+│                        renders with zero side effects, promote backs
+│                        up/edits/reloads/audits, behavior flips: the
+│                        candidate takes the traffic, mirroring stops,
+│                        incumbent still serving), no_go blocks (409,
+│                        nothing written) then force applies (forced in
+│                        response + audit), thin evidence promotes
+│                        with the warning + evidence_source none, the
+│                        reload-failure safety net (monkeypatched
+│                        reload → 400, file byte-identical, running
+│                        config the same object, backup kept), trial
+│                        evidence feeding a cross-model promotion
+│                        (insert live, candidate serves), plan
+│                        side-effect-free + repeatable, 403s for
+│                        tenant/plain + validation 400s — every
+│                        environment points config_path at a tmp_path
+│                        file it owns; the repo's ./config.yaml is
+│                        never touched
 ├── test_usage_export.py  /admin/usage/export: CSV columns/order/attachment download,
 │                        JSON summary + by_key/by_model/by_status aggregates, key/model/
 │                        status filters, time windows (default 30d, naive=UTC), shadow
