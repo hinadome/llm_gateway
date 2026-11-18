@@ -287,6 +287,33 @@ guardrails:
       on_exceed: block           # block | redirect
       redirect_model: gpt-4o
 
+  # Prompt compression: the remediation counterpart of context_window.
+  # Where context_window BLOCKS (or redirects) an over-window request,
+  # this one deterministically COMPRESSES it to fit — middle-out
+  # folding, no LLM call, no added latency. Order it BEFORE
+  # context_window in this list: a request folded under the target
+  # then passes the check; one that cannot be saved (a gigantic last
+  # message) steps aside untouched and gets context_window's honest
+  # error. Target: max_input_tokens when set, else the model's
+  # declared window minus reserve_output_tokens (same name and default
+  # as context_window, so the pairing fits exactly). Always keeps
+  # leading system messages, the first keep_first and the last
+  # keep_last non-system messages; drops the middle with a marker note
+  # prepended to the first kept message (content-only: roles and
+  # content shapes are preserved). If still over, truncates kept
+  # non-system messages oldest-first toward min_message_chars — the
+  # system block and the LAST message are never trimmed. Savings land
+  # in the request log's guardrail_actions (tokens_before/after) and
+  # on gateway_prompt_compression_saved_tokens_total{model}.
+  - name: prompt_compression
+    enabled: false
+    params:
+      # max_input_tokens: 8000   # explicit budget; empty = window-fit
+      reserve_output_tokens: 1024
+      keep_first: 2              # messages kept at the top (the task)
+      keep_last: 4               # kept at the bottom (the live exchange)
+      min_message_chars: 512     # floor for oldest-first truncation
+
   # Production-grade PII detection via Microsoft Presidio (optional
   # 'guardrails' extra). Replaces the regex heuristics above — disable
   # pii_redaction when enabling this.

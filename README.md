@@ -24,7 +24,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Multimodal chat** | Audio input in chat (`input_audio` parts) on every inbound format — OpenAI chat, the Responses bridge, and native Gemini (`inlineData` audio) — with the full policy pipeline (guardrails see an `[audio]` placeholder, never the bytes). **Audio output**: `modalities: ["text", "audio"]` + `audio: {voice, format}` returns `message.audio` (transcript + base64 WAV, or raw `pcm16`) — OpenAI/Azure passthrough incl. streamed `delta.audio`; Gemini translates to `responseModalities` + `speechConfig` (voice map shared with TTS); guardrails see transcripts (block/redact text, never the bytes). Image-to-image chat: Gemini image models (`gemini-2.5-flash-image`) on the chat surface return generated images as `image_url` content parts, round-tripped through the native Gemini format |
 | **Native inbound formats** | Anthropic Messages API (`POST /v1/messages`) and Gemini format (`POST /v1/models/{model}:generateContent`, `:streamGenerateContent`, `:embedContent`, `:batchEmbedContents` — `/v1` and `/v1beta`) accepted natively: same keys, guardrails, budgets, routing and caching as the OpenAI surface, responses translated back to each format (verified against the real `anthropic` and `google-genai` SDKs) |
 | **Responses API bridge** | `POST /v1/responses` (the OpenAI Agents SDK's default transport) translated to the chat-completions core — input items, instructions, function tools, `text.format`, streaming SSE events; verified against the real OpenAI SDK and OpenAI Agents SDK (see [Agent frameworks](#agent-frameworks)). Deployments can additionally set `native_responses: true` to forward those requests to OpenAI's `/responses` endpoint **in their original shape** (see below) |
-| **Guardrails (in/out)** | Pluggable request/response/stream-phase checks: PII redaction (regex or Microsoft Presidio), prompt-injection heuristics, keyword blocklists, output moderation, response-schema validation, request limits, context-window management. Request-phase guardrails can **modify** more than messages — rewrite `model` (reject-and-redirect: "too expensive for the flagship model, serve it on the small one"), sampling params and tools, with modifications **chaining** across guardrails. Stream-phase guardrails can **rewrite output as it streams** (PII masked mid-stream, never reaching the client, no matter how the provider chunked it). Any guardrail can run in **observe mode** (log & count would-be verdicts without enforcing) and can be **scoped** to certain keys/models/routes (`scope` with fnmatch globs; per-route policy like "strict checks on `/v1/chat/completions`, looser on the native formats"; per-key runtime overrides via `disabled_guardrails`) |
+| **Guardrails (in/out)** | Pluggable request/response/stream-phase checks: PII redaction (regex or Microsoft Presidio), prompt-injection heuristics, keyword blocklists, output moderation, response-schema validation, request limits, context-window management, **prompt compression** (middle-out folding of over-budget prompts to fit — the deterministic, no-LLM-call remediation counterpart of context-window blocking; observe mode measures the savings before you enforce). Request-phase guardrails can **modify** more than messages — rewrite `model` (reject-and-redirect: "too expensive for the flagship model, serve it on the small one"), sampling params and tools, with modifications **chaining** across guardrails. Stream-phase guardrails can **rewrite output as it streams** (PII masked mid-stream, never reaching the client, no matter how the provider chunked it). Any guardrail can run in **observe mode** (log & count would-be verdicts without enforcing) and can be **scoped** to certain keys/models/routes (`scope` with fnmatch globs; per-route policy like "strict checks on `/v1/chat/completions`, looser on the native formats"; per-key runtime overrides via `disabled_guardrails`) |
 | **Model aliasing** | `model_aliases` maps client-requested names to your public model names — apps with hardcoded provider model names (`gpt-4o`, `claude-3-5-sonnet-...`) work unchanged; opt-in `default_model` catches any unknown name; real model names always win over aliases |
 | **Per-key model routing** | Each virtual key can carry its own `model_mappings` (requested name → public model) and `default_model` — per-team steering without code changes. Mappings apply before global aliases and win even over real public names; everything downstream (permissions, budgets, caches, logs) sees the resolved name |
 | **Managed system prompts** | A global `prompts.system_prompt` or a per-key `system_prompt` (admin API/UI, no restart) is prepended to requests that carry **no system message of their own** — the gateway manages the prompt for callers that don't provide one; a client-supplied system message (OpenAI `system`/`developer`, Anthropic `system`, Gemini `systemInstruction`, Responses `instructions`) always wins. Injection runs before guardrails and cache lookup, so the prompt that goes out is the prompt that gets checked and cached |
@@ -486,6 +486,36 @@ guardrails:
 - **Scope**: every chat-family surface (`/v1/chat/completions`, `/v1/responses`, native `/v1/messages`, native Gemini) — blocked requests 400 pre-dispatch, streams included; embeddings/images/audio are unaffected. Like any guardrail it composes with observe mode, scoping and per-key `disabled_guardrails`.
 
 14 tests pin the contract (`tests/test_context_window.py`).
+
+## Prompt compression
+
+`context_window`'s remediation counterpart: where that guardrail *blocks* (or redirects) an over-window request, `prompt_compression` **compresses it to fit** — deterministically, in the request phase, with no LLM call and no added latency. Long agent conversations keep working instead of dying at the window; every saved token is also a saved cent. Order it **before** `context_window` in the guardrails list:
+
+```yaml
+guardrails:
+  - name: prompt_compression
+    enabled: true
+    params:
+      # max_input_tokens: 8000   # explicit budget; empty = window-fit
+      reserve_output_tokens: 1024
+      keep_first: 2              # messages kept at the top (the task)
+      keep_last: 4               # at the bottom (the live exchange)
+      min_message_chars: 512     # floor for oldest-first truncation
+  - name: context_window         # ordered after: gets what compression saved
+    enabled: true
+```
+
+The algorithm is middle-out folding, the shape agent frameworks converged on:
+
+- **Fold the middle.** Leading *system* messages are always kept (policy, small, load-bearing), plus the first `keep_first` and the last `keep_last` non-system messages; everything between is dropped. A short note — `[gateway: 6 earlier messages (~2400 tokens) were removed...]` — is prepended to the first kept message so the model knows its history has a gap. Content-only: roles and content shapes are preserved (a parts-list message gains one leading text part, images ride along untouched), so every provider adapter and every native outbound format handles the folded request exactly like the original.
+- **Then truncate oldest-first**, only if still over: kept non-system messages are shortened toward `min_message_chars` one at a time, oldest first. The system block and the *last* message are never trimmed — a response to a mangled task or a mangled latest turn is garbage either way.
+- **Never blocks.** When even compression can't reach the target (a single gigantic last message), the guardrail steps aside and the request flows on untouched — `context_window` (or the provider) gives the honest error. Compression is a saver, not a blocker.
+
+The target: `max_input_tokens` when set (an explicit budget — cost control even on models whose window would never block), else the model's declared window minus `reserve_output_tokens` — the same vocabulary and default `context_window` uses, so a request folded under the target then *passes* the `context_window` check ordered after it. Models with neither are unmanaged.
+
+Like every guardrail it composes with the framework for free: observe mode logs the would-be savings without touching the request (measure the ROI before enforcing), scoping limits it to keys/models/routes, per-key `disabled_guardrails` turns it off at runtime, and each verdict lands in the request log's `guardrail_actions` with `tokens_before` / `tokens_after` / `tokens_saved` / `messages_dropped` / `messages_truncated`. Enforced savings aggregate on `gateway_prompt_compression_saved_tokens_total{model}` — the ROI metric; multiply by your input price. Modifications run before the cache lookup, so compressed and uncompressed forms of one logical prompt hold different cache entries (different wires, different entries).
+
+18 tests pin the contract (`tests/test_prompt_compression.py`).
 
 ## Capture-replay harness
 
@@ -1106,6 +1136,7 @@ Because the OpenAI adapter is a passthrough, you can point `providers.openai.api
 | `gateway_markup_usd_total` | counter | tenant — pricing-markup revenue (billed − actual, from a tenant's `pricing_markup_pct`) |
 | `gateway_guardrail_blocks_total` | counter | guardrail, phase — enforce mode only |
 | `gateway_guardrail_observed_total` | counter | guardrail, phase, action — would-be verdicts in observe mode |
+| `gateway_prompt_compression_saved_tokens_total` | counter | model — estimated input tokens removed by enforced `prompt_compression` folds/truncations (observe mode and replay runs never count); the ROI metric — multiply by your input price |
 | `gateway_cache_hits_total` | counter | result (hit / semantic / miss) |
 | `gateway_alerts_total` | counter | kind, outcome — budget-threshold alerts (sent / failed / skipped-when-no-URL) |
 | `gateway_auth_total` | counter | authenticator, result (authenticated / rejected) — per auth-chain step |

@@ -8,6 +8,39 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Prompt compression guardrail — the remediation counterpart of
+  context_window: where that guardrail blocks (or redirects) an
+  over-window request, prompt_compression deterministically
+  COMPRESSES it to fit — middle-out folding, no LLM call, no added
+  latency. Always keeps leading system messages plus the first
+  keep_first and last keep_last non-system messages, drops the middle
+  with a marker note prepended as CONTENT to the first kept message
+  (roles and content-part shapes preserved — a parts-list message
+  gains one leading text part, images ride along untouched — so every
+  provider adapter and native outbound format serves the folded
+  request exactly like the original). If still over the target,
+  truncates kept messages oldest-first toward min_message_chars;
+  never trims the system block or the last message (a response to a
+  mangled task or latest turn is garbage either way). Never blocks:
+  when it cannot reach the target (a gigantic last message) it steps
+  aside and the request flows on untouched — context_window, ordered
+  after it, gives the honest error. Target: max_input_tokens when set
+  (an explicit budget — cost control even on models whose window
+  would never block), else the declared window minus
+  reserve_output_tokens (same vocabulary and default as
+  context_window, so compress-then-check composes: a request folded
+  under the target passes the check that follows). Framework
+  composition for free: observe mode logs would-be savings without
+  touching the request, scoping limits it to keys/models/routes,
+  per-key disabled_guardrails turns it off at runtime, verdicts land
+  in guardrail_actions with tokens_before/after/saved and
+  messages_dropped/truncated, and enforced savings aggregate on
+  gateway_prompt_compression_saved_tokens_total{model} (the ROI
+  metric; observe mode and replay-harness runs never count — the
+  GUARDRAIL_BLOCKS discipline applied to savings). Modifications run
+  before the cache lookup, so compressed and uncompressed forms of
+  one logical prompt hold different cache entries. 18 new tests
+  (tests/test_prompt_compression.py); full suite 974 passing.
 - Data-residency routing — deployment-tag-constrained routing, fail
   closed. Each deployment may carry an operator-asserted `residency`
   tag (lowercase slug, e.g. "eu" — config.yaml; None = NO CLAIM,

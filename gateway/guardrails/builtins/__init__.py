@@ -15,6 +15,7 @@ from .keyword_blocklist import KeywordBlocklistGuardrail
 from .output_moderation import OutputModerationGuardrail
 from .pii_redaction import PIIRedactionGuardrail
 from .presidio_pii import PresidioPIIGuardrail
+from .prompt_compression import PromptCompressionGuardrail
 from .prompt_injection import PromptInjectionGuardrail
 from .request_limits import RequestLimitsGuardrail
 from .response_schema import ResponseSchemaGuardrail
@@ -28,6 +29,7 @@ BUILTIN_GUARDRAILS: dict[str, type] = {
     ResponseSchemaGuardrail.name: ResponseSchemaGuardrail,
     RequestLimitsGuardrail.name: RequestLimitsGuardrail,
     ContextWindowGuardrail.name: ContextWindowGuardrail,
+    PromptCompressionGuardrail.name: PromptCompressionGuardrail,
 }
 
 __all__ = [
@@ -36,6 +38,7 @@ __all__ = [
     "KeywordBlocklistGuardrail",
     "OutputModerationGuardrail",
     "PIIRedactionGuardrail",
+    "PromptCompressionGuardrail",
     "PromptInjectionGuardrail",
     "RequestLimitsGuardrail",
     "ResponseSchemaGuardrail",

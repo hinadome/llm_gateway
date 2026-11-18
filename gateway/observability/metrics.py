@@ -82,6 +82,15 @@ GUARDRAIL_OBSERVED = Counter(
     ["guardrail", "phase", "action"],
 )
 
+PROMPT_COMPRESSION_SAVED = Counter(
+    "gateway_prompt_compression_saved_tokens_total",
+    "Estimated input tokens removed from prompts by the "
+    "prompt_compression guardrail (enforced compressions only; observe "
+    "mode and replay-harness runs never count). The ROI metric: "
+    "multiply by your input price.",
+    ["model"],
+)
+
 CACHE = Counter(
     "gateway_cache_hits_total",
     "Response cache lookups.",
