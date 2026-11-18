@@ -51,6 +51,7 @@ from .core.batch_worker import BatchWorker
 from .core.canary import CanaryProber
 from .core.idempotency import IdempotencyStore
 from .core.pii_scan import PIIScanner
+from .core.slo_alerts import SLOAlertEvaluator
 from .core.cache import ResponseCache
 from .core.events import EventBus
 from .core.cost import CostCalculator
@@ -391,6 +392,15 @@ def create_app(
     # POST /admin/canaries/probe drive waves directly; the lifespan
     # loop below is the only *scheduled* driver).
     canary_prober = CanaryProber(router, config.canary, events=events_bus)
+    # SLO alert evaluator (tier 44): turns the tier-42/43 verdicts
+    # into fire-once/re-arm transitions. Built here, attached to
+    # app.state after the app exists (tests drive evaluate_once
+    # directly; the lifespan loop below is the only *scheduled*
+    # driver). Shares the budget-alert HTTP client — alert POSTs are
+    # not request traffic and must not appear as spans.
+    slo_alert_evaluator = SLOAlertEvaluator(
+        client=alert_http_client, events=events_bus
+    )
     # PII/secret scanner: pure computation over stored log bodies —
     # rebuilt on config swap (detectors depend on pii_scan settings).
     pii_scanner = PIIScanner(config.pii_scan)
@@ -478,6 +488,34 @@ def create_app(
 
         canary_task = asyncio.create_task(_canary_loop())
 
+        # SLO alert evaluation (tier 44): one verdict pass per
+        # interval — the tier-42/43 numbers turned into the two
+        # transitions an on-call consumes (fire on breach/burn/
+        # exhaustion, recover when provably healthy; a quiet window
+        # holds state and says nothing). Always started (not gated on
+        # targets or alerts.enabled) so hot-enabling takes effect from
+        # the next pass; re-reads app.state.config.slos each
+        # iteration. Under pytest (ASGITransport skips the lifespan)
+        # this loop never starts — tests drive evaluate_once()
+        # directly.
+        async def _slo_alert_loop() -> None:
+            while True:
+                current = app.state.config.slos
+                active = bool(current.targets) and current.alerts.enabled
+                if active:
+                    try:
+                        async with get_sessionmaker()() as session:
+                            await slo_alert_evaluator.evaluate_once(
+                                session, app.state.config
+                            )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("slo alert evaluation failed")
+                await asyncio.sleep(
+                    current.evaluation_interval_seconds if active else 30.0
+                )
+
+        slo_alert_task = asyncio.create_task(_slo_alert_loop())
+
         # MCP session TTL: evict gateway-issued sessions idle past
         # mcp.session_ttl_seconds. The registry is the gateway's OWN
         # state (survives hot-reloads — a client mid-conversation is
@@ -554,6 +592,7 @@ def create_app(
         if batch_task is not None:
             batch_task.cancel()
         canary_task.cancel()
+        slo_alert_task.cancel()
         mcp_sweep_task.cancel()
         if vault_invalidation_task is not None:
             vault_invalidation_task.cancel()
@@ -569,6 +608,7 @@ def create_app(
             )
         await client.aclose()
         await alerts.aclose()
+        await slo_alert_evaluator.aclose()
         await audit.aclose()
         # Authenticators that own resources (JWKS HTTP client).
         for step in app.state.auth_chain.steps:
@@ -619,6 +659,8 @@ def create_app(
     # Canary prober (probe_once() driven by the lifespan loop, the
     # probe-now endpoint, or tests directly).
     app.state.canary = canary_prober
+    # SLO alert evaluator (admin-plane; tests drive evaluate_once()).
+    app.state.slo_alerts = slo_alert_evaluator
     # PII/secret scanner (admin-plane GETs; rebuilt on config swap).
     app.state.pii_scanner = pii_scanner
     # Prompt library (admin-plane CRUD routes live in api/admin.py).

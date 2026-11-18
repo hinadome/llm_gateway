@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 85 Python files, ~31,100 lines, 1189 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 86 Python files, ~31,550 lines, 1200 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -505,11 +505,18 @@ gateway/
 │                           burn is real, the short one confirms it
 │                           is still burning — a burst that already
 │                           ended never fires; zero-tolerance bars
-│                           have no rate to compute and say so); the
-│                           config echoes as
+│                           have no rate to compute and say so); tier
+│                           44 attaches the target's persisted
+│                           alert state (firing / condition / since
+│                           — the same settings KV row the
+│                           evaluator wrote, so the panel shows
+│                           exactly what on-call was paged for;
+│                           null when never fired or recovered);
+│                           the config echoes as
 │                           model_dump(); read-at-request-time means
 │                           hot-reload re-verdicts on the next call;
-│                           breach delivery is a later tier;
+│                           delivery itself is the background
+│                           evaluator's job (slo_alerts.py);
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -1147,9 +1154,7 @@ gateway/
 │   │                       and sorts by name: no loop, no persistence,
 │   │                       no cached verdicts, so a tightened bar
 │   │                       re-verdicts on the next read (hot-reload
-│   │                       applies instantly); breach delivery is a
-│   │                       later tier — this surface is the
-│   │                       measurement, never a pager. Tier 43 adds
+│   │                       applies instantly). Tier 43 adds
 │   │                       the error-budget lens, same query+pure
 │   │                       split: measure_bad is one window's
 │   │                       bad-event accounting (denominator = the
@@ -1182,6 +1187,50 @@ gateway/
 │   │                       the target's own window, floored at 1;
 │   │                       status computes burn rules first so
 │   │                       at_risk can see them
+│   ├── slo_alerts.py      SLO alert delivery (tier 44): the verdicts
+│   │                       get teeth. alert_condition is the pure
+│   │                       (firing, condition) machine over one
+│   │                       status() row — breached first (the
+│   │                       promise itself), then any burn rule
+│   │                       burning (the pace), then budget
+│   │                       exhausted; provably healthy needs every
+│   │                       leg good; anything insufficient is
+│   │                       UNKNOWN and the caller holds prior
+│   │                       state (a quiet window neither fires
+│   │                       nor un-fires — an SLO that stops
+│   │                       receiving traffic must never quietly
+│   │                       clear a page). SLOAlertEvaluator.
+│   │                       evaluate_once reuses slos.status() so an
+│   │                       alert is decided by exactly the numbers
+│   │                       the dashboard serves (no drift between
+│   │                       delivery and measurement); state is a
+│   │                       JSON map on the settings KV table
+│   │                       (slo_alert_state: name -> firing/
+│   │                       condition/since), persisted BEFORE
+│   │                       delivery so a crash mid-pass prefers
+│   │                       duplicate silence over duplicate noise,
+│   │                       surviving restarts (single-writer: the
+│   │                       lifespan loop, so no compare-and-swap
+│   │                       needed, unlike the concurrent budget
+│   │                       alerts); fire-once per target, re-arms
+│   │                       only on a genuine recovery, names drop
+│   │                       out when the target leaves the config.
+│   │                       Transitions emit slo.alert / slo.recovered
+│   │                       observer events and POST self-sufficient
+│   │                       payloads (definition + condition +
+│   │                       numbers + human message) to the
+│   │                       slos.alerts webhook — bounded retries,
+│   │                       gateway_alerts_total{kind="slo",
+│   │                       outcome=sent|failed|skipped}; no URL =
+│   │                       skipped no-op while events still fire;
+│   │                       alerts.enabled=false turns the evaluator
+│   │                       off entirely while measurement keeps
+│   │                       serving. The lifespan loop (always
+│   │                       started; 30s idle re-check with no
+│   │                       targets or disabled, so hot-enabling is
+│   │                       immediate) re-reads app.state.config.
+│   │                       slos each pass; under pytest tests drive
+│   │                       evaluate_once() directly
 │   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
 │   │                       that answers "did secrets land in the request
 │   │                       log?"): detectors mirror the pii_redaction
@@ -1709,7 +1758,12 @@ gateway/
                             exhausted red, insufficient gray), every
                             burn rule's multiwindow pace verdict in
                             its tooltip and red badges for rules that
-                            are firing — the panel hides
+                            are firing; tier 44 adds the red
+                            "alerting" badge on objectives whose
+                            alert already fired (condition + since in
+                            its tooltip; fire-once — on-call was
+                            paged, and the badge stays until the
+                            target provably recovers) — the panel hides
                             itself when no targets are configured, and a
                             tenant admin who cannot read SLOs loses the
                             panel, not the tab), key
@@ -3060,6 +3114,45 @@ tests/
 │                        pace verdicts while the budget stands. A
 │                        second UI-surface pin covers the Budget
 │                        column (tests/test_admin_ui.py)
+├── test_slo_alerts.py   SLO alert delivery (tier 44): pure units —
+│                        the condition machine (breached outranks
+│                        burning outranks exhausted; healthy needs
+│                        every leg; insufficient is UNKNOWN — never
+│                        healthy), the payloads (self-sufficient:
+│                        definition + condition + numbers + message;
+│                        recovery says what it healed to), delivery
+│                        outcomes (no URL = skipped no-op, failing
+│                        endpoint runs its bounded retries then
+│                        honest failure, working one sent — all on
+│                        gateway_alerts_total{kind="slo"}); e2e over
+│                        seeded windows, each driving evaluate_once()
+│                        directly (the lifespan loop never runs
+│                        under pytest) with the webhook sink injected
+│                        as the app's alert client and the Recorder
+│                        event handler capturing slo.alert /
+│                        slo.recovered — fire-once (one webhook, one
+│                        event, a second pass silent, and a
+│                        brand-new evaluator — the restart story —
+│                        reads the persisted state and stays
+│                        silent), recovery re-arms (heal →
+│                        slo_recovered, re-breach → a second alert:
+│                        fire, recover, re-fire on the sink), the
+│                        insufficient hold (after firing, a 3-row
+│                        window says NOTHING — no recovery, state
+│                        held; healthy evidence returns and the
+│                        recovery fires), burn-on-pace (the at_risk
+│                        seed: bar met, fast-burn burning — pages
+│                        with condition burning while the payload
+│                        honestly carries verdict met), the admin
+│                        surface (rows carry firing/condition/since
+│                        after a fire, null before and after
+│                        recovery; the config echo carries the
+│                        delivery settings), the kill switch
+│                        (alerts.enabled=false: no deliveries, no
+│                        events, no state — measurement still
+│                        verdicts) and the no-targets no-op. A
+│                        third UI-surface pin covers the alerting
+│                        badge (tests/test_admin_ui.py)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while

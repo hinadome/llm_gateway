@@ -278,6 +278,21 @@ async def test_admin_ui_slo_budget_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_slo_alert_surface(env):
+    # Tier 44: the delivery state — a red "alerting" badge on targets
+    # whose alert already fired (fire-once: on-call was paged; the
+    # badge stays until the target provably recovers), with the
+    # condition and since in its tooltip. Static-shell assertions
+    # only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        "alertBadge",
+        "alerting",
+        "fire-once",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

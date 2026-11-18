@@ -36,6 +36,7 @@ from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as
 from ..core import migration as migration_core
 from ..core import promotion as promotion_core
 from ..core import slos as slos_core
+from ..core import slo_alerts as slo_alerts_core
 from ..core import trials as trials_core
 from ..core.vault import VaultService
 from ..db import get_sessionmaker
@@ -2682,13 +2683,21 @@ async def slo_status(
     verdict: the long window establishes the burn is real, the
     short one confirms it is still burning — a burst that already
     ended never fires; zero-tolerance bars have no rate to compute
-    and say so). This surface is
-    the measurement and the honest answer — never a pager; alert
-    delivery on breach is a later tier."""
+    and say so). Tier 44 attaches each target's persisted ``alert``
+    state (firing, condition, since — what on-call was already paged
+    for, from the same settings row the evaluator wrote; ``null``
+    when the target has never fired or has recovered). This surface is
+    the measurement and the honest answer — the *delivery* is the
+    background evaluator's job (webhook + ``slo.alert`` /
+    ``slo.recovered`` events, fire-once per transition, configured
+    under ``slos.alerts``)."""
     config = raw_request.app.state.config
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         data = await slos_core.status(session, config)
+        state = await slo_alerts_core.alert_state(session)
+    for row in data:
+        row["alert"] = state.get(row["name"])
     return {"data": data, "config": config.slos.model_dump()}
 
 

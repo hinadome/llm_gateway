@@ -8,6 +8,37 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- SLO alert delivery (tier 44) — the tier-42/43 verdicts get teeth.
+  Measurement pages no one; delivery does. A background evaluator
+  (the canary-loop shape: always started, re-reading `slos:` each
+  pass, so hot-reload applies from the next pass) runs one verdict
+  pass per `slos.evaluation_interval_seconds` and turns it into the
+  two transitions an on-call consumes.
+  - **Decided by the served numbers.** Each pass is exactly the
+    `status()` behind `GET /admin/slos` — an alert can never drift
+    from what the dashboard shows.
+  - **Fire-once / re-arm, persisted.** `slo.alert` when a target
+    starts firing — bar `breached`, a burn rule `burning`, or the
+    budget `exhausted`, in that precedence — and `slo.recovered`
+    when it is provably healthy again. State lives on the settings
+    KV table (a restart never re-pages), persists before delivery
+    (a crash mid-pass prefers duplicate silence over duplicate
+    noise), and only a genuine recovery re-arms.
+  - **A quiet window is not a verdict — in either direction.**
+    Insufficient evidence holds the previous state: an SLO that
+    stops receiving traffic neither fires nor quietly un-fires.
+  - **Best-effort delivery that never blocks.** Webhook payloads
+    carry the definition, the condition, the numbers and the human
+    message; bounded retries; outcomes counted on
+    `gateway_alerts_total{kind="slo",outcome=sent|failed|skipped}`.
+    No URL: skipped no-op while the events still fire.
+    `slos.alerts.enabled: false`: the whole evaluator off — no
+    state, no events — while measurement keeps serving.
+  `GET /admin/slos` rows carry the target's persisted `alert` state
+  (what on-call was already paged for), and the Overview panel
+  marks fired targets with a red *alerting* badge until they
+  provably recover. 10 tests + a UI-surface pin; the suite stands
+  at 1200.
 - Error budgets & burn rate (tier 43) — the tier-42 SLO model gains
   its second lens. A bar says whether the promise held; a budget
   says how fast it is being spent. Every metric is restated as a

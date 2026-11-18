@@ -707,6 +707,29 @@ class SLOBurnRule(BaseModel):
         return self
 
 
+class SLOAlertsConfig(BaseModel):
+    """SLO alert delivery (tier 44): webhook + events when a target's
+    verdict or budget turns bad, and when it recovers. Delivery is
+    best-effort with bounded retries (the budget-alert semantics);
+    without a ``webhook_url`` (or ``url_env``) the webhook is a no-op
+    that still counts as ``skipped`` on ``gateway_alerts_total`` —
+    the ``slo.alert`` / ``slo.recovered`` observer events fire either
+    way. ``enabled: false`` turns the whole evaluator off (no state
+    writes, no events, no webhooks) while SLO *measurement* keeps
+    serving at ``GET /admin/slos``."""
+
+    enabled: bool = True
+    webhook_url: str | None = None
+    url_env: str | None = None  # env var that overrides webhook_url when set
+    timeout_seconds: float = 5.0
+    max_attempts: int = 2  # 1 retry, 0.5s backoff (budget-alert pacing)
+
+    def resolve_url(self) -> str | None:
+        if self.url_env and os.environ.get(self.url_env):
+            return os.environ[self.url_env]
+        return self.webhook_url
+
+
 class SLOsConfig(BaseModel):
     """Service level objectives (tier 42): named, deliberate promises
     about the client experience — ``p95 latency under 800ms``, ``error
@@ -727,6 +750,15 @@ class SLOsConfig(BaseModel):
     allowed, budget remaining, and the ``burn`` rules — multiwindow
     pace verdicts over the same rows. ``burn: []`` disables the
     pace verdicts (the budget math stands on its own).
+
+    Tier 44 adds delivery: ``evaluation_interval_seconds`` paces the
+    background evaluator (the canary-loop shape — always started,
+    re-reading this config each pass, so hot-reload applies from the
+    next pass), and ``alerts`` configures the webhook. Fire-once /
+    re-arm per target and condition, persisted on the settings KV
+    table so restarts never re-page; recovery fires when a target is
+    provably healthy again — a quiet window (insufficient_evidence)
+    is *unknown*, never a recovery.
     """
 
     targets: list[SLOTargetConfig] = Field(default_factory=list)
@@ -741,6 +773,11 @@ class SLOsConfig(BaseModel):
             ),
         ]
     )
+    # The evaluator's pace (tier 44). One pass = the same status() the
+    # admin endpoint serves, so an alert is decided by exactly the
+    # numbers the dashboard shows.
+    evaluation_interval_seconds: float = Field(default=60.0, gt=0)
+    alerts: SLOAlertsConfig = Field(default_factory=SLOAlertsConfig)
 
 
 class PIIScanConfig(BaseModel):

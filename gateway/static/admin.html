@@ -912,6 +912,15 @@ async function loadSLOs() {
     const pct = b.remaining_pct == null ? "—" : Math.round(b.remaining_pct) + "% left";
     return `<span class="b ${BUDGET_COLOR[b.state] || "b-gray"}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(pct)}</span>${burning}`;
   }
+  // Tier 44: the delivery state — a red badge on targets whose alert
+  // already fired (fire-once: on-call was paged; the badge stays
+  // until the target provably recovers).
+  function alertBadge(t) {
+    const a = t.alert;
+    if (!a || !a.firing) return "";
+    const tip = `alert ${a.condition} since ${esc((a.since || "").replace("T", " ").slice(0, 19))} — already delivered (fire-once)`;
+    return ` <span class="b b-red" title="${tip}">alerting</span>`;
+  }
   box.innerHTML = "<thead><tr><th>Objective</th><th>Scope</th><th>Metric</th><th class=num>Bar</th><th class=num>Measured</th><th class=num>Requests</th><th>Budget</th><th>Verdict</th><th>Window</th></tr></thead><tbody>" +
     targets.map(t => {
       const scope = esc(t.model) + (t.deployment ? ` · <span class="mono" style="font-size:12px">${esc(t.deployment)}</span>` : "");
@@ -920,7 +929,7 @@ async function loadSLOs() {
         ? `<span class="muted" title="${esc(t.reason || "")}">unproven</span>`
         : fmtSloValue(t.metric, t.value);
       return `<tr>
-        <td>${esc(t.name)}</td>
+        <td>${esc(t.name)}${alertBadge(t)}</td>
         <td>${scope}</td>
         <td class="mono" style="font-size:12px">${esc(t.metric)}</td>
         <td class="num">${fmtSloValue(t.metric, t.target)}</td>
