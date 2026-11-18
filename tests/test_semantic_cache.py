@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+import httpx
 import math
 
 import pytest
+from fakeredis import FakeAsyncRedis
 from prometheus_client.registry import REGISTRY
 
-from gateway.config import SemanticCacheConfig
+from gateway.config import SemanticCacheConfig, Settings
+from gateway.core.cache import cache_key_for
+from gateway.core.redis_backends import RedisSemanticCache
 from gateway.core.semantic_cache import SemanticCache, cosine_similarity
+from gateway.db import dispose_engine, init_engine, reset_engine_for_tests
+from gateway.main import create_app
 from gateway.schemas import ChatCompletionRequest
 
-from .conftest import ADMIN_KEY, _make_env, auth, chat_body, create_key, make_config
+from .conftest import (
+    ADMIN_KEY,
+    MockUpstream,
+    _make_env,
+    auth,
+    chat_body,
+    create_key,
+    make_config,
+)
 
 
 def cache_count(result: str) -> float:
@@ -395,3 +409,249 @@ async def test_semantic_model_without_deployment_disables(tmp_path, caplog):
             assert r.headers["X-Gateway-Cache"] == "MISS"
         # No embeddings call was attempted (layer disabled at startup).
         assert len([b for b in ns.mock.bodies() if "input" in b]) == 0
+
+
+# ----------------------------------------------------------------------
+# Redis-backed store (tier 59): parity with the in-memory implementation,
+# plus the sharing the backend exists for. Unit tests run against
+# fakeredis; the e2e tests inject it into real apps.
+# ----------------------------------------------------------------------
+
+
+async def test_redis_put_get_roundtrip_and_threshold():
+    redis = FakeAsyncRedis()
+    cache = RedisSemanticCache(
+        redis, SemanticCacheConfig(threshold=0.95), _fake_embed, prefix="t", clock=FakeClock()
+    )
+    await cache.put("m", _request("hello"), [1.0, 0.0], {"id": "r1"})
+    # identical direction -> hit
+    assert await cache.get("m", [2.0, 0.0]) == {"id": "r1"}
+    # cosine([1,0],[1,1]) ~ 0.707 -> below threshold
+    assert await cache.get("m", [1.0, 1.0]) is None
+
+
+async def test_redis_get_picks_best_match():
+    redis = FakeAsyncRedis()
+    clock = FakeClock()
+    cache = RedisSemanticCache(
+        redis, SemanticCacheConfig(threshold=0.9), _fake_embed, prefix="t", clock=clock
+    )
+    await cache.put("m", _request("a"), [1.0, 0.0], {"id": "weak"})
+    await cache.put("m", _request("b"), [0.99, 0.141], {"id": "strong"})
+    # closer to the second entry
+    assert await cache.get("m", [0.98, 0.2]) == {"id": "strong"}
+
+
+async def test_redis_model_isolation():
+    redis = FakeAsyncRedis()
+    cache = RedisSemanticCache(redis, SemanticCacheConfig(), _fake_embed, prefix="t")
+    await cache.put("model-a", _request("hello"), [1.0, 0.0], {"id": "r1"})
+    assert await cache.get("model-b", [1.0, 0.0]) is None
+    assert await cache.get("model-a", [1.0, 0.0]) == {"id": "r1"}
+
+
+async def test_redis_policy_token_isolation():
+    # A hit skips response guardrails, so entries never cross policy
+    # buckets (the same contract the in-memory store keeps).
+    redis = FakeAsyncRedis()
+    cache = RedisSemanticCache(redis, SemanticCacheConfig(), _fake_embed, prefix="t")
+    await cache.put("m", _request("hello"), [1.0, 0.0], {"id": "r1"}, "policy-a")
+    assert await cache.get("m", [1.0, 0.0], "policy-b") is None
+    assert await cache.get("m", [1.0, 0.0], "policy-a") == {"id": "r1"}
+
+
+async def test_redis_per_entry_ttl_and_freshness_window():
+    # Per-key cache policy (tier 54), both sides: the writer's own
+    # window rides the entry's Redis EX (pinned here — server-side real
+    # time, not clock-testable), and a reader's max_age bounds what it
+    # accepts from the payload's stored write time — a freshness miss
+    # leaves the entry for wider-window readers.
+    redis = FakeAsyncRedis()
+    clock = FakeClock()
+    cache = RedisSemanticCache(
+        redis, SemanticCacheConfig(ttl_seconds=10), _fake_embed, prefix="t", clock=clock
+    )
+    req = _request("hello")
+    await cache.put("m", req, [1.0, 0.0], {"id": "long"}, ttl_seconds=30)
+    entry_key = f"t:sem:m||{cache_key_for(req)}".encode()
+    assert await redis.ttl(entry_key) == 30
+    clock.now += 5
+    assert await cache.get("m", [1.0, 0.0], max_age=4) is None  # too stale for a 4s caller
+    assert await cache.get("m", [1.0, 0.0], max_age=5) == {"id": "long"}
+
+
+async def test_redis_lru_eviction_bound():
+    redis = FakeAsyncRedis()
+    clock = FakeClock()
+    cache = RedisSemanticCache(
+        redis, SemanticCacheConfig(max_entries=2), _fake_embed, prefix="t", clock=clock
+    )
+    await cache.put("m", _request("one"), [1.0, 0.0], {"id": "r1"})
+    clock.now += 1
+    await cache.put("m", _request("two"), [0.0, 1.0], {"id": "r2"})
+    clock.now += 1
+    await cache.put("m", _request("three"), [1.0, 1.0], {"id": "r3"})
+    # oldest entry ("one") was evicted; the others are not similar enough
+    # to a [1,0] query (orthogonal and 0.707) to mask the eviction.
+    assert await cache.get("m", [1.0, 0.0]) is None
+    assert await cache.get("m", [0.0, 1.0]) == {"id": "r2"}
+    assert await redis.zcard("t:sem:index") == 2
+
+
+async def test_redis_reput_same_request_replaces():
+    redis = FakeAsyncRedis()
+    cache = RedisSemanticCache(redis, SemanticCacheConfig(), _fake_embed, prefix="t")
+    await cache.put("m", _request("hello"), [1.0, 0.0], {"id": "old"})
+    await cache.put("m", _request("hello"), [1.0, 0.1], {"id": "new"})
+    assert await cache.get("m", [1.0, 0.1]) == {"id": "new"}
+    # one entry + the index — a reput replaces, never duplicates
+    assert await redis.zcard("t:sem:index") == 1
+    assert await redis.dbsize() == 2
+
+
+async def test_redis_tombstone_pruning():
+    # An entry whose EX passed (or that was evicted mid-index) leaves a
+    # tombstone in the index; the next lookup that walks it prunes it.
+    redis = FakeAsyncRedis()
+    cache = RedisSemanticCache(redis, SemanticCacheConfig(), _fake_embed, prefix="t")
+    req = _request("hello")
+    await cache.put("m", req, [1.0, 0.0], {"id": "r1"})
+    assert await cache.get("m", [1.0, 0.0]) == {"id": "r1"}
+    await redis.delete(f"t:sem:m||{cache_key_for(req)}".encode())  # simulate EX passing
+    assert await redis.zcard("t:sem:index") == 1  # tombstone lingers...
+    assert await cache.get("m", [1.0, 0.0]) is None
+    assert await redis.zcard("t:sem:index") == 0  # ...pruned by the lookup
+
+
+async def test_redis_clear():
+    redis = FakeAsyncRedis()
+    cache = RedisSemanticCache(redis, SemanticCacheConfig(), _fake_embed, prefix="t")
+    await cache.put("m", _request("a"), [1.0, 0.0], {"id": "r1"})
+    await cache.put("m", _request("b"), [0.0, 1.0], {"id": "r2"})
+    await cache.clear()
+    assert await cache.get("m", [1.0, 0.0]) is None
+    assert await redis.dbsize() == 0
+
+
+async def test_redis_embed_failure_returns_none():
+    async def broken(text: str) -> list[float]:
+        raise RuntimeError("embedder down")
+
+    redis = FakeAsyncRedis()
+    cache = RedisSemanticCache(redis, SemanticCacheConfig(), broken, prefix="t")
+    assert await cache.embed(_request("hello")) is None
+
+
+async def test_redis_two_stores_share_entries():
+    """Two stores over one client = two replicas' stores: what A
+    stores, B serves — the whole point of the backend."""
+    redis = FakeAsyncRedis()
+    cfg = SemanticCacheConfig()
+    replica_a = RedisSemanticCache(redis, cfg, _fake_embed, prefix="t")
+    replica_b = RedisSemanticCache(redis, cfg, _fake_embed, prefix="t")
+    await replica_a.put("m", _request("hello"), [1.0, 0.0], {"id": "shared"})
+    assert await replica_b.get("m", [2.0, 0.0]) == {"id": "shared"}
+
+
+# -- e2e through the app (fakeredis-injected backend) ---------------------
+
+
+async def test_redis_semantic_hit_e2e(tmp_path):
+    redis = FakeAsyncRedis()
+    config = make_config(
+        redis_backends=True,
+        semantic_cache=SemanticCacheConfig(enabled=True, threshold=0.9),
+    )
+    async for ns in _make_env(
+        tmp_path, config=config, semantic_embedder=_topic_embedder, redis_client=redis
+    ):
+        key = await create_key(ns.client, "sem")
+
+        r1 = await ns.client.post(
+            "/v1/chat/completions",
+            json=chat_body(content="topicA first phrasing"),
+            headers=auth(key["key"]),
+        )
+        assert r1.status_code == 200
+        assert r1.headers["X-Gateway-Cache"] == "MISS"
+
+        r2 = await ns.client.post(
+            "/v1/chat/completions",
+            json=chat_body(content="topicA second phrasing"),
+            headers=auth(key["key"]),
+        )
+        assert r2.status_code == 200
+        assert r2.headers["X-Gateway-Cache"] == "SEMANTIC"
+        # Only the first request reached upstream.
+        assert len([b for b in ns.mock.bodies() if "messages" in b]) == 1
+
+        # The entry really lives in Redis — the app did not fall back
+        # to the per-process store.
+        assert await redis.exists("llm-gateway:sem:index")
+        keys = await redis.keys("llm-gateway:sem:*")
+        assert any(not k.endswith(b"index") for k in keys)  # the entry itself
+
+
+async def test_two_apps_share_semantic_entries(tmp_path):
+    """The tier-59 guarantee end to end: replica A stores a semantic
+    entry; replica B serves a near-duplicate from it. B's process never
+    saw the request — the entry lives in Redis."""
+    redis = FakeAsyncRedis()
+    reset_engine_for_tests()
+    db_url = f"sqlite+aiosqlite:///{tmp_path}/replicas.db"
+    await init_engine(db_url)
+
+    def build() -> tuple:
+        mock = MockUpstream()
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock.handler))
+        app = create_app(
+            settings=Settings(admin_key=ADMIN_KEY, database_url=db_url),
+            config=make_config(
+                redis_backends=True,
+                semantic_cache=SemanticCacheConfig(enabled=True, threshold=0.9),
+            ),
+            http_client=http_client,
+            redis_client=redis,
+            semantic_embedder=_topic_embedder,
+        )
+        app.state.admin_key = ADMIN_KEY  # ASGITransport does not run the lifespan
+        return app, mock, http_client
+
+    app_a, mock_a, http_a = build()
+    app_b, mock_b, http_b = build()
+    try:
+        client_a = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_a), base_url="http://a.test"
+        )
+        client_b = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_b), base_url="http://b.test"
+        )
+        key = (await create_key(client_a, "replica-sem", rpm_limit=10))["key"]
+
+        # replica A serves the request (semantic MISS, upstream on A only)
+        first = await client_a.post(
+            "/v1/chat/completions",
+            json=chat_body(content="topicA first phrasing"),
+            headers=auth(key),
+        )
+        assert first.status_code == 200
+        assert first.headers["X-Gateway-Cache"] == "MISS"
+
+        # replica B serves the near-duplicate from A's shared entry
+        second = await client_b.post(
+            "/v1/chat/completions",
+            json=chat_body(content="topicA second phrasing"),
+            headers=auth(key),
+        )
+        assert second.status_code == 200
+        assert second.headers["X-Gateway-Cache"] == "SEMANTIC"
+        assert [b for b in mock_b.bodies() if "messages" in b] == []  # B never called upstream
+
+        # and the shared store really holds the entry
+        assert await redis.exists("llm-gateway:sem:index")
+        await client_a.aclose()
+        await client_b.aclose()
+    finally:
+        await http_a.aclose()
+        await http_b.aclose()
+        await dispose_engine()

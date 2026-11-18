@@ -40,7 +40,11 @@ facade), so selecting backends is a one-line config change
 ``routing.breaker.backend: redis``) — see ``main.py``. Tier 34 adds
 ``RedisVaultInvalidator``, the BYOK vault's cache-invalidation fan-out
 (``vault.backend: redis``): publish-on-write + a per-replica subscriber
-loop, both best-effort with the vault TTL as the backstop.
+loop, both best-effort with the vault TTL as the backstop. Tier 59
+adds ``RedisSemanticCache`` (``semantic_cache.backend: redis``): the
+similarity layer's store shared across replicas — same brute-force
+cosine semantics, same embed/get/put contract as the in-memory
+``SemanticCache``.
 """
 
 from __future__ import annotations
@@ -54,9 +58,12 @@ from typing import Any, Callable
 from redis import asyncio as aioredis
 from redis.exceptions import RedisError, WatchError
 
+from ..config import SemanticCacheConfig
 from ..observability import metrics
+from ..schemas import ChatCompletionRequest
 from .breaker import CircuitState
-from .cache import cache_key_for  # noqa: F401 — re-exported for convenience
+from .cache import cache_key_for
+from .semantic_cache import EmbedFn, cosine_similarity, embed_request
 
 logger = logging.getLogger("gateway.redis")
 
@@ -269,6 +276,163 @@ class RedisResponseCache:
             # note members added before the feature have none, and this
             # delete is idempotent on absent keys.
             pipe.delete(*[self._stored_at_key(m) for m in members])
+        pipe.delete(self._index_key)
+        await pipe.execute()
+
+
+class RedisSemanticCache:
+    """Semantic (similarity) cache backed by Redis (tier 59).
+
+    The in-memory ``SemanticCache`` is per-process, so a near-duplicate
+    that replica A embedded and stored was a guaranteed miss on replica
+    B. This class puts the whole store in Redis so every replica shares
+    entries — the multi-replica leg the exact cache, rate limiter,
+    breakers, vault and idempotency already had. The contract is
+    identical (``embed`` / ``get`` / ``put`` / ``clear``; the pipeline
+    knows no difference), and so are the semantics:
+
+    * buckets are (model, response-policy token): a hit skips response
+      guardrails, so near-duplicates only serve callers whose policy —
+      and tenant — match the writer's;
+    * per-entry TTL rides the entry's own Redis EX (the per-key cache
+      policy, tier 54: a writer's own window stamps its entry), and a
+      reader's ``max_age`` bounds what it accepts from the stored
+      write time — a freshness miss leaves the entry for wider windows;
+    * LRU is a global bound across models, scored by touch time.
+
+    Layout: one string key per entry holding a JSON payload (embedding,
+    response, write time), plus one zset index whose members are
+    ``model|policy_token|entry_id`` — the bucket is a member PREFIX, so
+    a lookup filters same-bucket candidates from the index before any
+    payload fetch, then brute-forces cosine similarity locally (same
+    math, same threshold, over shared entries). Expired entries (their
+    EX passed server-side) leave tombstones in the index; lookups
+    prune the ones they walk, and eviction/clear sweep the rest.
+    """
+
+    def __init__(
+        self,
+        client: aioredis.Redis,
+        config: SemanticCacheConfig,
+        embed_fn: EmbedFn,
+        prefix: str = "llm-gateway",
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._client = client
+        self.config = config
+        self._embed_fn = embed_fn
+        self._clock = clock
+        self._key_prefix = f"{prefix}:sem:"
+        self._index_key = f"{prefix}:sem:index"
+
+    # -- keys ---------------------------------------------------------
+    # Members are "model|policy_token|entry_id"; the entry key is the
+    # prefix + member. The index (zrange) speaks bytes under redis-py's
+    # default decode_responses=False, so bucket filtering and entry-key
+    # building are byte-wise (the stored-at companion's lesson: str()-ing
+    # an index member builds repr-garbage keys and silently orphans the
+    # real entry).
+    def _member(self, model: str, policy_token: str, entry_id: str) -> str:
+        return f"{model}|{policy_token}|{entry_id}"
+
+    def _entry_key(self, member: str | bytes) -> str | bytes:
+        prefix = self._key_prefix.encode() if isinstance(member, bytes) else self._key_prefix
+        return prefix + member
+
+    async def embed(
+        self,
+        request: ChatCompletionRequest,
+        residencies: frozenset[str] | None = None,
+    ) -> list[float] | None:
+        return await embed_request(self._embed_fn, request, residencies)
+
+    async def get(
+        self,
+        model: str,
+        embedding: list[float],
+        policy_token: str = "",
+        max_age: float | None = None,
+    ) -> dict | None:
+        """Best same-(model, policy) entry with similarity >= threshold,
+        fresh enough for the reader's ``max_age`` window — the payload's
+        stored write time is the age source (the entry's own EX already
+        enforced the writer's window server-side)."""
+        threshold = self.config.threshold
+        bucket = f"{model}|{policy_token}|".encode()
+        members = await self._client.zrange(self._index_key, 0, -1)
+        candidates = [m for m in members if m.startswith(bucket)]
+        if not candidates:
+            return None
+        now = self._clock()
+        raw_entries = await self._client.mget([self._entry_key(m) for m in candidates])
+        best_member: bytes | None = None
+        best_score = 0.0
+        best_response: dict | None = None
+        tombstones: list[bytes] = []
+        for member, raw in zip(candidates, raw_entries):
+            if raw is None:
+                tombstones.append(member)  # EX passed (or evicted): dead index entry
+                continue
+            entry = json.loads(raw)
+            if max_age is not None and now - float(entry["stored_at"]) > max_age:
+                continue  # too stale for THIS caller; keep for wider windows
+            score = cosine_similarity(embedding, entry["embedding"])
+            if score >= threshold and (best_member is None or score > best_score):
+                best_member, best_score, best_response = member, score, entry["response"]
+        if tombstones:
+            # Prune the index entries whose payloads are gone — the
+            # lookup is the natural sweeper (bounded by what it walked);
+            # eviction and clear are the backstops.
+            await self._client.zrem(self._index_key, *tombstones)
+        if best_member is not None:
+            await self._client.zadd(self._index_key, {best_member: now})  # touch
+        return best_response
+
+    async def put(
+        self,
+        model: str,
+        request: ChatCompletionRequest,
+        embedding: list[float],
+        response: dict,
+        policy_token: str = "",
+        ttl_seconds: float | None = None,
+    ) -> None:
+        """Store a successful response under its normalized-request id,
+        with the writer's TTL window as the entry's own Redis EX (None =
+        the configured global — per-key cache policy, tier 54)."""
+        member = self._member(model, policy_token, cache_key_for(request))
+        entry_key = self._entry_key(member)
+        ttl = max(1, int(ttl_seconds or self.config.ttl_seconds))
+        now = self._clock()
+        pipe = self._client.pipeline(transaction=True)
+        pipe.set(
+            entry_key,
+            json.dumps(
+                {"embedding": embedding, "response": response, "stored_at": now},
+                default=str,
+            ),
+            ex=ttl,
+        )
+        pipe.zadd(self._index_key, {member: now})
+        pipe.zcard(self._index_key)
+        _, _, size = await pipe.execute()
+        if size > self.config.max_entries:
+            # Evict the least-recently-touched members — globally across
+            # models, like the in-memory OrderedDict bound.
+            victims = await self._client.zrange(
+                self._index_key, 0, size - self.config.max_entries - 1
+            )
+            if victims:
+                pipe = self._client.pipeline(transaction=True)
+                pipe.delete(*[self._entry_key(v) for v in victims])
+                pipe.zrem(self._index_key, *victims)
+                await pipe.execute()
+
+    async def clear(self) -> None:
+        members = await self._client.zrange(self._index_key, 0, -1)
+        pipe = self._client.pipeline(transaction=True)
+        if members:
+            pipe.delete(*[self._entry_key(m) for m in members])
         pipe.delete(self._index_key)
         await pipe.execute()
 

@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 93 Python files, ~35,600 lines, 1370 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 93 Python files, ~35,800 lines, 1383 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -1147,7 +1147,18 @@ gateway/
 │   │                       Registry — shared windows, cache entries and circuit-breaker
 │   │                       state across workers/replicas, semantics preserved;
 │   │                       RedisVaultInvalidator (tier 34) fans BYOK cache
-│   │                       invalidations across the same fleet (see vault.py).
+│   │                       invalidations across the same fleet (see vault.py);
+│   │                       RedisSemanticCache (tier 59) shares the
+│   │                       similarity store too — one JSON payload
+│   │                       per entry (embedding + response + write
+│   │                       time, EX = the writer's window), a global
+│   │                       zset index whose members are
+│   │                       model|policy|entry_id so a lookup filters
+│   │                       its bucket by prefix before any payload
+│   │                       fetch, brute-force cosine locally, LRU
+│   │                       eviction globally, tombstones pruned by
+│   │                       the lookups that walk them (see
+│   │                       semantic_cache.py).
 │   │                       Tier 54 in RedisResponseCache: the writer's
 │   │                       window is the entry's own EX (per-entry, not
 │   │                       per-cache), and custom-window writes add a
@@ -1190,7 +1201,15 @@ gateway/
 │   │                       exact cache — the entry tuple gains the
 │   │                       per-entry TTL (the writer's window) and
 │   │                       get(max_age=) bounds what the caller
-│   │                       accepts (freshness misses leave the entry)
+│   │                       accepts (freshness misses leave the entry).
+│   │                       Tier 59: the embed step is shared with the
+│   │                       Redis store (module-level embed_request),
+│   │                       and semantic_cache.backend: redis swaps
+│   │                       this class wholesale for RedisSemanticCache
+│   │                       (redis_backends.py) — the pipeline depends
+│   │                       only on embed/get/put, so replicas share
+│   │                       near-duplicate entries with identical
+│   │                       cosine/threshold semantics.
 │   ├── vault.py            BYOK vault (tier 31): tenant-owned provider
 │   │                       credentials, encrypted at rest. VaultService
 │   │                       wraps Fernet/MultiFernet under
@@ -3147,8 +3166,9 @@ create_app(settings, config, http_client, tracer_provider, redis_client, alert_h
  ├── cache:        ResponseCache (memory) | RedisResponseCache (config.cache.backend)
  ├── rate_limiter: RateLimiter (memory)   | RedisRateLimiter (config.rate_limit.backend)
  ├── CostCalculator(config.pricing)
- ├── semantic:      SemanticCache (config.semantic_cache) — None unless enabled;
- │    embedder = injected semantic_embedder (tests) or embed_fn_for(router, model)
+ ├── semantic:      SemanticCache (memory) | RedisSemanticCache (backend: redis) — None
+ │    unless enabled; embedder = injected semantic_embedder (tests) or
+ │    embed_fn_for(router, model)
  │    routing through the normal embeddings machinery; a configured model with
  │    no deployment disables the layer with one startup warning
   ├── BudgetAlertManager(config.alerts, client=alert_http_client)
@@ -3220,7 +3240,7 @@ Being honest about the seams — these are the current trade-offs (all are local
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
 5. **Service selection beyond the built-ins is code.** The rate limiter, response cache and circuit-breaker registry have two built-in backends each (in-memory, Redis) selectable from `config.yaml`, but swapping in something else (e.g., a DynamoDB cache) still means calling `create_app` differently — the selection switch covers the shipped implementations only.
 6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. The same choice is why rotation never touches tokens: a JWT names the *key*, not its credential, so every token naming a key keeps working across its rotations (tier 51) — only raw-credential holders need the new secret. ~~Per-key cache overrides don't exist~~ **Solved (tier 54):** the key row now carries `cache_enabled` (NULL = inherit; `false` = bypass both response caches, exact + semantic, chat and embeddings, lookup and store — narrowing only, global-off stays off) and `cache_ttl_seconds` (NULL = the global window; otherwise the key's own, honored read-side as a freshness bound and write-side as the entry's lifetime), snapshotted at auth like every other key ceiling. Not covered: mTLS client certificates.
-7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
+7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching (exact *and* semantic — `semantic_cache.backend: redis`, tier 59: a near-duplicate one replica embedded and stored is a hit for every replica, `RedisSemanticCache` keeping the same cosine/threshold/TTL/LRU semantics over shared entries) and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
 9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
 10. ~~No tenant concept~~ **Solved:** tenants (`models.Tenant`) group virtual keys under a narrowing policy ceiling — allowlist, RPM/TPM, the three budget windows — with no admin bypass at the tenant layer; tenant admins are scoped (own keys/logs/stats/usage, 404 on cross-tenant ids, 403 on platform endpoints) and auth fails closed on dangling/disabled tenants (see §6). ~~Tenant guardrail scoping has no first-class field (item 9)~~ **Solved (tier 58):** `guardrails[].scope.tenants` / `exclude_tenants` match the tenant's name with fnmatch globs — one field binds a whole tenant (every member key, tenant admins included, the ceiling applies to them like every member), with no key-name globs or per-key `disabled_guardrails` bookkeeping; a platform key (no tenant) is in no tenant, so `tenants` never widens onto it and `exclude_tenants` never excuses it. Remaining gaps, honestly: the admin UI has no tenant views (per-endpoint 403s degrade in-page for tenant admins), and tenant API-key budgets are the only pooling dimension — per-tenant pricing exists as a single cost-plus *markup* multiplier over the shared model pricing table (`pricing_markup_pct`, tier 25), but per-tenant *per-model* price overrides and rate-limit overrides per key-within-tenant still don't exist beyond what the two stacked windows already enforce.
@@ -3273,11 +3293,12 @@ redis:
   prefix: llm-gateway
 rate_limit: {backend: redis}
 cache:      {backend: redis}
+semantic_cache: {backend: redis}
 routing:
   breaker: {backend: redis}
 ```
 
-Keys are namespaced by the prefix and expire shortly after their window/TTL, so idle state cleans itself up (breaker hashes carry a TTL well beyond the cooldown). `check` is one pipelined round trip (plus an `HMGET` for TPM); multi-command steps run inside `MULTI`/`EXEC` transactions. If Redis is unavailable, the breaker fails *open* — `allow` routes anyway and record calls are dropped with a warning (the breaker is protection, not correctness); admin snapshots/reset surface the error instead of lying. Rolling your own backend still only requires the interface (`check` / `record_request` / `record_usage`, `get` / `put` / `clear`, and the async breaker facade) — `create_app(redis_client=...)` accepts an injected client. Tier 34 adds the BYOK vault to the same fleet story: `vault.backend: redis` makes every admin write publish `(tenant_id, provider)` on `{prefix}:vault-invalidation` (`RedisVaultInvalidator`, one listener task per process in the lifespan), so each replica drops its decrypted-key cache entry **and its negative twin** the moment the message lands instead of within `vault.ttl_seconds` — best-effort by design (a failed publish never fails the admin write; a malformed message is skipped loudly; a Redis outage backs the listener off 5s), the TTL the backstop, `memory` (default) the single-process shape.
+Keys are namespaced by the prefix and expire shortly after their window/TTL, so idle state cleans itself up (breaker hashes carry a TTL well beyond the cooldown). `check` is one pipelined round trip (plus an `HMGET` for TPM); multi-command steps run inside `MULTI`/`EXEC` transactions. If Redis is unavailable, the breaker fails *open* — `allow` routes anyway and record calls are dropped with a warning (the breaker is protection, not correctness); admin snapshots/reset surface the error instead of lying. Rolling your own backend still only requires the interface (`check` / `record_request` / `record_usage`, `get` / `put` / `clear`, and the async breaker facade) — `create_app(redis_client=...)` accepts an injected client. Tier 34 adds the BYOK vault to the same fleet story: `vault.backend: redis` makes every admin write publish `(tenant_id, provider)` on `{prefix}:vault-invalidation` (`RedisVaultInvalidator`, one listener task per process in the lifespan), so each replica drops its decrypted-key cache entry **and its negative twin** the moment the message lands instead of within `vault.ttl_seconds` — best-effort by design (a failed publish never fails the admin write; a malformed message is skipped loudly; a Redis outage backs the listener off 5s), the TTL the backstop, `memory` (default) the single-process shape. Tier 59 adds the semantic cache to the shared set: `semantic_cache.backend: redis` builds `RedisSemanticCache` — the same brute-force cosine lookup over entries every replica can serve, one JSON payload per entry under `{prefix}:sem:`, EX carrying the writer's per-key window (tier 54), a global LRU zset index whose `model|policy|entry_id` members let a lookup filter its (model, policy-token) bucket by prefix before fetching payloads, and index tombstones (entries whose EX passed) pruned by the lookups that walk them — eviction and `clear` are the backstops. `memory` (default) remains the single-process store.
 
 **Run against Postgres**: `GATEWAY_DATABASE_URL=postgresql+asyncpg://...`. Tables are created on startup by the same `create_all`.
 
@@ -3766,6 +3787,15 @@ tests/
 │                        + e2e with a deterministic fake embedder (SEMANTIC header,
 │                        stream replay, exact-hit precedence, model isolation, threshold)
 │                        + real router-embedder wiring + startup disable on bad model
+│                        + tier 59 — RedisSemanticCache over fakeredis: parity
+│                        units for every memory contract (threshold, best match,
+│                        model AND policy-token isolation, per-entry EX +
+│                        freshness window, LRU bound, reput-replaces, tombstone
+│                        pruning, clear, embed-failure degrade), two stores over
+│                        one client sharing entries, and e2e: the app really using
+│                        Redis (keys visible) + two apps over one client where
+│                        replica B serves replica A's near-duplicate (SEMANTIC,
+│                        zero upstream calls on B)
 ├── test_playground.py   Admin playground (tier 41): the schema unit
 │                        (key optional, knobs default, stream DECLARED
 │                        so the refusal is the endpoint's explicit

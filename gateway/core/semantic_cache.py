@@ -20,9 +20,11 @@ The store is per-process, TTL + size bounded (LRU). The embed call is
 best-effort: on any failure the lookup degrades to a miss with a
 warning — semantic caching must never break or block a request.
 
-A ``Redis``-backed or vector-store implementation can replace this
-class wholesale: the pipeline only depends on ``embed`` / ``get`` /
-``put``.
+``semantic_cache.backend: redis`` swaps in ``RedisSemanticCache``
+(``redis_backends.py``) — the same brute-force cosine semantics over
+entries shared across every worker/replica, so a near-duplicate served
+by one replica is a hit for the next. Either store satisfies the
+pipeline's contract: it only depends on ``embed`` / ``get`` / ``put``.
 """
 
 from __future__ import annotations
@@ -47,6 +49,30 @@ logger = logging.getLogger("gateway.semantic_cache")
 # unrestricted callers, and a restricted caller whose embedder cannot
 # accept it degrades to a cache miss (never a residency violation).
 EmbedFn = Callable[..., Awaitable[list[float]]]
+
+
+async def embed_request(
+    embed_fn: EmbedFn,
+    request: ChatCompletionRequest,
+    residencies: frozenset[str] | None = None,
+) -> list[float] | None:
+    """Shared embed step of both stores (memory and Redis): embed the
+    normalized request, degrade to None (never an exception) on failure.
+
+    ``residencies`` is passed to the embedder ONLY when a requirement
+    exists (None callers call single-argument embedders, the
+    pre-tier-28 shape, so external embed fns keep working unchanged).
+    An embedder that cannot accept the argument raises, which lands
+    here as a miss: a restricted caller's prompt simply loses
+    semantic-cache hits — degrade, never violate.
+    """
+    try:
+        if residencies is None:
+            return await embed_fn(cache_payload_for(request))
+        return await embed_fn(cache_payload_for(request), residencies)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("semantic cache embed failed, treating as miss: %s", exc)
+        return None
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -101,22 +127,9 @@ class SemanticCache:
         """Embed the normalized request; None (never an exception) on failure.
 
         The embedding is computed once per request and reused for both
-        the lookup and (on a miss) the store. ``residencies`` is the
-        caller's effective data-residency requirement — it is passed to
-        the embedder ONLY when a requirement exists (None callers call
-        single-argument embedders, the pre-tier-28 shape, so external
-        embed fns keep working unchanged). An embedder that cannot
-        accept the argument raises, which lands here as a miss: a
-        restricted caller's prompt simply loses semantic-cache hits —
-        degrade, never violate.
+        the lookup and (on a miss) the store (see ``embed_request``).
         """
-        try:
-            if residencies is None:
-                return await self._embed_fn(cache_payload_for(request))
-            return await self._embed_fn(cache_payload_for(request), residencies)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("semantic cache embed failed, treating as miss: %s", exc)
-            return None
+        return await embed_request(self._embed_fn, request, residencies)
 
     async def get(
         self,

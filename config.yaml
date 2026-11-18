@@ -367,13 +367,16 @@ cache:
 # after an exact miss, embed the normalized request and serve the best
 # same-model cached response with >= threshold cosine similarity.
 # Costs one embeddings call per uncached request (billed to the
-# gateway's provider key). Off by default. Store is per-process.
+# gateway's provider key). Off by default. Store is per-process;
+# backend: redis shares entries across every worker/replica (the same
+# selection as cache.backend below).
 #semantic_cache:
 #  enabled: true
-#  model: text-embedding-3-small   # embeddings model (needs a deployment)
+#  model: text-embedding-mock     # embeddings model (needs a deployment)
 #  threshold: 0.95                 # cosine similarity required for a hit
 #  ttl_seconds: 300
 #  max_entries: 256
+#  backend: memory                 # memory | redis
 
 # Shared state for multi-worker / multi-replica deployments. Enable by
 # setting rate_limit.backend, cache.backend and/or

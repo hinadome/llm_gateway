@@ -211,6 +211,9 @@ def make_config(**cache_overrides) -> GatewayConfig:
         # Idempotency follows the response cache's backend selection
         # (its store is built the same way, namespaced apart).
         config.idempotency.backend = "redis"
+        # The semantic store too (tier 59) — inert unless enabled, like
+        # every backend field.
+        config.semantic_cache.backend = "redis"
     return config
 
 

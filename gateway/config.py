@@ -327,6 +327,11 @@ class SemanticCacheConfig(BaseModel):
     only same-model requests can match. The similarity threshold trades
     false-positive hits (wrong-but-similar answer served, cheaper)
     against false negatives (cache never hits). Off by default.
+
+    ``backend`` selects where entries live: ``memory`` (per process —
+    near-duplicates embedded and stored by one replica are invisible to
+    the next) or ``redis`` (shared: one replica's semantic entry is a
+    hit for the whole fleet — see ``RedisSemanticCache``).
     """
 
     enabled: bool = False
@@ -334,6 +339,7 @@ class SemanticCacheConfig(BaseModel):
     threshold: float = 0.95  # cosine similarity required for a hit
     ttl_seconds: float = 300
     max_entries: int = 256
+    backend: str = "memory"  # memory | redis
 
 
 class RateLimitConfig(BaseModel):

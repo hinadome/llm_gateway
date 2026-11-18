@@ -8,6 +8,36 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Redis semantic cache (tier 59) — `semantic_cache.backend: redis`
+  closes the biggest multi-replica gap: the similarity store was the
+  one cache still per-process, so a near-duplicate that replica A
+  embedded and stored was a guaranteed miss on replica B. New
+  `RedisSemanticCache` (`core/redis_backends.py`) puts the whole store
+  in Redis with the pipeline's contract untouched — it depends only on
+  `embed` / `get` / `put`, so no pipeline change was needed:
+  - **Same semantics, shared entries**: brute-force cosine over
+    same-(model, response-policy-token) buckets — near-duplicates
+    never cross tenants or policies; per-entry TTL rides the entry's
+    own Redis EX (the per-key cache policy, tier 54: a writer's own
+    window stamps its entry) while a reader's `max_age` freshness
+    window reads the stored write time; LRU stays a global bound
+    across models.
+  - **Layout**: one JSON payload per entry (embedding + response +
+    write time) under `{prefix}:sem:*`, plus a global zset index whose
+    members are `model|policy|entry_id` — the bucket is a member
+    prefix, so a lookup filters its candidates before fetching any
+    payload and never touches other models'/policies' entries.
+    Expired entries leave index tombstones; the lookups that walk
+    them prune them (eviction and `clear` are the backstops).
+  - **Wiring**: the Redis client condition in `create_app` gains the
+    semantic backend; `redis` with no client falls back to the
+    in-memory store — degrade, never break. The embed step is now
+    shared by both stores (`embed_request` in `semantic_cache.py`).
+  - 13 new tests: parity units for every memory contract, two stores
+    over one client (what A stores, B serves), an e2e proving the app
+    really writes to Redis, and the fleet proof — two apps over one
+    Redis where replica B serves replica A's near-duplicate (SEMANTIC,
+    zero upstream calls on B). Suite 1383.
 - Tenant guardrail scoping (tier 58) — `guardrails[].scope.tenants` /
   `exclude_tenants`: fnmatch globs over the caller's tenant *name*
   (§8.2 item 9, the last first-class gap in the tenant story). One

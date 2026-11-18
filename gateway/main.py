@@ -72,6 +72,7 @@ from .core.redis_backends import (
     RedisCircuitBreakerRegistry,
     RedisRateLimiter,
     RedisResponseCache,
+    RedisSemanticCache,
     RedisVaultInvalidator,
 )
 from .core.router import Router, embed_fn_for
@@ -211,6 +212,7 @@ def create_app(
         or config.routing.breaker.backend == "redis"
         or config.idempotency.backend == "redis"
         or config.vault.backend == "redis"
+        or config.semantic_cache.backend == "redis"
     ):
         redis_client = aioredis.from_url(config.redis.resolve_url())
     breakers = None
@@ -343,12 +345,15 @@ def create_app(
     # tied to the routing table. Otherwise the embedder routes through
     # the normal embeddings machinery — and a configured model with no
     # deployment disables the layer with one warning instead of failing
-    # every request at lookup time.
+    # every request at lookup time. backend: redis (tier 59) shares the
+    # store across replicas (RedisSemanticCache); memory stays
+    # per-process. A redis backend without a client (never true via
+    # config — the client condition above — but honest if a caller
+    # injects None) falls back to memory: degrade, never break.
     semantic = None
     if config.semantic_cache.enabled:
-        if semantic_embedder is not None:
-            semantic = SemanticCache(config.semantic_cache, semantic_embedder)
-        else:
+        embedder: Callable[..., Awaitable[list[float]]] | None = semantic_embedder
+        if embedder is None:
             try:
                 router.resolve(config.semantic_cache.model)
             except (ModelNotFoundError, ProviderError):
@@ -357,10 +362,17 @@ def create_app(
                     config.semantic_cache.model,
                 )
             else:
-                semantic = SemanticCache(
+                embedder = embed_fn_for(router, config.semantic_cache.model)
+        if embedder is not None:
+            if config.semantic_cache.backend == "redis" and redis_client is not None:
+                semantic = RedisSemanticCache(
+                    redis_client,
                     config.semantic_cache,
-                    embed_fn_for(router, config.semantic_cache.model),
+                    embedder,
+                    prefix=config.redis.prefix,
                 )
+            else:
+                semantic = SemanticCache(config.semantic_cache, embedder)
     # Model aliases / default routing: validate targets up front — an
     # alias pointing at nothing would 404 at request time with a message
     # about the *target*, which is confusing to debug. Warn, don't fail:
