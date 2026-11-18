@@ -225,15 +225,36 @@ async def test_trial_run_replays_and_scores(tmp_path):
         assert detail["completed"] == 3
         assert detail["skipped"] == 0
         assert detail["cost_usd"] >= 3 * PER_CALL_COST
-        assert detail["summary"] == {
+        # Tier 37: the summary is a full migration evidence group —
+        # the same shape a shadow-diff mirror group carries — so the
+        # run verdicts through core/migration.evaluate like one. The
+        # latency means are honest int-ms values (in-process mock
+        # calls may round below 1ms; the verdict's latency check
+        # skips on a 0 primary mean, never fakes a percent), so the
+        # == pin covers the deterministic fields and the latency leg
+        # its shape + internal consistency.
+        summary = detail["summary"]
+        assert {
+            k: v for k, v in summary.items() if "latency" not in k
+        } == {
             "pairs": 3,
             "exact": 3,
             "near": 0,
             "divergent": 0,
             "shadow_error": 0,
             "not_comparable": 0,
+            "comparable": 3,
+            "match_rate": 1.0,
             "similarity_mean": 1.0,
         }
+        assert all(
+            isinstance(summary[k], int)
+            for k in ("shadow_latency_ms", "primary_latency_ms", "latency_delta_ms")
+        )
+        assert (
+            summary["latency_delta_ms"]
+            == summary["shadow_latency_ms"] - summary["primary_latency_ms"]
+        )
 
         # One trial row per replayed entry, sharing the original's
         # request_id, flagged shadow, scored, on the candidate.

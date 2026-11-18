@@ -8,6 +8,58 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Migration verdicts (tier 37) — the go/no-go recommendation engine
+  over the migration evidence. Tiers 13/35/36 collected the evidence:
+  mirrored pairs scored raw-vs-raw, candidate trials replayed on
+  demand. What was still missing was the *call* — an operator
+  staring at "match rate 96%, mean similarity 0.91, 2.4% shadow
+  errors, +18% latency" had to judge by feel whether the candidate
+  is promotable. Now the evidence becomes a recommendation,
+  auditable and never authoritative:
+  - **One engine, both evidence legs.** `core/migration.evaluate`
+    is a pure function over one evidence group — the exact shape a
+    shadow-diff mirror group and a trial run's summary both carry —
+    so `GET /admin/migration/verdicts` (mirrors, `?model=`/
+    `?deployment=`/`?since=`) and the recommendations folded into
+    every `/admin/trials` row and detail verdict identically
+    through one code path. No DB, no clock, no state to drift.
+  - **The vocabulary.** `go` — every bar cleared. `hold` — answers
+    fine, a soft concern needs a business call (a marginal
+    similarity mean, or a latency regression measured as a
+    *percent of the primary's mean*, because an absolute bar means
+    different things on a 200ms and a 20s model). `no_go` — answers
+    diverge, or the candidate fails the traffic it is given.
+    `insufficient_evidence` — too thin to judge. The worst honest
+    call wins; a hold never outranks a no_go.
+  - **Sufficiency gates both volumes.** `min_pairs` (20) applies to
+    total pairs (the volume a shadow-error rate is measured on)
+    *and* comparable pairs (the volume answer equivalence is judged
+    on — not_comparable rows prove nothing about it), with one
+    deliberate exception, pinned by a test: a shadow-error rate
+    over its bar on a full volume of pairs is a no_go even when
+    nothing was comparable — a candidate that fails every call it
+    is given has already answered the question.
+  - **Nothing is faked.** Unmeasurable checks (missing latency
+    means, a zero primary mean) report null and are skipped, never
+    passed; every verdict ships its per-check numbers (`value` +
+    `threshold` + `pass`) and one human reason per failed check, so
+    a recommendation can be audited, re-bucketed or second-guessed
+    — never taken on faith. All five thresholds live in the new
+    `migration:` config section, read live (tighten a bar, reload,
+    and the next read re-verdicts) and echoed in every response.
+  - **Fixed on the way through:** mirror log rows recorded ~0ms
+    latency — both mirror tasks built the row's context *after*
+    the upstream call, so the logged `latency_ms` measured from
+    the context's birth, and every shadow-diff "Δ latency" read as
+    an implausible speedup. Shadow and prompt-A/B mirror rows now
+    stamp the call's actual start (the same `started_monotonic`
+    stance trials had from the start), so the latency leg of the
+    evidence — and tier 35's delta column — is real.
+  The endpoint is platform-admin-only like the evidence it reads;
+  the admin dashboard's Routing tab renders a "Go / no-go" badge on
+  each shadow-diff row and each trial run (failed-check reasons in
+  the tooltip). 17 tests + a UI-surface pin (`tests/test_migration.py`,
+  `tests/test_admin_ui.py`); the suite stands at 1114.
 - Candidate trials (tier 36) — the deliberate-replay leg of provider
   migration. Shadow mirroring + diffing is passive evidence: only the
   traffic a model actually gets, only candidates wired as `shadow:

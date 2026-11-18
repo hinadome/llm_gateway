@@ -118,6 +118,21 @@ async def test_admin_ui_trials_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_migration_verdicts_surface(env):
+    # Tier 37: the routing tab's evidence tables carry the go/no-go
+    # recommendations — the shadow-diff table fetches
+    # /admin/migration/verdicts in parallel (one badge per mirrored
+    # candidate) and the trials table renders each run's folded
+    # recommendation; both tooltip their failed-check reasons.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        "/admin/migration/verdicts",
+        "MIGRATION_BADGE",
+        "Go / no-go",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

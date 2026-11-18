@@ -69,6 +69,7 @@ from .shadow_diff import (
     VERDICT_SHADOW_ERROR,
     extract_content_text,
     score_pair,
+    trial_baselines,
 )
 
 logger = logging.getLogger(__name__)
@@ -490,6 +491,13 @@ async def run_summaries(session: AsyncSession, trial_ids: list[str]) -> dict[str
     runs table can show the verdict badges without N+1 detail fetches.
     Computed from the log rows: the Trial row deliberately
     denormalizes nothing the pairs already say.
+
+    Tier 37: the summary IS a migration evidence group — the same
+    shape a ``shadow_diff.aggregate`` mirror group carries (comparable,
+    match_rate, and the latency means against the original primaries,
+    via shadow_diff.trial_baselines) — so ``core/migration.evaluate``
+    verdicts a trial and a mirrored deployment identically through one
+    code path.
     """
     if not trial_ids:
         return {}
@@ -531,14 +539,31 @@ async def run_summaries(session: AsyncSession, trial_ids: list[str]) -> dict[str
         if similarity_total is not None:
             summary["_similarity_sum"] += float(similarity_total)
             summary["_comparable"] += count
+    baselines = await trial_baselines(session, list(trial_ids))
     out: dict[str, dict[str, Any]] = {}
     for trial_id, summary in per.items():
         comparable = summary.pop("_comparable")
         similarity_sum = summary.pop("_similarity_sum")
+        matched = summary[VERDICT_EXACT] + summary[VERDICT_NEAR]
+        latency = baselines.get(trial_id) or {
+            "shadow_latency_ms": None,
+            "primary_latency_ms": None,
+        }
+        shadow_latency = latency.get("shadow_latency_ms")
+        primary_latency = latency.get("primary_latency_ms")
         out[trial_id] = {
             **summary,
+            "comparable": comparable,
+            "match_rate": round(matched / comparable, 4) if comparable else None,
             "similarity_mean": (
                 round(similarity_sum / comparable, 4) if comparable else None
+            ),
+            "shadow_latency_ms": shadow_latency,
+            "primary_latency_ms": primary_latency,
+            "latency_delta_ms": (
+                shadow_latency - primary_latency
+                if shadow_latency is not None and primary_latency is not None
+                else None
             ),
         }
     return out
@@ -548,12 +573,24 @@ async def run_summary(session: AsyncSession, trial_id: str) -> dict[str, Any]:
     """The single-run form of run_summaries — the trial detail
     endpoint's go/no-go numbers."""
     summaries = await run_summaries(session, [trial_id])
-    return summaries.get(trial_id) or {
+    return summaries.get(trial_id) or _empty_summary()
+
+
+def _empty_summary() -> dict[str, Any]:
+    """The zero-evidence evidence group (an empty window, a pending
+    run): every count zero, every mean null — evaluates to
+    insufficient_evidence, never a fabricated 0.0."""
+    return {
         "pairs": 0,
         VERDICT_EXACT: 0,
         VERDICT_NEAR: 0,
         VERDICT_DIVERGENT: 0,
         VERDICT_SHADOW_ERROR: 0,
         VERDICT_NOT_COMPARABLE: 0,
+        "comparable": 0,
+        "match_rate": None,
         "similarity_mean": None,
+        "shadow_latency_ms": None,
+        "primary_latency_ms": None,
+        "latency_delta_ms": None,
     }

@@ -169,7 +169,7 @@ def _pair_conditions(
     deployment: str | None = None,
     verdict: str | None = None,
     since=None,
-    trial_id: str | None = None,
+    trial_id: str | list[str] | None = None,
 ) -> list:
     """The WHERE terms shared by the aggregate and the drilldown.
 
@@ -183,8 +183,10 @@ def _pair_conditions(
     Tier 36: ``trial_id`` scopes the pair set. None (the standing
     scope) excludes candidate-trial rows — a deliberate replay is an
     experiment, not live mirroring, and would double-count a candidate
-    already shadow-mirrored; a non-null value selects exactly that
-    trial's pairs (the /admin/trials/{id}/pairs drilldown).
+    already shadow-mirrored; a trial id selects exactly that trial's
+    pairs (the /admin/trials/{id}/pairs drilldown). Tier 37 accepts a
+    LIST of ids too — one grouped query over many trials
+    (trial_baselines), same terms.
     """
     terms = [
         shadow.shadow.is_(True),
@@ -193,7 +195,11 @@ def _pair_conditions(
         (
             shadow.trial_id.is_(None)
             if trial_id is None
-            else shadow.trial_id == trial_id
+            else (
+                shadow.trial_id.in_(trial_id)
+                if isinstance(trial_id, list)
+                else shadow.trial_id == trial_id
+            )
         ),
     ]
     if model is not None:
@@ -301,6 +307,20 @@ async def aggregate(
                     int(row.shadow_latency_mean - row.primary_latency_mean)
                     if row.shadow_latency_mean is not None
                     and row.primary_latency_mean is not None
+                    else None
+                ),
+                # The means themselves (tier 37): the migration verdict
+                # expresses the latency concern as a PERCENT of the
+                # primary's mean — an absolute delta means different
+                # things on a 200ms and a 20s model.
+                "shadow_latency_ms": (
+                    int(row.shadow_latency_mean)
+                    if row.shadow_latency_mean is not None
+                    else None
+                ),
+                "primary_latency_ms": (
+                    int(row.primary_latency_mean)
+                    if row.primary_latency_mean is not None
                     else None
                 ),
                 "tokens_delta": (
@@ -416,3 +436,50 @@ async def pairs(
             }
         )
     return {"data": out, "total": total, "limit": limit, "offset": offset}
+
+
+async def trial_baselines(session, trial_ids: list[str]) -> dict[str, dict]:
+    """Mean latency of each trial's candidate calls against their
+    original primaries' recorded latencies — one grouped query over
+    the same pairing join the drilldown uses (``_primary_join``),
+    scoped per trial id. Tier 37: this is the latency leg of a trial
+    run's evidence (``trials.run_summaries`` folds it in) so
+    ``core/migration.evaluate`` sees the same shape a mirror group
+    carries. A trial row whose primary was retention-pruned joins no
+    baseline — the mean over the rows that did, honestly.
+
+    Returns ``{trial_id: {"shadow_latency_ms", "primary_latency_ms"}}``
+    for exactly the ids that have trial rows; missing ids mean no
+    rows (the summary reports nulls, the verdict skips the check).
+    """
+    if not trial_ids:
+        return {}
+    shadow = aliased(RequestLog)
+    primary = aliased(RequestLog)
+    rows = (
+        (
+            await session.execute(
+                select(
+                    shadow.trial_id,
+                    func.avg(shadow.latency_ms).label("shadow_latency"),
+                    func.avg(primary.latency_ms).label("primary_latency"),
+                )
+                .select_from(shadow)
+                .outerjoin(primary, _primary_join(primary, shadow))
+                .where(*_pair_conditions(shadow, primary, trial_id=list(trial_ids)))
+                .group_by(shadow.trial_id)
+            )
+        )
+        .all()
+    )
+    return {
+        row.trial_id: {
+            "shadow_latency_ms": (
+                int(row.shadow_latency) if row.shadow_latency is not None else None
+            ),
+            "primary_latency_ms": (
+                int(row.primary_latency) if row.primary_latency is not None else None
+            ),
+        }
+        for row in rows
+    }

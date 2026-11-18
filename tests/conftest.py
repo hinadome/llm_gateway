@@ -33,6 +33,7 @@ from gateway.config import (
     MCPServerConfig,
     ReplayConfig,
     TrialsConfig,
+    MigrationConfig,
     RunawayConfig,
     ConcurrencyConfig,
     LoggingConfig,
@@ -114,6 +115,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     idempotency = cache_overrides.pop("idempotency", None) or IdempotencyConfig()
     replay = cache_overrides.pop("replay", None) or ReplayConfig()
     trials = cache_overrides.pop("trials", None) or TrialsConfig()
+    migration = cache_overrides.pop("migration", None) or MigrationConfig()
     runaway = cache_overrides.pop("runaway", None) or RunawayConfig()
     concurrency = cache_overrides.pop("concurrency", None) or ConcurrencyConfig()
     mcp = cache_overrides.pop("mcp", None) or MCPConfig()
@@ -187,6 +189,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         events=events,
         mcp=mcp,
         vault=vault,
+        migration=migration,
     )
     if redis_backends:
         config.cache.backend = "redis"
@@ -215,6 +218,11 @@ class MockUpstream:
         # upstream call slow so concurrency-cap tests can hold a slot
         # for a controlled window (tests reset it to 0 when done).
         self.delay_seconds: float = 0.0
+        # Optional per-model delay (seconds), ADDED to delay_seconds:
+        # migration-verdict tests point a shadow/trial candidate at a
+        # slower model so the latency check has a real regression to
+        # measure, without slowing every other request in the suite.
+        self.model_delays: dict[str, float] = {}
         # Optional per-model content override (shadow-diff tests point a
         # shadow deployment at a model that answers differently, so the
         # pair scores divergent instead of exact).
@@ -394,6 +402,13 @@ class MockUpstream:
             body = json.loads(request.content) if request.content else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             body = {"_raw": True, "size_bytes": len(request.content)}
+        # Per-model delay, added to the global one above: keyed on the
+        # UPSTREAM model the adapter sent (the body's model), so a
+        # shadow/trial candidate pointed at a slower model shows a real
+        # latency regression without slowing the rest of the suite.
+        model_delay = self.model_delays.get(body.get("model"))
+        if model_delay:
+            await asyncio.sleep(model_delay)
         self.requests.append(
             {"url": str(request.url), "headers": dict(request.headers), "body": body}
         )

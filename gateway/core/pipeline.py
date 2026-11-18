@@ -3565,6 +3565,11 @@ class GatewayPipeline:
             shadow=True,
             shadow_verdict=verdict,
             shadow_similarity=similarity,
+            # Honest latency (tier 37): the row measures from THIS call's
+            # start, not the context's birth after it — the shadow row
+            # used to log ~0ms, which made every latency delta read as
+            # an implausible speedup in the evidence aggregate.
+            started_monotonic=started,
         )
         # Snapshot this mirror's own wire capture (its task context, not
         # the primary's — see the reset above).
@@ -3742,6 +3747,9 @@ class GatewayPipeline:
             prompt_variant=f"{library_prompt.name} v{candidate.version}",
             shadow_verdict=verdict,
             shadow_similarity=similarity,
+            # Honest latency (tier 37): call start, not ctx birth — the
+            # same fix as the shadow mirror above.
+            started_monotonic=started,
         )
         # Snapshot this mirror's own wire capture (its task context).
         variant_ctx.upstream_request = wire.upstream_request()

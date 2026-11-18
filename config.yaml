@@ -626,6 +626,32 @@ trials:
   max_concurrency: 2     # ceiling for per-run concurrency (calls per wave)
   max_cost_usd: 1.0      # ceiling for per-run candidate spend (USD)
 
+# Migration verdicts — the go/no-go recommendation engine over the
+# migration evidence. Tiers 13/35/36 collect the evidence (mirrored
+# pairs scored raw-vs-raw, candidate trials replayed on demand); this
+# section is the call. GET /admin/migration/verdicts verdicts each
+# mirrored candidate — and every trial run carries its own folded
+# recommendation — as go / hold / no_go / insufficient_evidence with
+# the per-check numbers that drove it. A recommendation, never a
+# gate: go = every bar cleared; hold = answers fine, a soft concern
+# (marginal similarity, a latency regression) needs a business call;
+# no_go = answers diverge or the candidate fails the traffic it is
+# given; insufficient_evidence = too thin to judge, collect more.
+# All five thresholds are read live off the running config and echoed
+# in every verdict response — tighten a bar, reload, and the next
+# read re-verdicts; the recommendation is always auditable against
+# the bars that produced it. min_pairs gates two volumes at once:
+# total pairs (what a shadow-error rate can be measured on) and
+# comparable pairs among them (what answer equivalence can be judged
+# on) — with one exception: a shadow-error rate over its bar on a
+# full volume of pairs is a no_go even when nothing was comparable.
+migration:
+  min_pairs: 20               # mirrored pairs AND comparable pairs needed
+  min_match_rate: 0.95        # (exact + near) / comparable at or above
+  max_shadow_error_rate: 0.02 # failed mirror calls / pairs at or below
+  min_similarity_mean: 0.90   # mean similarity over comparable pairs
+  max_latency_delta_pct: 25.0 # candidate mean latency vs primary, %
+
 # Runaway-agent protection: identical-request loop detection with an
 # escalating cooldown jail. An agent stuck in a loop (retry storm,
 # regenerating tool-call loop) sends the SAME request over and over at

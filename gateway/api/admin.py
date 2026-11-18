@@ -24,6 +24,7 @@ from ..core.context import AuthContext
 from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
+from ..core import migration as migration_core
 from ..core import trials as trials_core
 from ..core.vault import VaultService
 from ..db import get_sessionmaker
@@ -1810,6 +1811,52 @@ async def shadow_diff_pair_list(
         )
 
 
+# -- migration verdicts (tier 37) -----------------------------------------
+# The go/no-go recommendation engine over the migration evidence:
+# core/migration.evaluate turns a shadow-diff mirror group (and, via
+# the folded summaries, a candidate-trial run) into go / hold / no_go
+# / insufficient_evidence with the per-check numbers that drove it.
+# Platform-admin-only like the evidence it reads.
+
+
+@router.get("/admin/migration/verdicts")
+async def migration_verdicts(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+    model: str | None = None,
+    deployment: str | None = None,
+    since: str | None = None,
+) -> dict:
+    """Go/no-go recommendations for the mirrored (standing) migration
+    evidence — one row per scored shadow-deployment group, carrying
+    the full evidence group plus its recommendation: verdict (go /
+    hold / no_go / insufficient_evidence), per-check measurements and
+    the reasons for every failed check. Thresholds come from the live
+    ``migration:`` config and are echoed in the response, so a verdict
+    is always auditable against the bars that produced it.
+    ``?model=`` / ``?deployment=`` narrow to one candidate,
+    ``?since=`` (ISO-8601) bounds the evidence window (stale pairs —
+    from before a candidate's last update — can be excluded). Trial
+    evidence is NOT included here: the trials endpoints carry their own
+    per-run recommendations."""
+    config = raw_request.app.state.config
+    since_ts = _parse_range_ts(since, "since") if since else None
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        agg = await shadow_aggregate(session, model=model, since=since_ts)
+    data = []
+    for group in agg["groups"]:
+        if deployment is not None and group["deployment"] != deployment:
+            continue
+        data.append(
+            {
+                **group,
+                "recommendation": migration_core.evaluate(group, config.migration),
+            }
+        )
+    return {"data": data, "thresholds": config.migration.model_dump()}
+
+
 # -- candidate trials (tier 36) -------------------------------------------
 # The deliberate-replay leg: a captured window of one public model's
 # traffic replayed against a named candidate deployment with real
@@ -1900,6 +1947,7 @@ async def create_trial(
 
 @router.get("/admin/trials")
 async def list_trials(
+    raw_request: Request,
     admin: Annotated[AuthContext, Depends(require_platform_admin)],
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -1908,7 +1956,11 @@ async def list_trials(
     candidate spend and the stop reason (done / no_entries / cost_cap /
     cancelled / orphaned_by_restart / error). Each row carries its
     verdict summary (one grouped query for the page) so the table can
-    show the verdict breakdown without per-run detail fetches."""
+    show the verdict breakdown without per-run detail fetches, plus
+    the run's migration recommendation (tier 37: the summary IS an
+    evidence group — core/migration.evaluate verdicts it against the
+    live ``migration:`` thresholds)."""
+    config = raw_request.app.state.config
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         total = (
@@ -1930,7 +1982,12 @@ async def list_trials(
         data = []
         for row in rows:
             out = _trial_dict(row)
-            out["summary"] = summaries.get(row.id)
+            # run_summaries seeds an entry for every requested id — a
+            # run with no rows yet evaluates (honestly) as thin evidence.
+            out["summary"] = summaries[row.id]
+            out["recommendation"] = migration_core.evaluate(
+                out["summary"], config.migration
+            )
             data.append(out)
         return {
             "data": data,
@@ -1942,12 +1999,17 @@ async def list_trials(
 
 @router.get("/admin/trials/{trial_id}")
 async def get_trial(
-    trial_id: str, admin: Annotated[AuthContext, Depends(require_platform_admin)]
+    raw_request: Request,
+    trial_id: str,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
 ) -> dict:
     """One trial run: the row plus its verdict summary (exact / near /
     divergent / shadow_error / not_comparable counts and the mean
     similarity over comparable pairs), computed from the run's log
-    rows."""
+    rows — and the run's migration recommendation (tier 37): the
+    go/no-go call against the live ``migration:`` thresholds, with the
+    per-check measurements."""
+    config = raw_request.app.state.config
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         row = await session.get(Trial, trial_id)
@@ -1957,6 +2019,9 @@ async def get_trial(
             )
         out = _trial_dict(row)
         out["summary"] = await trials_core.run_summary(session, trial_id)
+        out["recommendation"] = migration_core.evaluate(
+            out["summary"], config.migration
+        )
         return out
 
 

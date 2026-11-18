@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 82 Python files, ~28,200 lines, 1097 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 83 Python files, ~28,600 lines, 1114 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -100,7 +100,10 @@ gateway/
 │                           session TTL), vault (ttl_seconds + backend for the
 │                           cache-invalidation fan-out + strict, the tenant-only
 │                           ladder stance — hot-reloadable, backend/TTL report
-│                           restart_required), multipart upload cap)
+│                           restart_required), trials (the deliberate-replay
+│                           ceilings + enabled), migration (the five verdict
+│                           thresholds, read live off the running config —
+│                           hot-reloadable, tier 37), multipart upload cap)
 ├── schemas.py              OpenAI-compatible pydantic models (request, response, chunks, admin);
 │                           ChatCompletionRequest carries private attrs (never serialized,
 │                           excluded from cache identity/logs) for the native Responses
@@ -330,15 +333,25 @@ gateway/
 │                           candidate deployment — any configured one —
 │                           and the three caps) and spawns it,
 │                           GET /admin/trials lists runs newest-first
-│                           with each verdict summary folded in (one
-│                           grouped query), GET /admin/trials/{id} is
-│                           the run + summary, GET /admin/trials/{id}/
+│                           with each verdict summary + migration
+│                           recommendation folded in (tier 37: one
+│                           grouped query, then core/migration.
+│                           evaluate per row — no N+1), GET
+│                           /admin/trials/{id} is the run + summary +
+│                           recommendation, GET /admin/trials/{id}/
 │                           pairs the drilldown (shadow_diff.pairs
 │                           scoped by trial_id — same pair shape as
 │                           the standing drilldown), POST
 │                           /admin/trials/{id}/cancel a guarded
 │                           UPDATE (finished runs 409; a live run
 │                           stops within one wave) — see core/trials;
+│                           GET /admin/migration/verdicts (tier 37,
+│                           same platform-admin boundary — it reads
+│                           the same cross-tenant evidence) turns the
+│                           standing mirror groups into go / hold /
+│                           no_go / insufficient_evidence
+│                           recommendations, thresholds echoed live
+│                           (?model=/?deployment=/?since= narrow);
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -471,6 +484,16 @@ gateway/
 │   │                       baseline — and each mirror row is scored on it
 │   │                       (core/shadow_diff): shadow_verdict +
 │   │                       shadow_similarity land on the shadow row;
+│   │                       tier 37 fixes the mirror rows' latency:
+│   │                       both mirror tasks stamp the row's ctx
+│   │                       with the CALL's start (started_monotonic=
+│   │                       started), so the logged latency_ms is the
+│   │                       mirror call's own duration — before, the
+│   │                       ctx was created after the call and every
+│   │                       mirror row logged ~0ms, making the
+│   │                       evidence aggregate's latency deltas read
+│   │                       as implausible speedups (trials.py had
+│   │                       it right from the start);
 │   │                       _note_byok (tier 31) marks the ctx right after
 │   │                       every dispatch when the upstream call rode
 │   │                       the TENANT'S stored vault credential —
@@ -1100,7 +1123,16 @@ gateway/
 │   │                       never pollutes live-mirroring evidence;
 │   │                       a trial id selects exactly that run's
 │   │                       pairs (the /admin/trials/{id}/pairs
-│   │                       drilldown reuses the same query).
+│   │                       drilldown reuses the same query); tier 37
+│   │                       also accepts a LIST of ids (one grouped
+│   │                       query over many runs — trial_baselines).
+│   │                       Tier 37: each aggregate group carries the
+│   │                       latency MEANS (not just their delta) so
+│   │                       core/migration can express the latency
+│   │                       concern as a percent of the primary mean,
+│   │                       and trial_baselines (public, same
+│   │                       _primary_join) gives each trial run its
+│   │                       candidate-vs-primary latency means.
 │   ├── trials.py           Candidate trials (tier 36): the deliberate-
 │   │                       replay leg of provider migration. Where
 │   │                       shadow mirroring is passive (only traffic
@@ -1157,9 +1189,51 @@ gateway/
 │   │                       run_summaries is the reporting layer —
 │   │                       verdict counts + mean similarity per run
 │   │                       in one grouped query, folded into the
-│   │                       trial list rows. stop_reason vocabulary:
-│   │                       done / no_entries / cost_cap / cancelled
-│   │                       / orphaned_by_restart / error.
+│   │                       trial list rows. Tier 37 grows the
+│   │                       summary into a FULL evidence group (the
+│   │                       shadow_diff.aggregate shape: comparable,
+│   │                       match_rate, and the latency means against
+│   │                       the original primaries via shadow_diff.
+│   │                       trial_baselines), so the run verdicts
+│   │                       through core/migration.evaluate exactly
+│   │                       like a mirrored deployment. stop_reason
+│   │                       vocabulary: done / no_entries / cost_cap
+│   │                       / cancelled / orphaned_by_restart / error.
+│   ├── migration.py        Migration verdicts (tier 37): the go/no-go
+│   │                       recommendation engine over the migration
+│   │                       evidence — the call tiers 13/35/36
+│   │                       collected but nobody made. evaluate is a
+│   │                       PURE function over one evidence group (the
+│   │                       aggregate-group shape, so mirror evidence
+│   │                       and trial evidence verdict through one
+│   │                       code path): no DB, no clock, no state to
+│   │                       drift — every response echoes what it
+│   │                       measured. Vocabulary: go (every bar
+│   │                       cleared) / hold (answers fine, a soft
+│   │                       concern — marginal similarity mean, a
+│   │                       latency regression measured as a PERCENT
+│   │                       of the primary mean — needs a business
+│   │                       call) / no_go (match rate missed, or the
+│   │                       shadow-error rate over its bar — the
+│   │                       candidate fails the traffic it is given)
+│   │                       / insufficient_evidence. Sufficiency
+│   │                       gates BOTH volumes with one bar:
+│   │                       min_pairs applies to total pairs (the
+│   │                       volume an error rate is measured on) and
+│   │                       to comparable pairs (the volume answer
+│   │                       equivalence is judged on), with one
+│   │                       deliberate exception — a full-volume
+│   │                       error-rate failure is a no_go even when
+│   │                       nothing was comparable. Honesty: checks
+│   │                       carry value + threshold + pass with
+│   │                       null pass for unmeasurable legs (never
+│   │                       faked), reasons one line per failed check,
+│   │                       worst honest call wins (no_go outranks
+│   │                       hold). Thresholds are the migration:
+│   │                       config section, read live (hot-reload
+│   │                       re-verdicts) and echoed by the endpoints.
+│   │                       A RECOMMENDATION, not a gate — nothing
+│   │                       promotes automatically.
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -1356,7 +1430,15 @@ gateway/
                             stop reason, progress, per-run verdict badges
                             + cost; Pairs/Divergent buttons open the shared
                             dialog, Cancel for live runs; tenant admins get
-                            an in-place 403 note — pairs cross tenants) —
+                            an in-place 403 note — pairs cross tenants).
+                            Tier 37 adds the Go / no-go column to BOTH
+                            evidence tables: the shadow-diff table fetches
+                            /admin/migration/verdicts in parallel and maps
+                            each recommendation onto its candidate row
+                            (keyed model + deployment), the trials table
+                            renders each run's folded recommendation (once
+                            the run has pairs); the badge tooltips carry
+                            the failed-check reasons verbatim —
                             guardrail inventory, system (health/readiness,
                             config reload, backups). A test enforces the
                             no-external-resources invariant.
@@ -2318,7 +2400,33 @@ tests/
 │                        standing shadow-diff unaffected by trial rows, 403s
 │                        for tenant/plain keys on all five endpoints, validation
 │                        400s + the disabled 404, the startup sweep + the
-│                        guarded claim (a cancelled run can never start)
+│                        guarded claim (a cancelled run can never start);
+│                        tier 37 grows the summary pin into the full
+│                        evidence-group shape (comparable/match_rate +
+│                        the latency means, shape-consistency pinned —
+│                        machine-speed values are never exact-pinned)
+├── test_migration.py    Migration verdicts (tier 37): evaluate units over
+│                        the shared evidence-group shape — clean go (all
+│                        five checks measured + passed, audit shape),
+│                        match-rate + shadow-error no_gos, similarity +
+│                        latency-pct holds, hold-never-outranks-no_go,
+│                        the two sufficiency gates (thin pairs, thin
+│                        comparable) with the full-volume error escape
+│                        (all-failed on enough pairs is no_go, on three
+│                        is insufficient), unmeasurable checks skipped
+│                        (null pass, zero-primary guard), empty evidence;
+│                        e2e over mirrors (four-twin fan-out: exact → go,
+│                        divergent → no_go, failing → the escape no_go,
+│                        slower → latency measured as a percent; separate
+│                        real-bar hold pin with a stabilized base
+│                        latency), filters + threshold echo + malformed-
+│                        since 400 + standing verdicts byte-identical
+│                        across a trial against the SAME deployment,
+│                        403s for tenant/plain keys; trial-side: the
+│                        go recommendation with the latency leg measured
+│                        (trial_baselines wiring) and the not_comparable
+│                        honesty pin (a rewritten primary → insufficient,
+│                        match_rate honestly skipped)
 ├── test_usage_export.py  /admin/usage/export: CSV columns/order/attachment download,
 │                        JSON summary + by_key/by_model/by_status aggregates, key/model/
 │                        status filters, time windows (default 30d, naive=UTC), shadow

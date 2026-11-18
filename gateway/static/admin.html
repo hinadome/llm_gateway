@@ -307,7 +307,7 @@
     </div>
     <div class="panel" style="margin-top:14px">
       <div class="ph">Shadow diff evidence
-        <div class="right muted" style="font-weight:400;font-size:12px">mirrored pairs, scored raw-vs-raw &middot; exact = 1.0 &middot; near &ge; 0.80 &middot; deltas vs the paired primaries</div>
+        <div class="right muted" style="font-weight:400;font-size:12px">mirrored pairs, scored raw-vs-raw &middot; exact = 1.0 &middot; near &ge; 0.80 &middot; deltas vs the paired primaries &middot; go / no-go vs the <span class="mono" style="font-size:11px">migration:</span> thresholds</div>
       </div>
       <div style="overflow-x:auto"><table id="shadow-diff-table"></table></div>
     </div>
@@ -1613,6 +1613,8 @@ const VERDICT_BADGE = {
   exact: "b-green", near: "b-blue", divergent: "b-amber",
   shadow_error: "b-red", not_comparable: "b-gray",
 };
+// Tier 37: the go/no-go recommendation vocabulary (core/migration).
+const MIGRATION_BADGE = { go: "b-green", hold: "b-amber", no_go: "b-red", insufficient_evidence: "b-gray" };
 const shadowPairs = { model: null, deployment: null, verdict: null, trialId: null, limit: 25, offset: 0, total: 0 };
 
 function signedDelta(v, fmt) {
@@ -1623,24 +1625,37 @@ function signedDelta(v, fmt) {
 
 async function loadShadowDiff() {
   // Scored mirror pairs per shadow deployment — the go/no-go numbers
-  // for promoting a candidate to serving. Platform-admin surface
-  // (pairs carry request bodies, which cross tenants); any error is
-  // reported in place rather than blanking the routing table above.
-  let r;
-  try { r = await api("/admin/shadow-diff"); }
-  catch (e) {
+  // for promoting a candidate to serving — each with the tier-37
+  // recommendation (go / hold / no_go / insufficient_evidence) from
+  // /admin/migration/verdicts. Platform-admin surface (pairs carry
+  // request bodies, which cross tenants); any error is reported in
+  // place rather than blanking the routing table above.
+  let r, verdicts;
+  try {
+    [r, verdicts] = await Promise.all([
+      api("/admin/shadow-diff"),
+      api("/admin/migration/verdicts").catch(() => null),
+    ]);
+  } catch (e) {
     $("#shadow-diff-table").innerHTML =
       `<tbody><tr><td class="muted">${esc(e.message || e)}</td></tr></tbody>`;
     return;
   }
+  const recByCandidate = new Map(
+    (verdicts && verdicts.data || []).map(v => [v.model + "\u0000" + v.deployment, v.recommendation])
+  );
   const groups = r.groups || [];
   if (!groups.length) {
     $("#shadow-diff-table").innerHTML =
       `<tbody><tr><td class="muted">No scored mirror pairs yet. Add a shadow deployment to a model above and serve some traffic — every successful request is mirrored, scored raw-vs-raw, and reported here per shadow deployment.</td></tr></tbody>`;
     return;
   }
-  let html = "<thead><tr><th>Model</th><th>Shadow deployment</th><th class=num>Pairs</th><th>Verdicts</th><th class=num>Match rate</th><th class=num>Mean similarity</th><th class=num>&Delta; latency</th><th class=num>&Delta; cost</th><th>Last pair</th><th></th></tr></thead><tbody>";
+  let html = "<thead><tr><th>Model</th><th>Shadow deployment</th><th>Go / no-go</th><th class=num>Pairs</th><th>Verdicts</th><th class=num>Match rate</th><th class=num>Mean similarity</th><th class=num>&Delta; latency</th><th class=num>&Delta; cost</th><th>Last pair</th><th></th></tr></thead><tbody>";
   for (const g of groups) {
+    const rec = recByCandidate.get(g.model + "\u0000" + g.deployment);
+    const recBadge = !rec
+      ? '<span class="muted">—</span>'
+      : `<span class="b ${MIGRATION_BADGE[rec.verdict] || "b-gray"}" title="${esc(rec.reasons.length ? rec.reasons.join(" · ") : "clears every migration threshold (" + rec.checks.filter(c => c.pass).length + " checks)")}">${esc(rec.verdict.replace(/_/g, " "))}</span>`;
     const badges = [
       ["exact", g.exact, "byte-identical answers (similarity 1.0)"],
       ["near", g.near, "cosmetic drift: similarity at or above 0.80"],
@@ -1653,6 +1668,7 @@ async function loadShadowDiff() {
     html += `<tr>
       <td class="mono">${esc(g.model)}</td>
       <td class="mono">${esc(g.deployment)} <span class="muted" style="font-size:12px">${esc(g.provider)}</span></td>
+      <td>${recBadge}</td>
       <td class="num">${fmtInt(g.pairs)}</td>
       <td>${badges || '<span class="muted">—</span>'}</td>
       <td class="num">${g.match_rate == null ? "—" : Math.round(g.match_rate * 100) + "%"}</td>
@@ -1768,7 +1784,7 @@ async function loadTrials(routing) {
     $("#trials-table").innerHTML = `<tbody><tr><td class="muted">No trial runs yet. Pick a model's captured window and a candidate deployment above — the gateway replays it with real upstream calls (throttled, spend-capped) and scores every pair like a mirror.</td></tr></tbody>`;
     return;
   }
-  let html = "<thead><tr><th>Run</th><th>Model &rarr; candidate</th><th>Status</th><th class=num>Progress</th><th>Verdicts</th><th class=num>Cost</th><th>Created</th><th></th></tr></thead><tbody>";
+  let html = "<thead><tr><th>Run</th><th>Model &rarr; candidate</th><th>Status</th><th class=num>Progress</th><th>Verdicts</th><th>Go / no-go</th><th class=num>Cost</th><th>Created</th><th></th></tr></thead><tbody>";
   for (const t of r.data) {
     const verdicts = t.summary ? [
       ["exact", t.summary.exact], ["near", t.summary.near], ["divergent", t.summary.divergent],
@@ -1776,6 +1792,11 @@ async function loadTrials(routing) {
     ].filter(([, n]) => n > 0)
      .map(([v, n]) => `<span class="b ${VERDICT_BADGE[v]}" title="trial rows with verdict ${v}">${n} ${v.replace(/_/g, " ")}</span>`)
      .join(" ") : "";
+    // The tier-37 recommendation, once the run has any evidence to
+    // judge (a pair-less row would read as a meaningless verdict).
+    const rec = (t.recommendation && t.summary && t.summary.pairs > 0)
+      ? `<span class="b ${MIGRATION_BADGE[t.recommendation.verdict] || "b-gray"}" title="${esc(t.recommendation.reasons.length ? t.recommendation.reasons.join(" · ") : "clears every migration threshold (" + t.recommendation.checks.filter(c => c.pass).length + " checks)")}">${esc(t.recommendation.verdict.replace(/_/g, " "))}</span>`
+      : '<span class="muted">—</span>';
     const progress = `${fmtInt(t.completed)}/${fmtInt(t.selected)}` + (t.skipped ? ` <span class="muted" style="font-size:11px">(+${t.skipped} skipped)</span>` : "");
     html += `<tr>
       <td class="mono" title="${esc(t.id)}">${esc(t.id.slice(0, 8))}</td>
@@ -1783,6 +1804,7 @@ async function loadTrials(routing) {
       <td><span class="b ${TRIAL_BADGE[t.status] || "b-gray"}">${esc(t.status)}</span>${t.stop_reason ? ` <span class="muted" style="font-size:11px">${esc(t.stop_reason)}</span>` : ""}</td>
       <td class="num">${progress}</td>
       <td>${verdicts || '<span class="muted">—</span>'}</td>
+      <td>${rec}</td>
       <td class="num">${fmtUsd(t.cost_usd)}</td>
       <td class="muted" style="font-size:12px">${fmtWhen(t.created_at)}</td>
       <td>

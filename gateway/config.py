@@ -759,6 +759,52 @@ class TrialsConfig(BaseModel):
     max_cost_usd: float = 1.0
 
 
+class MigrationConfig(BaseModel):
+    """Migration verdicts (tier 37): the go/no-go recommendation engine
+    over the migration evidence — shadow-diff mirror groups and
+    candidate-trial summaries (``core/migration.evaluate``). Pure
+    thresholds, read live off the running config (hot-reloadable —
+    tightening a bar re-verdicts on the next read, no restart); every
+    verdict response echoes the thresholds it used, and the raw numbers
+    always ship beside the verdict so the call is auditable, never
+    taken on faith.
+
+    A verdict is a RECOMMENDATION, not a gate: ``go`` means the
+    evidence clears every bar, ``hold`` means the answers are
+    acceptable but a soft concern (marginal similarity, a latency
+    regression) needs a business call, ``no_go`` means the evidence
+    says the candidate is not ready (answers diverge, or the candidate
+    fails the traffic it is given), ``insufficient_evidence`` means
+    there is not enough to judge — collect more traffic or run a
+    candidate trial.
+    """
+
+    # Evidence a verdict needs, applied to two volumes at once: total
+    # pairs (the volume a shadow-error rate can be measured on — every
+    # mirror call is evidence) and comparable pairs among them (exact
+    # + near + divergent — the volume answer equivalence can be judged
+    # on). Thin on either, the verdict is insufficient_evidence
+    # regardless of the other numbers — a lucky handful of pairs
+    # proves nothing. One exception: a shadow-error rate over its bar
+    # on a full volume of pairs is a no_go even when nothing was
+    # comparable — a candidate that fails the traffic it is given has
+    # already answered the question.
+    min_pairs: int = 20
+    # (exact + near) / comparable at or above this = answers match.
+    min_match_rate: float = 0.95
+    # shadow_error / pairs at or below this — a candidate that fails
+    # the traffic it is given is a no_go however good the rest looks.
+    max_shadow_error_rate: float = 0.02
+    # Mean similarity over comparable pairs at or above this — catches
+    # all-"near" runs (every answer cosmetically drifted yet none
+    # divergent) that a bare match rate would wave through.
+    min_similarity_mean: float = 0.90
+    # Candidate mean latency vs the serving primary's, in percent
+    # (positive = candidate slower) at or below this = hold-level
+    # concern. Latency is a business trade, not a correctness bar.
+    max_latency_delta_pct: float = 25.0
+
+
 class RunawayConfig(BaseModel):
     """Runaway-agent protection: loop detection with an escalating
     cooldown jail.
@@ -977,6 +1023,7 @@ class GatewayConfig(BaseModel):
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
     trials: TrialsConfig = Field(default_factory=TrialsConfig)
+    migration: MigrationConfig = Field(default_factory=MigrationConfig)
     runaway: RunawayConfig = Field(default_factory=RunawayConfig)
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
