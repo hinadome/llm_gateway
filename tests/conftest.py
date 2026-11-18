@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import uuid
+import asyncio
 from types import SimpleNamespace
 
 import httpx
@@ -30,6 +31,7 @@ from gateway.config import (
     JWTAuthConfig,
     ReplayConfig,
     RunawayConfig,
+    ConcurrencyConfig,
     LoggingConfig,
     MetricsConfig,
     ModelConfig,
@@ -108,6 +110,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     idempotency = cache_overrides.pop("idempotency", None) or IdempotencyConfig()
     replay = cache_overrides.pop("replay", None) or ReplayConfig()
     runaway = cache_overrides.pop("runaway", None) or RunawayConfig()
+    concurrency = cache_overrides.pop("concurrency", None) or ConcurrencyConfig()
     cache = cache_overrides.pop("cache", None) or CacheConfig(
         enabled=True, ttl_seconds=300, max_entries=128
     )
@@ -172,6 +175,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         idempotency=idempotency,
         replay=replay,
         runaway=runaway,
+        concurrency=concurrency,
         events=events,
     )
     if redis_backends:
@@ -197,6 +201,10 @@ class MockUpstream:
         # Optional fields merged into the non-streaming chat usage dict
         # (e.g. prompt_tokens_details.cached_tokens — tier 24 billing).
         self.usage_extra: dict | None = None
+        # Optional delay applied to every request (seconds): makes the
+        # upstream call slow so concurrency-cap tests can hold a slot
+        # for a controlled window (tests reset it to 0 when done).
+        self.delay_seconds: float = 0.0
 
     @staticmethod
     def _embedding_response(body: dict) -> dict:
@@ -346,7 +354,9 @@ class MockUpstream:
             files.setdefault(name, []).append(value.rstrip(b"\r\n"))
         return files
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        if self.delay_seconds > 0:
+            await asyncio.sleep(self.delay_seconds)
         try:
             body = json.loads(request.content) if request.content else {}
         except (json.JSONDecodeError, UnicodeDecodeError):

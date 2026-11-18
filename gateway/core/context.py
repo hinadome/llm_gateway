@@ -44,9 +44,21 @@ class AuthContext:
     # gateway_cost_usd_total{model} stays ACTUAL. None = no markup
     # (platform keys, or a tenant that sets none).
     tenant_pricing_markup_pct: float | None = None
+    # Pooled concurrency ceiling across every member key's UPSTREAM
+    # requests (None = tenant sets none). Mirrors tenant_rpm/tpm: the
+    # member key must pass both its own cap and the tenant's.
+    tenant_max_concurrency: int | None = None
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
     rpm_limit: int | None = None
     tpm_limit: int | None = None
+    # Concurrency admission (tier 27): max simultaneous UPSTREAM
+    # requests this key may hold (None = unlimited) and its QoS
+    # priority — when a cap is contended, waiters are admitted
+    # highest-priority-first (FIFO within a priority). Priority only
+    # matters under contention. Snapshotted at auth time like the
+    # other ceilings.
+    max_concurrency: int | None = None
+    priority: int = 0
     max_budget_usd: float | None = None
     spend_usd: float = 0.0
     # Budget windows (UTC calendar day/month), snapshotted at auth time like
@@ -150,6 +162,12 @@ class RequestContext:
     # later retry with different parameters under the same
     # Idempotency-Key is rejected instead of served the wrong answer.
     idempotency_fingerprint: str | None = None
+    # Concurrency slot held by this request (pipeline._acquire_slot
+    # after the cache miss, before routing). Released wherever the
+    # in-flight gauge decrements — _finish_span for non-streams, the
+    # stream wrapper's finally for streams — via _release_slot, which
+    # is idempotent. Cache hits and idempotent replays never hold one.
+    concurrency_slot: Any | None = None
     # The resolved public model's declared context window
     # (ModelConfig.context_window), set at step 0 and re-resolved when
     # a guardrail redirects (4.5). Read by the context_window

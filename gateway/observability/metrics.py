@@ -42,6 +42,26 @@ RUNAWAY = Counter(
     ["key"],
 )
 
+CONCURRENCY_INFLIGHT = Gauge(
+    "gateway_concurrency_inflight",
+    "Upstream requests currently holding a concurrency slot, per virtual "
+    "key (chat-family; keys with no cap skip admission entirely).",
+    ["key"],
+)
+
+CONCURRENCY_QUEUED = Gauge(
+    "gateway_concurrency_queued",
+    "Requests currently queued for a concurrency slot, per virtual key.",
+    ["key"],
+)
+
+CONCURRENCY_REJECTED = Counter(
+    "gateway_concurrency_rejected_total",
+    "Requests refused after waiting past concurrency.wait_seconds for a "
+    "slot (429 + Retry-After).",
+    ["key"],
+)
+
 GUARDRAIL_BLOCKS = Counter(
     "gateway_guardrail_blocks_total",
     "Requests/chunks blocked by guardrails.",

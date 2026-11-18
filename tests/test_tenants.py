@@ -449,6 +449,7 @@ async def test_tenant_admin_platform_endpoints_403(tmp_path):
             ("GET", "/admin/guardrails", None),
             ("GET", "/admin/runaway", None),
             ("POST", f"/admin/runaway/{admin['id']}/release", None),
+            ("GET", "/admin/concurrency", None),
             ("POST", "/admin/reload", None),
             ("GET", "/admin/backups", None),
             ("POST", "/admin/backup", None),

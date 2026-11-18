@@ -655,6 +655,35 @@ class RunawayConfig(BaseModel):
     reset_after_seconds: float = 600.0
 
 
+class ConcurrencyConfig(BaseModel):
+    """Concurrent-request admission control with priority queueing.
+
+    RPM/TPM bound the *rate* of requests; this bounds how many may be
+    in-flight against the upstream at once — the number that protects
+    a provider quota or a small deployment fleet. Caps live on the
+    rows, snapshotted at auth time like every other ceiling:
+    ``VirtualKey.max_concurrency`` and the pooled
+    ``Tenant.max_concurrency`` (a member key must pass both). A caller
+    with neither cap skips admission entirely.
+
+    The slot wraps the upstream call: acquired after the cache miss
+    (hits and idempotent replays never hold one), released when the
+    response completes — including a stream's full body. When every
+    slot is taken, requests QUEUE for up to ``wait_seconds``, admitted
+    highest-``priority``-first (``VirtualKey.priority``, FIFO within a
+    priority); an expired wait answers 429 + Retry-After.
+
+    State is in-process (like the idempotency in-flight map and
+    runaway detection): a multi-replica fleet enforces its
+    per-replica share.
+    """
+
+    enabled: bool = True
+    # How long a request queues for a slot before failing with 429
+    # (+ Retry-After). 0 = fail fast when all slots are taken.
+    wait_seconds: float = 10.0
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -747,6 +776,7 @@ class GatewayConfig(BaseModel):
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
     runaway: RunawayConfig = Field(default_factory=RunawayConfig)
+    concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 

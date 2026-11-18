@@ -57,6 +57,7 @@ from .core.prompt_library import PromptLibrary
 from .core.pipeline import GatewayPipeline
 from .core.ratelimit import RateLimiter
 from .core.runaway import RunawayProtector
+from .core.concurrency import ConcurrencyLimiter
 from .core.redis_backends import (
     RedisCircuitBreakerRegistry,
     RedisRateLimiter,
@@ -255,6 +256,12 @@ def create_app(
     # Detection state is in-process (like the idempotency in-flight
     # map): a multi-replica fleet detects at per-replica rate.
     runaway = RunawayProtector()
+    # Concurrency admission control: per-key/tenant in-flight caps with
+    # priority queueing. Always constructed — enabled/wait_seconds are
+    # read off the live config per call (hot reload applies, held
+    # slots survive), and the caps live on the key/tenant rows anyway.
+    # In-process state, like the runaway protector: per-replica shares.
+    concurrency = ConcurrencyLimiter()
 
     cost_calculator = CostCalculator(config.pricing)
     # Budget alerts: own (non-instrumented) HTTP client; disabled unless a
@@ -339,6 +346,7 @@ def create_app(
         events=events_bus,
         idempotency=idempotency,
         runaway=runaway,
+        concurrency=concurrency,
     )
     # Batch API worker: drives /v1/batches lines in waves (app.state so
     # tests can tick it manually; the lifespan loop is the only driver

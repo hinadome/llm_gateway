@@ -332,6 +332,11 @@ class KeyCreateRequest(BaseModel):
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
     rpm_limit: int | None = None
     tpm_limit: int | None = None
+    # Concurrency admission: max simultaneous upstream requests (None
+    # = unlimited) + QoS priority (higher admitted first under
+    # contention; FIFO within a priority; default 0).
+    max_concurrency: int | None = Field(default=None, ge=1)
+    priority: int = Field(default=0, ge=-1000, le=1000)
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None  # UTC calendar-day cap
     monthly_budget_usd: float | None = None  # UTC calendar-month cap
@@ -368,6 +373,8 @@ class KeyUpdateRequest(BaseModel):
     allowed_models: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
+    max_concurrency: int | None = Field(default=None, ge=1)
+    priority: int | None = Field(default=None, ge=-1000, le=1000)
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None
     monthly_budget_usd: float | None = None
@@ -403,6 +410,10 @@ class TenantCreateRequest(BaseModel):
     # included; snapshots at auth time like the other tenant ceilings.
     # None = bill at actual cost (the platform default).
     pricing_markup_pct: float | None = Field(default=None, ge=0, le=1000)
+    # Pooled concurrency ceiling across every member key's upstream
+    # requests (None = tenant sets none; a member must pass both its
+    # own cap and the tenant's).
+    max_concurrency: int | None = Field(default=None, ge=1)
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None  # UTC calendar-day cap
     monthly_budget_usd: float | None = None  # UTC calendar-month cap
@@ -417,6 +428,7 @@ class TenantUpdateRequest(BaseModel):
     rpm_limit: int | None = None
     tpm_limit: int | None = None
     pricing_markup_pct: float | None = Field(default=None, ge=0, le=1000)
+    max_concurrency: int | None = Field(default=None, ge=1)
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None
     monthly_budget_usd: float | None = None

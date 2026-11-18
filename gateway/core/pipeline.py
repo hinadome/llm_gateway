@@ -66,6 +66,7 @@ from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
 from .cost import CostCalculator, cached_tokens_from_usage
 from .runaway import RunawayProtector
+from .concurrency import ConcurrencyLimiter
 from .events import EventBus
 from .logging_svc import LoggingService
 from .router import Router
@@ -165,6 +166,7 @@ class GatewayPipeline:
         events: EventBus | None = None,
         idempotency: IdempotencyStore | None = None,
         runaway: RunawayProtector | None = None,
+        concurrency: ConcurrencyLimiter | None = None,
     ) -> None:
         self.config = config
         # Per-key metric series (metrics.per_key — opt-in; the labeler's
@@ -201,6 +203,10 @@ class GatewayPipeline:
         # constructions): loop detection + escalating cooldown jail —
         # see core/runaway.py.
         self.runaway = runaway
+        # Concurrency admission control (None = disabled — standalone
+        # constructions): per-key/tenant in-flight caps with priority
+        # queueing — see core/concurrency.py.
+        self.concurrency = concurrency
         # OTel API is a no-op until a provider is installed (spans are then
         # invalid and cost ~nothing), so this is safe unconditionally.
         self._tracer = tracer or trace.get_tracer("gateway")
@@ -601,6 +607,18 @@ class GatewayPipeline:
             return JSONResponse(content=cached, headers=headers)
         if key is not None or self.semantic is not None:
             metrics.CACHE.labels("miss").inc()
+
+        # 5.5 Concurrency admission (pre-routing): the slot wraps the
+        # upstream call — acquired after the cache miss so hits and
+        # idempotent replays (no upstream, no slot) bypass it, and
+        # released wherever the in-flight gauge decrements. A key at
+        # its cap queues (priority-ordered) for up to
+        # concurrency.wait_seconds, then answers 429 + Retry-After.
+        # Keys/tenants with no cap skip admission entirely; admin/env
+        # traffic (no key_id) is exempt like every key-layer ceiling.
+        # Chat-family only: embeddings/images/audio run through
+        # _serve_simple, which never acquires a slot.
+        await self._acquire_slot(ctx)
 
         # 6. + 7. Route to provider (with retries/fallbacks)
         if request.stream:
@@ -1601,6 +1619,10 @@ class GatewayPipeline:
                         yield chunk
                 finally:
                     metrics.INFLIGHT.dec()
+                    # The stream held its concurrency slot until the body
+                    # completed (a slow reader occupies upstream capacity
+                    # for exactly as long as it reads).
+                    self._release_slot(ctx)
                     if span is not None:
                         self._annotate_span(span, ctx)
                         if ctx.status in ("error", "blocked"):
@@ -1749,6 +1771,72 @@ class GatewayPipeline:
             "runaway: config if this is legitimate load.",
             retry_after=cooldown,
         )
+
+    async def _acquire_slot(self, ctx: RequestContext) -> None:
+        """Concurrent-request admission (chat-family). A caller with
+        neither a key cap nor a tenant cap skips this entirely — no
+        queueing, no metrics. Otherwise: admit immediately if a slot
+        fits, else queue (highest-priority first, FIFO within a
+        priority) for up to concurrency.wait_seconds and fail the
+        request with 429 + Retry-After when the wait expires."""
+        limiter = self.concurrency
+        cfg = self.config.concurrency
+        key_id = ctx.auth.key_id
+        if (
+            limiter is None
+            or not cfg.enabled
+            or key_id is None
+            or (ctx.auth.max_concurrency is None and ctx.auth.tenant_max_concurrency is None)
+        ):
+            return
+        started = time.monotonic()
+        slot = await limiter.acquire(
+            key_id=key_id,
+            tenant_id=ctx.auth.tenant_id,
+            key_label=self._key_labeler.label(ctx.auth.key_name),
+            key_cap=ctx.auth.max_concurrency,
+            tenant_cap=ctx.auth.tenant_max_concurrency,
+            priority=ctx.auth.priority,
+            wait_seconds=cfg.wait_seconds,
+        )
+        if slot is None:
+            waited = time.monotonic() - started
+            cap = ctx.auth.max_concurrency
+            if cap is None:
+                cap = ctx.auth.tenant_max_concurrency  # tenant cap is what held it
+            # Observer-only: admission already failed, there is nothing
+            # left to veto — the 429 is the decision.
+            await self._emit(
+                "concurrency.timeout",
+                ctx,
+                key_name=ctx.auth.key_name,
+                model=ctx.model,
+                max_concurrency=cap,
+                wait_seconds=cfg.wait_seconds,
+                waited_seconds=round(waited, 3),
+            )
+            raise RateLimitError(
+                f"Concurrency limit reached for this key (max {cap} "
+                f"in-flight request{'s' if cap != 1 else ''}) — no slot freed "
+                f"within {cfg.wait_seconds:.0f}s. Reduce parallelism or "
+                "raise the key's max_concurrency.",
+                retry_after=1.0,
+            )
+        ctx.concurrency_slot = slot
+
+    def _release_slot(self, ctx: RequestContext) -> None:
+        """Give this request's slot back (idempotent — called from every
+        exit that decrements the in-flight gauge; a request holds at
+        most one). Never raises: a release failure must not break the
+        response path that is already committed."""
+        slot = ctx.concurrency_slot
+        if slot is None:
+            return
+        ctx.concurrency_slot = None
+        try:
+            self.concurrency.release(slot)
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to release concurrency slot")
 
     async def _check_rate_limit(self, ctx: RequestContext, estimated_tokens: int) -> None:
         key = ctx.auth.key_id
@@ -2432,6 +2520,9 @@ class GatewayPipeline:
     def _finish_span(self, ctx: RequestContext, error: Exception | None = None) -> None:
         """Final accounting for one request: span attributes, status, end + in-flight gauge."""
         metrics.INFLIGHT.dec()
+        # Concurrency slot (if this request held one) — every non-stream
+        # exit lands here, success and error paths alike.
+        self._release_slot(ctx)
         span = ctx.otel_span
         if span is None:
             return

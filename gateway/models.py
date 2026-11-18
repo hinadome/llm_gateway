@@ -52,6 +52,15 @@ class VirtualKey(Base):
     allowed_models: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Concurrency admission (tier 27): max simultaneous UPSTREAM
+    # requests this key may hold (None = unlimited) and its QoS class
+    # — under contention, waiters are admitted highest-priority-first
+    # (FIFO within a priority). Priority only matters when a cap is
+    # contended. Both snapshot at auth time like the other ceilings.
+    # Nullable + default 0 so the auto-upgrade can add it to existing
+    # databases (None reads as the default class 0).
+    max_concurrency: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    priority: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     spend_usd: Mapped[float] = mapped_column(Float, default=0.0)
     # Budget windows: daily/monthly caps alongside the total. Spend and its
@@ -117,6 +126,8 @@ class VirtualKey(Base):
             "allowed_models": self.allowed_models,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
+            "max_concurrency": self.max_concurrency,
+            "priority": self.priority or 0,
             "max_budget_usd": self.max_budget_usd,
             "spend_usd": self.spend_usd,
             "daily_budget_usd": self.daily_budget_usd,
@@ -179,6 +190,11 @@ class Tenant(Base):
     # visible beside tenant economics. NULL = no markup (bill at
     # actual — the platform default; auto-upgrade adds the column).
     pricing_markup_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Pooled concurrency ceiling: max simultaneous UPSTREAM requests
+    # across every member key (None = tenant sets none). A member key
+    # must pass both its own cap and the tenant's — the tenant can
+    # only narrow, like every other ceiling.
+    max_concurrency: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     spend_usd: Mapped[float] = mapped_column(Float, default=0.0)
     # Budget windows: same scheme as VirtualKey (see there) — bucket ids
@@ -207,6 +223,7 @@ class Tenant(Base):
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "pricing_markup_pct": self.pricing_markup_pct,
+            "max_concurrency": self.max_concurrency,
             "max_budget_usd": self.max_budget_usd,
             "spend_usd": self.spend_usd,
             "daily_budget_usd": self.daily_budget_usd,

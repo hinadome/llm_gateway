@@ -375,6 +375,8 @@
       <div class="grid2">
         <label class="fld">RPM limit <input id="k-rpm" type="number" min="0" placeholder="unlimited"></label>
         <label class="fld">TPM limit <input id="k-tpm" type="number" min="0" placeholder="unlimited"></label>
+        <label class="fld" title="Concurrency admission: max requests this key may hold in-flight against the upstream at once (RPM/TPM bound the rate, this bounds the parallelism). Requests past the cap queue for concurrency.wait_seconds, then 429. Empty = unlimited.">Max concurrent <input id="k-conc" type="number" min="1" placeholder="unlimited"></label>
+        <label class="fld" title="QoS class under concurrency contention: when a cap (the key's or its tenant's) is contended, waiters are admitted highest-priority-first, FIFO within a class. Only matters when a cap is set somewhere. Empty = 0.">Priority <input id="k-priority" type="number" min="-1000" max="1000" placeholder="0"></label>
         <label class="fld">Max budget (USD) <input id="k-budget" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld">Expires at <input id="k-expires" type="datetime-local"></label>
         <label class="fld" title="Spend cap per UTC calendar day; resets at 00:00 UTC">
@@ -415,6 +417,7 @@
         <label class="fld" title="Pooled spend cap per UTC calendar day; resets at 00:00 UTC">Daily budget (USD) <input id="t-daily" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld" title="Pooled spend cap per UTC calendar month; resets on the 1st at 00:00 UTC">Monthly budget (USD) <input id="t-monthly" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld" title="Cost-plus billing: percent markup on provider cost for every member-key request (20 = bill 1.2x). Spend, budgets, logs and exports record the billed cost; gateway_cost_usd_total stays actual. Empty = no markup.">Markup % <input id="t-markup" type="number" min="0" max="1000" step="0.1" placeholder="none"></label>
+        <label class="fld" title="Pooled concurrency ceiling: max simultaneous upstream requests across every member key (each member still passes its own cap too; the tenant can only narrow). Empty = the tenant sets none.">Max concurrent <input id="t-conc" type="number" min="1" placeholder="unlimited"></label>
       </div>
       <label class="fld" style="grid-template-columns:auto 1fr;display:grid;gap:8px;align-items:center;color:var(--text)" id="t-active-row" title="Kill switch: while disabled, every member key fails closed (401) until re-enabled — spend state and keys are untouched.">
         <input type="checkbox" id="t-active" checked style="width:16px;height:16px;accent-color:var(--accent)"> Active
@@ -743,6 +746,9 @@ async function loadKeys() {
     const promptPolicy = promptBits.length
       ? ` <span class="b b-blue" title="Gateway-managed prompt policy: ${esc(promptBits.join(" + "))}">✎</span>`
       : "";
+    const concBadge = k.max_concurrency != null
+      ? ` <span class="b b-blue" title="Concurrency cap: at most ${k.max_concurrency} in-flight upstream request${k.max_concurrency === 1 ? "" : "s"}; past it, requests queue then 429. Priority ${k.priority || 0} under contention.">⇶${k.max_concurrency}${k.priority ? " p" + k.priority : ""}</span>`
+      : "";
     const expired = k.expires_at && new Date(k.expires_at) < new Date();
     const tenantBadge = k.tenant_id
       ? ` <span class="b b-purple" title="Tenant: must also pass this tenant's pooled policy ceiling (models, RPM/TPM, budgets)">${esc(state.tenantNames[k.tenant_id] || k.tenant_id)}</span>`
@@ -754,7 +760,7 @@ async function loadKeys() {
       <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
-      <td>${models}${grOff}${scoped}${ipLock}${promptPolicy}</td>
+      <td>${models}${grOff}${scoped}${ipLock}${promptPolicy}${concBadge}</td>
       <td class="num">${k.rpm_limit == null ? "—" : fmtInt(k.rpm_limit)} / ${k.tpm_limit == null ? "—" : fmtInt(k.tpm_limit)}</td>
       <td>${budgetCell}</td>
       <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
@@ -812,6 +818,8 @@ function openKeyDialog(k) {
   $("#k-ips").value = k && k.allowed_ips ? k.allowed_ips.join(", ") : "";
   $("#k-rpm").value = k && k.rpm_limit != null ? k.rpm_limit : "";
   $("#k-tpm").value = k && k.tpm_limit != null ? k.tpm_limit : "";
+  $("#k-conc").value = k && k.max_concurrency != null ? k.max_concurrency : "";
+  $("#k-priority").value = k && k.priority != null && k.priority !== 0 ? k.priority : "";
   $("#k-budget").value = k && k.max_budget_usd != null ? k.max_budget_usd : "";
   $("#k-daily").value = k && k.daily_budget_usd != null ? k.daily_budget_usd : "";
   $("#k-monthly").value = k && k.monthly_budget_usd != null ? k.monthly_budget_usd : "";
@@ -862,6 +870,8 @@ async function submitKeyDialog() {
       ? $("#k-ips").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     rpm_limit: num("k-rpm"),
     tpm_limit: num("k-tpm"),
+    max_concurrency: num("k-conc"),
+    priority: num("k-priority"),
     max_budget_usd: num("k-budget"),
     daily_budget_usd: num("k-daily"),
     monthly_budget_usd: num("k-monthly"),
@@ -888,6 +898,8 @@ async function submitKeyDialog() {
       if (body.allowed_ips == null) delete body.allowed_ips;
       if (body.rpm_limit == null) delete body.rpm_limit;
       if (body.tpm_limit == null) delete body.tpm_limit;
+      if (body.max_concurrency == null) delete body.max_concurrency;
+      if (body.priority == null) delete body.priority;
       if (body.max_budget_usd == null) delete body.max_budget_usd;
       if (body.daily_budget_usd == null) delete body.daily_budget_usd;
       if (body.monthly_budget_usd == null) delete body.monthly_budget_usd;
@@ -975,13 +987,16 @@ async function loadTenants() {
     const markupBadge = t.pricing_markup_pct == null
       ? '<span class="muted">—</span>'
       : `<span class="b b-blue" title="Cost-plus billing: member traffic bills at ${(100 + t.pricing_markup_pct) / 100}x provider cost; spend/budgets/logs record the billed amount">+${t.pricing_markup_pct}%</span>`;
+    const concBadge = t.max_concurrency != null
+      ? ` <span class="b b-blue" title="Pooled concurrency cap: at most ${t.max_concurrency} simultaneous upstream requests across every member key; past it, requests queue then 429.">⇶${t.max_concurrency}</span>`
+      : "";
     return `<tr>
       <td>${nameCell}</td>
       <td>${stateBadge}</td>
       <td class="num">${fmtInt(keyCounts[t.id] || 0)}</td>
       <td>${models}</td>
       <td class="num">${t.rpm_limit == null ? "—" : fmtInt(t.rpm_limit)} / ${t.tpm_limit == null ? "—" : fmtInt(t.tpm_limit)}</td>
-      <td>${markupBadge}</td>
+      <td>${markupBadge}${concBadge}</td>
       <td>${budgetCellHtml(t)}</td>
       <td class="muted" style="font-size:12px">${fmtWhen(t.created_at)}</td>
       <td style="white-space:nowrap">
@@ -1023,6 +1038,7 @@ function openTenantDialog(t) {
   $("#t-models").value = t && t.allowed_models ? t.allowed_models.join(", ") : "";
   $("#t-rpm").value = t && t.rpm_limit != null ? t.rpm_limit : "";
   $("#t-tpm").value = t && t.tpm_limit != null ? t.tpm_limit : "";
+  $("#t-conc").value = t && t.max_concurrency != null ? t.max_concurrency : "";
   $("#t-budget").value = t && t.max_budget_usd != null ? t.max_budget_usd : "";
   $("#t-daily").value = t && t.daily_budget_usd != null ? t.daily_budget_usd : "";
   $("#t-monthly").value = t && t.monthly_budget_usd != null ? t.monthly_budget_usd : "";
@@ -1042,6 +1058,7 @@ async function submitTenantDialog() {
     rpm_limit: num("t-rpm"),
     tpm_limit: num("t-tpm"),
     pricing_markup_pct: num("t-markup"),
+    max_concurrency: num("t-conc"),
     max_budget_usd: num("t-budget"),
     daily_budget_usd: num("t-daily"),
     monthly_budget_usd: num("t-monthly"),

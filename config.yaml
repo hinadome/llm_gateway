@@ -573,6 +573,37 @@ runaway:
   cooldown_max_seconds: 3600        # 1h ceiling
   reset_after_seconds: 600         # quiet period that clears the offense count
 
+# Concurrency admission control + QoS: how many requests a key (and
+# its tenant) may hold IN-FLIGHT against the upstream at once — RPM/TPM
+# bound the rate, this bounds the parallelism (protects a provider
+# quota or a small deployment fleet). Caps live on the rows, snapshotted
+# at auth time: max_concurrency on a virtual key (POST/PATCH /admin/keys,
+# admin UI key dialog) and the pooled max_concurrency on a tenant
+# (POST/PATCH /admin/tenants) — a member key must pass both; the tenant
+# can only narrow. Callers with neither cap skip admission entirely.
+# The slot wraps the upstream call: cache hits and idempotent replays
+# never hold one; a streamed response holds it until its body completes
+# (a slow reader occupies upstream capacity for exactly as long as it
+# reads). When every slot is taken, requests QUEUE (no extra upstream
+# pressure) admitted highest-priority-first — a key's `priority`
+# (POST/PATCH /admin/keys; default 0, higher first, FIFO within a
+# priority) is the QoS knob, and a waiter on a different key never
+# blocks behind an unrelated saturated one. A queue wait past
+# wait_seconds answers 429 rate_limit_exceeded + Retry-After
+# (0 = fail fast when all slots are taken). Chat-family surfaces only
+# (embeddings/images/audio bypass — documented honestly). Admin view:
+# GET /admin/concurrency (in-flight/queued per key+tenant, live config
+# echo). Metrics: gateway_concurrency_inflight{key} /
+# gateway_concurrency_queued{key} gauges,
+# gateway_concurrency_rejected_total{key}; a `concurrency.timeout`
+# observer event fires per refused wait. State is in-process (like the
+# idempotency in-flight map): a multi-replica fleet enforces its
+# per-replica share — run N replicas with cap/N, or accept the
+# approximation.
+concurrency:
+  enabled: true
+  wait_seconds: 10        # queue wait before 429; 0 = fail fast
+
 # Lifecycle events: subscribe handlers to the request-stage boundaries
 # (request.received / request.routed / response.completed / stream.* /
 # auth.rejected / key.* / budget.threshold / batch.* ...). Two kinds:

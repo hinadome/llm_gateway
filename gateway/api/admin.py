@@ -165,6 +165,8 @@ async def create_key(
             allowed_models=body.allowed_models,
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
+            max_concurrency=body.max_concurrency,
+            priority=body.priority,
             max_budget_usd=body.max_budget_usd,
             daily_budget_usd=body.daily_budget_usd,
             monthly_budget_usd=body.monthly_budget_usd,
@@ -263,6 +265,7 @@ async def update_key(
             "allowed_models",
             "rpm_limit",
             "tpm_limit",
+            "max_concurrency",
             "max_budget_usd",
             "daily_budget_usd",
             "monthly_budget_usd",
@@ -278,6 +281,9 @@ async def update_key(
         ):
             if field in updates:
                 setattr(vkey, field, updates[field])
+        if "priority" in updates:
+            # Non-null column: an explicit null means "back to default 0".
+            vkey.priority = updates["priority"] or 0
         if budget_changed:
             # Raising (or lowering) the budget re-arms alerts: levels the
             # current spend has already crossed count as fired, so only
@@ -346,6 +352,7 @@ async def create_tenant(
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
             pricing_markup_pct=body.pricing_markup_pct,
+            max_concurrency=body.max_concurrency,
             max_budget_usd=body.max_budget_usd,
             daily_budget_usd=body.daily_budget_usd,
             monthly_budget_usd=body.monthly_budget_usd,
@@ -415,6 +422,7 @@ async def update_tenant(
             "rpm_limit",
             "tpm_limit",
             "pricing_markup_pct",
+            "max_concurrency",
             "max_budget_usd",
             "daily_budget_usd",
             "monthly_budget_usd",
@@ -1665,6 +1673,54 @@ async def runaway_release(
         "runaway.released", actor=admin, key_id=key_id
     )
     return {"key_id": key_id, "released": True}
+
+
+@router.get("/admin/concurrency")
+async def concurrency_view(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Concurrency admission control: keys/tenants currently holding
+    in-flight slots or queueing for one, plus the live config echo and
+    the per-key gauges' ground truth. In-process state — a
+    multi-replica fleet reports its own share here. Read-only: slots
+    free themselves as responses complete; the caps live on the
+    key/tenant rows."""
+    pipeline = raw_request.app.state.pipeline
+    limiter = pipeline.concurrency
+    cfg = pipeline.config.concurrency
+    snapshot = limiter.snapshot() if limiter is not None else {"keys": [], "tenants": [], "queued_total": 0}
+    # Join display names — the limiter tracks ids only.
+    names: dict[str, str] = {}
+    tenant_names: dict[str, str] = {}
+    ids = [entry["key_id"] for entry in snapshot["keys"]]
+    tids = [entry["tenant_id"] for entry in snapshot["tenants"]]
+    if ids or tids:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            if ids:
+                rows = await session.execute(
+                    select(VirtualKey).where(VirtualKey.id.in_(ids))
+                )
+                names = {vk.id: vk.name for vk in rows.scalars()}
+            if tids:
+                rows = await session.execute(
+                    select(Tenant).where(Tenant.id.in_(tids))
+                )
+                tenant_names = {t.id: t.name for t in rows.scalars()}
+    return {
+        "enabled": cfg.enabled,
+        "wait_seconds": cfg.wait_seconds,
+        "keys": [
+            {**entry, "key_name": names.get(entry["key_id"])}
+            for entry in snapshot["keys"]
+        ],
+        "tenants": [
+            {**entry, "tenant_name": tenant_names.get(entry["tenant_id"])}
+            for entry in snapshot["tenants"]
+        ],
+        "queued_total": snapshot["queued_total"],
+    }
 
 
 # ----------------------------------------------------------------------

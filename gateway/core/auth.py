@@ -128,9 +128,14 @@ def auth_context_from_key(
         tenant_pricing_markup_pct=(
             tenant.pricing_markup_pct if tenant is not None else None
         ),
+        tenant_max_concurrency=(
+            tenant.max_concurrency if tenant is not None else None
+        ),
         allowed_models=vkey.allowed_models,
         rpm_limit=vkey.rpm_limit,
         tpm_limit=vkey.tpm_limit,
+        max_concurrency=vkey.max_concurrency,
+        priority=vkey.priority or 0,
         max_budget_usd=vkey.max_budget_usd,
         spend_usd=vkey.spend_usd,
         daily_budget_usd=vkey.daily_budget_usd,

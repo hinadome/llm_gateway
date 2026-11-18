@@ -8,6 +8,51 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Concurrency admission control + QoS — per-key and pooled
+  per-tenant in-flight caps with priority queueing. RPM/TPM bound
+  the rate of requests; max_concurrency (VirtualKey, and the pooled
+  Tenant.max_concurrency a member key must also pass — the tenant
+  can only narrow) bounds how many may be in-flight against the
+  upstream at once, the number that actually protects a provider
+  quota or a small deployment fleet. The slot wraps exactly the
+  upstream call: acquired at phase 5.5 after the cache miss (cache
+  hits and idempotent replays never hold one), released wherever
+  the in-flight gauge decrements — _finish_span for non-streams,
+  the stream wrapper's finally for streams (a slow stream reader
+  occupies upstream capacity for exactly as long as it reads), and
+  every error path, so a leaked slot is structurally impossible.
+  At the cap requests QUEUE (no extra upstream pressure): waiters
+  sit in a heap ordered (-priority, seq) — VirtualKey.priority is
+  the QoS class, higher admitted first, FIFO within a class, only
+  meaningful under contention (a key attribute, so it matters
+  exactly where contention crosses keys, typically the tenant pool)
+  — and the drain on every release scans in priority order,
+  SKIPPING rather than stopping at waiters that do not fit, so a
+  waiter on one saturated key never blocks an unrelated one.
+  asyncio.wait (never wait_for — a granted slot is not cancelled)
+  bounds the stay at concurrency.wait_seconds; expiry answers 429
+  rate_limit_exceeded + Retry-After (0 = fail fast), fires a
+  concurrency.timeout observer event (key, model, cap, wait and
+  waited seconds) and counts gateway_concurrency_rejected_total
+  {key}. Gauges gateway_concurrency_inflight{key} /
+  gateway_concurrency_queued{key} are the limiter's ground truth
+  (capless callers skip admission entirely and never appear);
+  GET /admin/concurrency surfaces them with key/tenant name joins
+  and the live config echo (platform admin only, pinned in the
+  platform-endpoint enumeration). Admin UI: Max concurrent +
+  Priority fields on the key dialog, Max concurrent on the tenant
+  dialog, with badges on the key/tenant rows. Honest boundaries,
+  same as runaway: chat-family only (embeddings/images/audio run
+  through _serve_simple and never acquire a slot); admin/env-key
+  traffic exempt; no locks anywhere (event-loop atomicity);
+  in-process state (like the idempotency in-flight map and runaway
+  detection) — multi-replica fleets enforce per-replica shares,
+  run N replicas with cap/N or accept the approximation.
+  priority is nullable-default-0 so db.py's auto-upgrade can add
+  it to existing databases. 15 new tests (tests/test_concurrency.
+  py); full suite 942 passing. README's event catalog also gained
+  the runaway.trip / runaway.released rows (a tier-26 doc gap
+  noticed while adding concurrency.timeout).
 - Runaway-agent protection — identical-request loop detection with an
   escalating cooldown jail. Agents stuck in loops (retry storms,
   regenerating tool-call loops) send the SAME request over and over;
