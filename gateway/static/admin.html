@@ -156,6 +156,7 @@
   <div class="spacer"></div>
   <span class="dot" id="conn"></span><span class="muted" style="font-size:12px" id="connlabel">disconnected</span>
   <div class="authbox" id="authbox" style="display:none">
+    <span id="whoami" class="muted" style="font-size:12px"></span>
     <button class="ghost small" id="btn-logout">Log out</button>
   </div>
 </header>
@@ -232,7 +233,10 @@
   <section class="tab" id="tab-keys">
     <div class="panel">
       <div class="ph">Virtual keys
-        <div class="right"><button class="primary small" id="btn-newkey">+ New key</button></div>
+        <div class="right">
+          <select id="keys-f-tenant" style="display:none" title="Per-tenant lens (platform admins): show only this tenant's keys"></select>
+          <button class="primary small" id="btn-newkey">+ New key</button>
+        </div>
       </div>
       <div style="overflow-x:auto"><table id="keys-table"></table></div>
     </div>
@@ -298,6 +302,9 @@
         <select id="f-status">
           <option value="">any status</option>
           <option>success</option><option>error</option><option>blocked</option>
+        </select>
+        <select id="f-tenant" style="display:none" title="Per-tenant lens (platform admins): only this tenant's rows">
+          <option value="">any tenant</option>
         </select>
         <input id="f-reqid" placeholder="request id" class="mono" style="width:180px">
         <input id="f-trace" placeholder="trace id" class="mono" style="width:180px">
@@ -741,6 +748,9 @@ const state = {
   // Did this tab's credential come from SSO? Governs logout: the
   // session cookie should be dropped server-side too.
   sso: sessionStorage.getItem("gw-admin-sso") === "1",
+  // The signed-in identity (GET /admin/whoami): name, auth method,
+  // tenancy — drives every role affordance in the UI (tier 61).
+  me: null,
   tab: "overview",
   hours: 24,
   auto: true,
@@ -908,19 +918,46 @@ async function ssoFinish() {
   }
 })();
 
-// Which kind of administrator signed in: only platform admins may
-// manage tenants (tenant admins get 403 there). Probing once drives
-// every tenancy affordance in the UI — the Tenants tab, tenant
-// placement in the key dialog, tenant name badges.
+// Which kind of administrator signed in (tier 61): GET /admin/whoami
+// is the one honest probe — name, auth method, tenancy — replacing
+// the old infer-the-role-from-which-endpoints-403 trick. It drives
+// every role affordance: the platform-only tabs' honest placeholders
+// (no guaranteed-403 request is ever fired, so the connection badge
+// stops lying), tenant placement in the key dialog, the tenant
+// lenses on keys/logs, and the header's signed-in line — an SSO
+// session names the human (their email).
 async function bootstrapAdminInfo() {
   try {
-    const r = await api("/admin/tenants");
-    state.tenantNames = Object.fromEntries((r.data || []).map(t => [t.id, t.name]));
-    state.platformAdmin = true;
+    const me = await api("/admin/whoami");
+    state.me = me;
+    state.platformAdmin = !!me.platform_admin;
   } catch (e) {
+    state.me = null;
     state.platformAdmin = false;
-    state.tenantNames = {};
   }
+  const w = $("#whoami");
+  if (state.me) {
+    w.textContent = state.me.name +
+      (state.me.tenant ? " · " + state.me.tenant.name : " · platform");
+    w.title = "signed in via " + (state.me.auth_method || "admin_key") +
+      (state.me.tenant ? " — tenant administrator" : " — platform administrator");
+  }
+  // Tenant name map (badges, dialogs, lenses): platform admins see
+  // the list; tenant admins need none — whoami already named their
+  // own, which seeds their keys' tenant badges.
+  if (state.platformAdmin) {
+    try {
+      const r = await api("/admin/tenants");
+      state.tenantNames = Object.fromEntries((r.data || []).map(t => [t.id, t.name]));
+    } catch (e) { state.tenantNames = {}; }
+  } else {
+    state.tenantNames = state.me && state.me.tenant
+      ? { [state.me.tenant.id]: state.me.tenant.name }
+      : {};
+  }
+  // The per-tenant lenses are platform-admin surfaces.
+  $("#keys-f-tenant").style.display = state.platformAdmin ? "" : "none";
+  $("#f-tenant").style.display = state.platformAdmin ? "" : "none";
 }
 $("#btn-login").addEventListener("click", tryLogin);
 $("#login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryLogin(); });
@@ -982,6 +1019,26 @@ $("#backups-table").addEventListener("click", async e => {
     await refreshBackups();
   } catch (err) { toast(err.message, true); }
 });
+
+// ---------- role & tenancy (tier 61) -------------------------------------
+// The honest sentence for a platform-only panel when a tenant
+// administrator is signed in — every gated surface says the same
+// thing, naming itself.
+const PLATFORM_ONLY = what =>
+  what + " is a platform-administrator surface. " +
+  "Your tenant's keys, logs and usage are on their own tabs.";
+
+// Fill a tenant <select> from the tenant name map, preserving the
+// current selection when it still exists. allLabel is the
+// empty-value option's text ("any tenant", "all tenants").
+function fillTenantSelect(sel, allLabel) {
+  const cur = sel.value;
+  const ids = Object.keys(state.tenantNames || {})
+    .sort((a, b) => state.tenantNames[a].localeCompare(state.tenantNames[b]));
+  sel.innerHTML = `<option value="">${allLabel}</option>` +
+    ids.map(id => `<option value="${esc(id)}">${esc(state.tenantNames[id])}</option>`).join("");
+  if (cur && ids.includes(cur)) sel.value = cur;
+}
 
 async function refresh() {
   if (!state.key) return;
@@ -1061,11 +1118,18 @@ function fmtSloValue(metric, v) {
 async function loadSLOs() {
   const panel = $("#ov-slos-panel");
   const box = $("#ov-slos");
+  // Platform-only (tier 61): whoami knows the role up front, so no
+  // guaranteed-403 request fires for a tenant administrator — the
+  // panel hides, not the tab (the same shape as before, minus the
+  // wasted round trip; the catch stays for a genuine failure).
+  if (!state.platformAdmin) {
+    panel.style.display = "none";
+    return;
+  }
   let r;
   try {
     r = await api("/admin/slos");
   } catch (e) {
-    // A tenant admin cannot read SLOs — hide the panel, not the tab.
     panel.style.display = "none";
     return;
   }
@@ -1160,7 +1224,15 @@ function budgetCellHtml(e) {
 // ---------- keys -------------------------------------------------------
 
 async function loadKeys() {
-  const r = await api("/admin/keys");
+  // Per-tenant lens (tier 61, platform admins): the select rides in
+  // the panel header; a chosen tenant narrows the server-side list
+  // (the API forces tenant admins to their own regardless).
+  const params = new URLSearchParams();
+  if (state.platformAdmin) {
+    fillTenantSelect($("#keys-f-tenant"), "all tenants");
+    if ($("#keys-f-tenant").value) params.set("tenant_id", $("#keys-f-tenant").value);
+  }
+  const r = await api("/admin/keys" + (params.toString() ? "?" + params.toString() : ""));
   const rows = (r.data || []).map(k => {
     const budgetCell = budgetCellHtml(k);
     const models = !k.allowed_models ? '<span class="b b-blue">all</span>' :
@@ -1490,8 +1562,7 @@ async function loadTenants() {
   $("#btn-newtenant").style.display = state.platformAdmin ? "" : "none";
   if (!state.platformAdmin) {
     $("#tenants-table").innerHTML =
-      "<tbody><tr><td class='empty'>Tenant management is a platform-administrator surface. " +
-      "Your tenant's keys, logs and usage are on their own tabs.</td></tr></tbody>";
+      "<tbody><tr><td class='empty'>" + PLATFORM_ONLY("Tenant management") + "</td></tr></tbody>";
     return;
   }
   const [tr, kr] = await Promise.all([
@@ -1754,6 +1825,15 @@ function populatePromptRefSelect(selected) {
 }
 
 async function loadPrompts() {
+  // Platform-only (tier 61): a tenant administrator gets the honest
+  // sentence, not a fired 403 and a lying connection badge.
+  if (!state.platformAdmin) {
+    $("#btn-newprompt").style.display = "none";
+    $("#prompts-table").innerHTML =
+      "<tbody><tr><td class='empty'>" + PLATFORM_ONLY("The prompt library") + "</td></tr></tbody>";
+    return;
+  }
+  $("#btn-newprompt").style.display = "";
   const r = await api("/admin/prompts");
   const rows = (r.data || []).map(p => {
     const a = p.active, c = p.candidate;
@@ -1879,16 +1959,23 @@ function logFilters() {
   const p = new URLSearchParams({ limit: state.logs.limit, offset: state.logs.offset });
   const add = (id, name) => { const v = $("#" + id).value.trim(); if (v) p.set(name, v); };
   add("f-key", "key_name"); add("f-model", "model"); add("f-reqid", "request_id"); add("f-trace", "trace_id");
+  add("f-tenant", "tenant_id");  // platform-admin lens; empty for tenant admins
   if ($("#f-status").value) p.set("status", $("#f-status").value);
   return p;
 }
 $("#btn-filter").addEventListener("click", () => { state.logs.offset = 0; loadLogs(); });
+$("#f-tenant").addEventListener("change", () => { state.logs.offset = 0; loadLogs(); });
+$("#keys-f-tenant").addEventListener("change", loadKeys);
 $("#btn-clearfilter").addEventListener("click", () => {
-  ["f-key", "f-model", "f-reqid", "f-trace", "f-status"].forEach(id => $("#" + id).value = "");
+  ["f-key", "f-model", "f-reqid", "f-trace", "f-status", "f-tenant"].forEach(id => $("#" + id).value = "");
   state.logs.offset = 0; loadLogs();
 });
 
 async function loadLogs() {
+  // Per-tenant lens (tier 61, platform admins): fill the select from
+  // the name map; a chosen tenant rides logFilters as tenant_id (the
+  // API forces tenant admins to their own regardless).
+  if (state.platformAdmin) fillTenantSelect($("#f-tenant"), "any tenant");
   const r = await api("/admin/logs?" + logFilters().toString());
   state.logs.total = r.total;
   const from = r.total === 0 ? 0 : r.offset + 1;
@@ -2357,6 +2444,14 @@ async function loadAnomalies() {
 const BREAKER_BADGE = { closed: "b-green", half_open: "b-amber", open: "b-red" };
 
 async function loadRouting() {
+  // Platform-only (tier 61): the routing table, the shadow-diff
+  // evidence and the candidate trials behind it are one operator
+  // surface — one honest sentence, zero fired 403s.
+  if (!state.platformAdmin) {
+    $("#routing-table").innerHTML =
+      "<tbody><tr><td class='empty'>" + PLATFORM_ONLY("Routing, breakers and shadow evidence") + "</td></tr></tbody>";
+    return;
+  }
   const r = await api("/admin/routing");
   const cb = r.circuit_breaker || {};
   let html = "<thead><tr><th>Deployment</th><th>Provider</th><th>Native model</th><th class=num>Priority</th><th class=num>Weight</th><th>Circuit</th><th></th></tr></thead><tbody>";
@@ -2872,6 +2967,21 @@ async function pgSend() {
 }
 
 async function loadPlayground() {
+  // Platform-only (tier 61): running a request through a key's policy
+  // reality is an operator's probe — tenant admins can read their own
+  // logs instead.
+  if (!state.platformAdmin) {
+    $("#pg-messages").innerHTML = "<span class='muted'>" + PLATFORM_ONLY("The playground") + "</span>";
+    $("#pg-model").innerHTML = "";
+    $("#pg-key").innerHTML = "";
+    $("#pg-input").disabled = true;
+    $("#pg-send").disabled = true;
+    $("#pg-clear").disabled = true;
+    return;
+  }
+  $("#pg-input").disabled = false;
+  $("#pg-send").disabled = false;
+  $("#pg-clear").disabled = false;
   const [routing, keys] = await Promise.all([
     api("/admin/routing"),
     api("/admin/keys"),
@@ -3027,6 +3137,19 @@ async function loadSystem() {
   }
   $("#system-health").innerHTML = healthHtml;
   $("#system-config-path").textContent = "config.yaml is re-read on reload (POST /admin/reload or SIGHUP)";
+  // Health is everyone's; config reload and backups are the
+  // operator's (tier 61): the buttons hide, the honest sentence
+  // replaces the list, no 403 is fired.
+  if (!state.platformAdmin) {
+    $("#btn-reload").style.display = "none";
+    $("#btn-backup").style.display = "none";
+    $("#system-reload-result").textContent = "";
+    $("#backups-table").innerHTML =
+      "<tbody><tr><td class='empty'>" + PLATFORM_ONLY("Config reload and database backups") + "</td></tr></tbody>";
+    return;
+  }
+  $("#btn-reload").style.display = "";
+  $("#btn-backup").style.display = "";
   await refreshBackups();
 }
 
@@ -3081,6 +3204,14 @@ async function createBackup() {
 // ---------- guardrails -------------------------------------------------
 
 async function loadGuardrails() {
+  // Platform-only (tier 61): guardrail *configuration* is the
+  // operator's; a tenant admin's own rows still show their verdicts
+  // on the logs tab.
+  if (!state.platformAdmin) {
+    $("#guardrails-table").innerHTML =
+      "<tbody><tr><td class='empty'>" + PLATFORM_ONLY("Guardrail configuration") + "</td></tr></tbody>";
+    return;
+  }
   const r = await api("/admin/guardrails");
   const rows = (r.guardrails || []).map(g => {
     // Compact route scoping: which inbound formats this guardrail runs on

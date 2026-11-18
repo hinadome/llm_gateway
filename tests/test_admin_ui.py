@@ -516,6 +516,36 @@ async def test_admin_ui_sso_login_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_tenant_views_surface(env):
+    # Tier 61: the dashboard learns who is signed in — the whoami
+    # probe and header line, the role-honest placeholders that
+    # replace fired 403s on every platform-only tab, and the
+    # per-tenant lenses on keys and logs. Static-shell assertions
+    # only (the endpoints live in test_tenants.py / test_sso.py).
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="whoami"',
+        "/admin/whoami",
+        "const PLATFORM_ONLY",
+        "fillTenantSelect",
+        'id="keys-f-tenant"',
+        'id="f-tenant"',
+        "me.tenant.name",
+        "me.auth_method",
+        "platform_admin",
+        "tenant_id",
+        # every gated tab names itself with the same honest sentence
+        "PLATFORM_ONLY(\"Tenant management\")",
+        "PLATFORM_ONLY(\"The prompt library\")",
+        "PLATFORM_ONLY(\"Routing, breakers and shadow evidence\")",
+        "PLATFORM_ONLY(\"Guardrail configuration\")",
+        "PLATFORM_ONLY(\"The playground\")",
+        "PLATFORM_ONLY(\"Config reload and database backups\")",
+        "is a platform-administrator surface",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_ui_pii_panel_surface(env):
     # Tier 57: the tier-53 teeth get their dashboard surface — a PII
     # scan tab (loading it IS the on-demand scan), the config-echo

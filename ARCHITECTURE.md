@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 95 Python files, ~36,600 lines, 1402 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 95 Python files, ~36,600 lines, 1406 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -342,7 +342,14 @@ gateway/
 │   │                       off. Cookie paths are scoped (/admin/ui[/sso]) so no
 │   │                       cookie ever rides an /admin/* API call
 │   └── admin.py            Keys CRUD (incl. per-key model_mappings / default_model,
-│                           prompt policy fields and scoping fields; POST
+│                           prompt policy fields and scoping fields; GET
+│                           /admin/keys takes the tier-61 per-tenant lens
+│                           ?tenant_id= — platform admins narrow to one
+│                           tenant, tenant admins are forced to their own
+│                           regardless, mirroring /admin/logs; GET
+│                           /admin/whoami — tier 61: the signed-in identity
+│                           (name, auth_method, platform_admin, tenancy),
+│                           the dashboard's one honest role probe; POST
 │                           /admin/keys/{id}/rotate — tier 51: replaces the
 │                           credential, the row keeps its identity; new raw
 │                           key shown exactly once, previous hash remembered
@@ -2388,7 +2395,22 @@ gateway/
                             HttpOnly cookie for the Bearer it sends (the
                             browser never holds the raw admin key; an ?sso=
                             error renders the reason in the overlay; logout
-                            drops the server-side cookie too). 12 tabs: overview stats (+ usage CSV
+                            drops the server-side cookie too). Tier 61 makes
+                            it role-aware: sign-in probes GET /admin/whoami
+                            (name, auth method, tenancy) — the header names
+                            the signed-in principal (an SSO session's email)
+                            — and every platform-only tab (tenant
+                            management, prompt library, routing/breakers/
+                            shadow evidence, guardrail config, playground,
+                            reload/backups) renders the same honest
+                            "platform-administrator surface" note for
+                            tenant administrators instead of firing a
+                            guaranteed-403 request (the connection badge
+                            stops lying), while platform admins get
+                            per-tenant lenses on the keys and logs tabs
+                            (tenant <select>s fed from the tenant name
+                            map, riding as ?tenant_id= — the forced
+                            scoping for tenant admins unchanged). 12 tabs: overview stats (+ usage CSV
                             export for the selected window, by-tenant breakdown
                             when tenants have traffic; tier 42 adds the SLO
                             panel above the traffic tables — one row per
@@ -3317,7 +3339,7 @@ Being honest about the seams — these are the current trade-offs (all are local
 7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching (exact *and* semantic — `semantic_cache.backend: redis`, tier 59: a near-duplicate one replica embedded and stored is a hit for every replica, `RedisSemanticCache` keeping the same cosine/threshold/TTL/LRU semantics over shared entries) and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
 9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
-10. ~~No tenant concept~~ **Solved:** tenants (`models.Tenant`) group virtual keys under a narrowing policy ceiling — allowlist, RPM/TPM, the three budget windows — with no admin bypass at the tenant layer; tenant admins are scoped (own keys/logs/stats/usage, 404 on cross-tenant ids, 403 on platform endpoints) and auth fails closed on dangling/disabled tenants (see §6). ~~Tenant guardrail scoping has no first-class field (item 9)~~ **Solved (tier 58):** `guardrails[].scope.tenants` / `exclude_tenants` match the tenant's name with fnmatch globs — one field binds a whole tenant (every member key, tenant admins included, the ceiling applies to them like every member), with no key-name globs or per-key `disabled_guardrails` bookkeeping; a platform key (no tenant) is in no tenant, so `tenants` never widens onto it and `exclude_tenants` never excuses it. Remaining gaps, honestly: the admin UI has no tenant views (per-endpoint 403s degrade in-page for tenant admins), and tenant API-key budgets are the only pooling dimension — per-tenant pricing exists as a single cost-plus *markup* multiplier over the shared model pricing table (`pricing_markup_pct`, tier 25), but per-tenant *per-model* price overrides and rate-limit overrides per key-within-tenant still don't exist beyond what the two stacked windows already enforce.
+10. ~~No tenant concept~~ **Solved:** tenants (`models.Tenant`) group virtual keys under a narrowing policy ceiling — allowlist, RPM/TPM, the three budget windows — with no admin bypass at the tenant layer; tenant admins are scoped (own keys/logs/stats/usage, 404 on cross-tenant ids, 403 on platform endpoints) and auth fails closed on dangling/disabled tenants (see §6). ~~Tenant guardrail scoping has no first-class field (item 9)~~ **Solved (tier 58):** `guardrails[].scope.tenants` / `exclude_tenants` match the tenant's name with fnmatch globs — one field binds a whole tenant (every member key, tenant admins included, the ceiling applies to them like every member), with no key-name globs or per-key `disabled_guardrails` bookkeeping; a platform key (no tenant) is in no tenant, so `tenants` never widens onto it and `exclude_tenants` never excuses it. ~~The admin UI has no tenant views (per-endpoint 403s degrade in-page for tenant admins)~~ **Solved (tier 61):** the dashboard is role-aware — `GET /admin/whoami` (name, auth method, tenancy, `platform_admin`) is one honest probe replacing the infer-the-role-from-which-endpoints-403 trick; every platform-only tab (tenant management, prompt library, routing/breakers/shadow evidence, guardrail config, playground, reload/backups) renders the same honest "platform-administrator surface" note for a tenant administrator instead of firing a guaranteed-403 request (so the connection badge stops reporting a connection error on a working dashboard); the header names the signed-in principal (an SSO session's email); and platform admins get per-tenant lenses on the keys and logs tabs (`GET /admin/keys?tenant_id=` joins `/admin/logs`'s forced-scope pattern — the lens is ignored for tenant admins, never an exfiltration path). Remaining gaps, honestly: tenant API-key budgets are the only pooling dimension — per-tenant pricing exists as a single cost-plus *markup* multiplier over the shared model pricing table (`pricing_markup_pct`, tier 25), but per-tenant *per-model* price overrides and rate-limit overrides per key-within-tenant still don't exist beyond what the two stacked windows already enforce.
 
 ### 8.3 Extension recipes
 
@@ -3456,7 +3478,8 @@ tests/
 │                        via jwt — 403 vs the session's 200), explicit-
 │                        endpoint discovery skip, logout dropping the cookie,
 │                        the principal (platform admin; audit records naming
-│                        the human — auth_method sso), raw-key additivity,
+│                        the human — auth_method sso; whoami answering the
+│                        email), raw-key additivity,
 │                        and the three fail-fast startup refusals
 ├── test_key_cache_policy.py  Per-key cache policy (tier 54, the §8.2 item-6
 │                        close): bypass opts out of BOTH caches for
@@ -3545,7 +3568,11 @@ tests/
 │                        or-divider, the probe/login/session/logout
 │                        URLs, ssoFinish/finishLogin, the ?sso=
 │                        landing with history.replaceState, the
-│                        gw-admin-sso flag),
+│                        gw-admin-sso flag), tenant-views markers
+│                        (tier 61: the whoami probe + header line,
+│                        the shared PLATFORM_ONLY sentence every
+│                        platform-only tab renders, fillTenantSelect,
+│                        the keys/logs tenant lenses),
 │                        /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,
@@ -3669,7 +3696,13 @@ tests/
 │                        cache isolation (tenant/policy-token salting for chat
 │                        + embeddings, same-tenant sharing), pooled spend +
 │                        tenant alerts (kind=tenant, fired levels persist),
-│                        X-Gateway-Tenant header, by_tenant stats/usage
+│                        X-Gateway-Tenant header, by_tenant stats/usage,
+│                        tier-61 identity + lens (whoami for platform
+│                        admin / tenant admin (tenant echoed,
+│                        platform_admin false) / non-admin 403; the
+│                        keys ?tenant_id= lens — narrows for platform
+│                        admins, empty on unknown ids, ignored for
+│                        tenant admins)
 ├── test_azure_adapter.py   Azure OpenAI adapter: deployment-addressed URLs + api-version
 │                        override + quoted deployment names, api-key header (units) and
 │                        e2e chat/stream/embeddings via the mock upstream, cross-provider

@@ -94,6 +94,30 @@ async def admin_ui() -> FileResponse:
     return FileResponse(_STATIC_DIR / "admin.html", media_type="text/html")
 
 
+@router.get("/admin/whoami")
+async def whoami(admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+    """The signed-in identity (tier 61): name, auth method, tenancy.
+
+    The dashboard's role probe — one honest call instead of inferring
+    the role from which endpoints 403. ``platform_admin`` mirrors the
+    :func:`require_platform_admin` rule (admin *and* outside every
+    tenant): false for tenant administrators, true for the operator's
+    own keys and for dashboard SSO sessions (whose ``name`` is the
+    signed-in email, ``auth_method`` ``sso``).
+    """
+    return {
+        "name": admin.key_name,
+        "auth_method": admin.auth_method,
+        "is_admin": admin.is_admin,
+        "platform_admin": admin.is_admin and admin.tenant_id is None,
+        "tenant": (
+            {"id": admin.tenant_id, "name": admin.tenant_name}
+            if admin.tenant_id is not None
+            else None
+        ),
+    }
+
+
 def _generate_key(prefix: str) -> str:
     return f"{prefix}-{secrets.token_urlsafe(24)}"
 
@@ -249,8 +273,12 @@ async def create_key(
 async def list_keys(
     admin: Annotated[AuthContext, Depends(require_admin)],
     idle_days: float | None = None,
+    tenant_id: str | None = None,
 ) -> dict:
-    """List keys, optionally narrowed to idle ones (tier 55).
+    """List keys, optionally narrowed to idle ones (tier 55), or — for
+    platform administrators — to one tenant (``tenant_id``, the
+    per-tenant lens; tenant admins are forced to their own tenant
+    regardless, mirroring /admin/logs).
 
     ``idle_days=N`` keeps keys whose last recorded use is N days ago
     or more — plus keys never used at all (NULL last_used_at: a
@@ -269,6 +297,8 @@ async def list_keys(
         stmt = select(VirtualKey).order_by(VirtualKey.created_at)
         if admin.tenant_id is not None:  # tenant admin: own tenant only
             stmt = stmt.where(VirtualKey.tenant_id == admin.tenant_id)
+        elif tenant_id:  # platform admin: the per-tenant lens
+            stmt = stmt.where(VirtualKey.tenant_id == tenant_id)
         result = await session.execute(stmt)
         rows = list(result.scalars())
     if idle_days is not None:

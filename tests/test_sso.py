@@ -527,6 +527,25 @@ async def test_sso_session_is_a_platform_admin(tmp_path, monkeypatch):
         break
 
 
+async def test_whoami_names_the_sso_human(tmp_path, monkeypatch):
+    """Tier 61: the dashboard's identity probe names the signed-in
+    human — the email and auth_method sso — where the raw admin key
+    could only ever say "admin"."""
+    async for env in _sso_env(tmp_path, monkeypatch):
+        body = await _login_flow(env.client)
+        resp = await env.client.get(
+            "/admin/whoami", headers={"Authorization": f"Bearer {body['token']}"}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "name": "alice@example.com",
+            "auth_method": "sso",
+            "is_admin": True,
+            "platform_admin": True,
+            "tenant": None,
+        }
+
+
 async def test_raw_admin_key_still_works_alongside_sso(tmp_path, monkeypatch):
     async for env in _sso_env(tmp_path, monkeypatch):
         resp = await env.client.get("/admin/keys", headers=auth(ADMIN_KEY))

@@ -8,7 +8,47 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
-- Dashboard single sign-on (tier 60) — `auth.sso` replaces the
+- Role-aware admin dashboard (tier 61) — `GET /admin/whoami` +
+  the per-tenant keys lens close the §8.2 item-10 honest gap: "the
+  admin UI has no tenant views (per-endpoint 403s degrade in-page
+  for tenant administrators)".
+  - **`GET /admin/whoami`** — the signed-in identity: `name`,
+    `auth_method`, `is_admin`, `platform_admin`, and tenancy
+    (`{id, name}` or null). One honest probe replaces the
+    dashboard's old infer-the-role-from-which-endpoints-403 trick
+    (`/admin/tenants` was fired just to see if it 403'd).
+    `platform_admin` mirrors `require_platform_admin` (admin *and*
+    outside every tenant): false for tenant administrators, true
+    for the operator's keys and for dashboard SSO sessions — whose
+    `name` is the signed-in email, `auth_method` `sso`.
+  - **The dashboard is role-aware** (`admin.html`): sign-in probes
+    whoami and names the principal in the header (an SSO session
+    shows the human's email); every platform-only tab — tenant
+    management, prompt library, routing/breakers/shadow evidence,
+    guardrail config, playground, reload/backups — renders the same
+    honest "platform-administrator surface" note for tenant
+    administrators instead of firing a guaranteed-403 request, so
+    the connection badge stops reporting an error on a working
+    dashboard (the SLO panel hides the same way, minus the wasted
+    round trip). Tenant administrators' own tabs (overview, keys,
+    vault, logs, PII, billing) were already tenant-scoped — now the
+    shell knows it and their keys' tenant badges show the tenant
+    name (whoami seeds it).
+  - **Per-tenant lenses (platform admins)**: `GET /admin/keys`
+    gains `?tenant_id=` — mirroring `/admin/logs`'s
+    forced-scope/Opt-in split exactly: platform admins narrow the
+    keys list and the logs filter bar to one tenant (tenant
+    `<select>`s fed from the tenant name map); tenant
+    administrators are forced to their own rows whatever they pass
+    (the lens can never exfiltrate another tenant's keys), and an
+    unknown id matches nothing (a filter, not a lookup).
+  - 4 new tests: whoami for platform admin / tenant admin /
+    non-admin 403 (`tests/test_tenants.py`), the keys-lens
+    matrix incl. the forced-scope proof, whoami naming the SSO
+    human (`tests/test_sso.py` — email + `auth_method` sso), and
+    the dashboard-surface pin (`tests/test_admin_ui.py`). Suite
+    1406.
+- Dashboard single sign-on (OIDC) (tier 60) — `auth.sso` replaces the
   dashboard's raw-admin-key-in-sessionStorage login with the corporate
   identity: an **OIDC authorization-code + PKCE (S256)** flow against
   your provider, ending in a short-lived **gateway-minted session**.

@@ -919,3 +919,101 @@ async def test_stats_by_tenant_platform_only(tmp_path):
         assert tstats["total_requests"] == 1
         assert "by_tenant" not in tstats
         assert {e["key_name"] for e in tstats["by_key"]} == {"acme-member"}
+
+
+# ----------------------------------------------------------------------
+# Tier 61: whoami (the dashboard's identity probe) + the keys lens
+# ----------------------------------------------------------------------
+
+
+async def test_whoami_identifies_each_principal_kind(tmp_path):
+    """GET /admin/whoami — the dashboard's one honest role probe,
+    replacing the infer-the-role-from-which-endpoints-403 trick: the
+    platform operator, the tenant administrator (their tenant echoed,
+    platform_admin false), and the 403 for non-admins."""
+    async for env in _make_env(tmp_path):
+        acme = await _create_tenant(env.client, "acme")
+        admin = await create_key(
+            env.client, "acme-admin", is_admin=True, tenant_id=acme["id"]
+        )
+        member = await create_key(env.client, "acme-member", tenant_id=acme["id"])
+
+        # Platform admin: the operator's key — no tenant, full power.
+        resp = await env.client.get("/admin/whoami", headers=auth(ADMIN_KEY))
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "name": "admin",
+            "auth_method": "admin_key",
+            "is_admin": True,
+            "platform_admin": True,
+            "tenant": None,
+        }
+
+        # Tenant administrator: their own identity — the name the
+        # header shows, the tenant the lenses pin to, and the
+        # platform_admin false that gates every platform-only tab.
+        resp = await env.client.get("/admin/whoami", headers=auth(admin["key"]))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["name"] == "acme-admin"
+        assert body["auth_method"] == "virtual_key"
+        assert body["is_admin"] is True
+        assert body["platform_admin"] is False
+        assert body["tenant"] == {"id": acme["id"], "name": "acme"}
+
+        # A plain member key never sees the admin API at all.
+        resp = await env.client.get("/admin/whoami", headers=auth(member["key"]))
+        assert resp.status_code == 403
+
+
+async def test_keys_tenant_lens(tmp_path):
+    """GET /admin/keys?tenant_id= — the per-tenant lens (tier 61): a
+    platform admin narrows the list to one tenant, an unknown tenant
+    id is honestly empty (a filter, not a lookup), and a tenant
+    administrator is forced to their own rows whatever they pass —
+    the lens can never be used to exfiltrate another tenant's keys."""
+    async for env in _make_env(tmp_path):
+        acme = await _create_tenant(env.client, "acme")
+        beta = await _create_tenant(env.client, "beta")
+        admin = await create_key(
+            env.client, "acme-admin", is_admin=True, tenant_id=acme["id"]
+        )
+        await create_key(env.client, "acme-member", tenant_id=acme["id"])
+        await create_key(env.client, "beta-member", tenant_id=beta["id"])
+        await create_key(env.client, "platform-user")
+
+        # No lens: the platform admin sees every key.
+        resp = await env.client.get("/admin/keys", headers=auth(ADMIN_KEY))
+        assert {k["name"] for k in resp.json()["data"]} == {
+            "acme-admin",
+            "acme-member",
+            "beta-member",
+            "platform-user",
+        }
+
+        # The lens narrows to one tenant's keys.
+        resp = await env.client.get(
+            "/admin/keys", params={"tenant_id": acme["id"]}, headers=auth(ADMIN_KEY)
+        )
+        assert {k["name"] for k in resp.json()["data"]} == {
+            "acme-admin",
+            "acme-member",
+        }
+
+        # An unknown tenant id matches nothing — empty, not a 404.
+        resp = await env.client.get(
+            "/admin/keys",
+            params={"tenant_id": "no-such-tenant"},
+            headers=auth(ADMIN_KEY),
+        )
+        assert resp.json()["data"] == []
+
+        # Tenant administrator: the param is ignored — forced to
+        # their own tenant, exactly like /admin/logs.
+        resp = await env.client.get(
+            "/admin/keys", params={"tenant_id": beta["id"]}, headers=auth(admin["key"])
+        )
+        assert {k["name"] for k in resp.json()["data"]} == {
+            "acme-admin",
+            "acme-member",
+        }
