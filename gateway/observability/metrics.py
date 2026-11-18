@@ -67,6 +67,12 @@ EVENTS = Counter(
     ["handler", "event", "outcome"],  # delivered | dropped | error | aborted
 )
 
+FEEDBACK = Counter(
+    "gateway_feedback_total",
+    "Client-reported quality ratings, by rating (1..5).",
+    ["rating"],
+)
+
 TTFT = Histogram(
     "gateway_stream_ttft_seconds",
     "Time from request start to the first streamed chunk delivered to the client.",

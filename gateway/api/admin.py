@@ -18,7 +18,7 @@ from ..core.context import AuthContext
 from ..core.prompt_library import PromptLibrary
 from ..db import get_sessionmaker
 from ..errors import GatewayError
-from ..models import RequestLog, Tenant, VirtualKey
+from ..models import Feedback, RequestLog, Tenant, VirtualKey
 from ..schemas import (
     KeyCreateRequest,
     KeyUpdateRequest,
@@ -695,6 +695,130 @@ async def get_log(
     row["upstream_request"] = log.upstream_request
     row["upstream_headers"] = log.upstream_headers
     return row
+
+
+# ----------------------------------------------------------------------
+# Feedback
+# ----------------------------------------------------------------------
+
+
+def _feedback_row(row: Feedback) -> dict:
+    return {
+        "id": row.id,
+        "object": "feedback",
+        "request_id": row.request_id,
+        "key_name": row.key_name,
+        "tenant_id": row.tenant_id,
+        "model": row.model,
+        "rating": row.rating,
+        "comment": row.comment,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.get("/admin/feedback")
+async def list_feedback(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    key_name: str | None = None,
+    model: str | None = None,
+    request_id: str | None = None,
+    min_rating: int | None = Query(None, ge=1, le=5),
+    max_rating: int | None = Query(None, ge=1, le=5),
+    tenant_id: str | None = None,
+) -> dict:
+    """Client-reported feedback rows, newest first. Tenant admins see
+    only their own tenant's rows (the filter is forced, not defaulted —
+    same rule as /admin/logs)."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        stmt = select(Feedback).order_by(Feedback.created_at.desc(), Feedback.id.desc())
+        effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+        if effective_tenant:
+            stmt = stmt.where(Feedback.tenant_id == effective_tenant)
+        if key_name:
+            stmt = stmt.where(Feedback.key_name == key_name)
+        if model:
+            stmt = stmt.where(Feedback.model == model)
+        if request_id:
+            stmt = stmt.where(Feedback.request_id == request_id)
+        if min_rating is not None:
+            stmt = stmt.where(Feedback.rating >= min_rating)
+        if max_rating is not None:
+            stmt = stmt.where(Feedback.rating <= max_rating)
+        total = await session.scalar(
+            select(func.count()).select_from(stmt.subquery())
+        )
+        result = await session.execute(stmt.limit(limit).offset(offset))
+        rows = result.scalars().all()
+        data = [_feedback_row(row) for row in rows]
+    return {"object": "list", "total": total, "limit": limit, "offset": offset, "data": data}
+
+
+def _feedback_bucket(rows: list) -> dict:
+    """count / average / %negative / %positive for one group.
+
+    Feedback is human-rate (one row per explicit client action, not
+    per request), so bucketing in Python keeps one consistent
+    definition across dimensions — including the 4-5/1-2 sentiment
+    split — without three divergent SQL expressions.
+    """
+    count = len(rows)
+    if count == 0:
+        return {
+            "count": 0,
+            "avg_rating": None,
+            "pct_negative": None,
+            "pct_positive": None,
+        }
+    ratings = [row.rating for row in rows]
+    negative = sum(1 for r in ratings if r <= 2)
+    positive = sum(1 for r in ratings if r >= 4)
+    return {
+        "count": count,
+        "avg_rating": round(sum(ratings) / count, 3),
+        "pct_negative": round(100.0 * negative / count, 1),
+        "pct_positive": round(100.0 * positive / count, 1),
+    }
+
+
+@router.get("/admin/feedback/stats")
+async def feedback_stats(
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    model: str | None = None,
+    key_name: str | None = None,
+    tenant_id: str | None = None,
+) -> dict:
+    """Quality aggregates from client feedback: overall, by model and by
+    key (positive = rating 4-5, negative = 1-2). Tenant admins are
+    scoped to their own tenant."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        stmt = select(Feedback)
+        effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+        if effective_tenant:
+            stmt = stmt.where(Feedback.tenant_id == effective_tenant)
+        if model:
+            stmt = stmt.where(Feedback.model == model)
+        if key_name:
+            stmt = stmt.where(Feedback.key_name == key_name)
+        all_rows = (await session.execute(stmt)).scalars().all()
+
+    by_model: dict[str, list] = {}
+    by_key: dict[str, list] = {}
+    for row in all_rows:
+        by_model.setdefault(row.model or "unknown", []).append(row)
+        by_key.setdefault(row.key_name or "unknown", []).append(row)
+    return {
+        "object": "feedback_stats",
+        "overall": _feedback_bucket(all_rows),
+        "by_model": {
+            name: _feedback_bucket(rows) for name, rows in sorted(by_model.items())
+        },
+        "by_key": {name: _feedback_bucket(rows) for name, rows in sorted(by_key.items())},
+    }
 
 
 # ----------------------------------------------------------------------

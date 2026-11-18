@@ -438,3 +438,33 @@ class BatchResult(Base):
     status: Mapped[str] = mapped_column(String(16), default="succeeded")
     response: Mapped[dict] = mapped_column(JSONColumn, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class Feedback(Base):
+    """Client-reported quality signal attached to one request-log row.
+
+    Rides the chat scope: any key that can chat may rate its own
+    requests — ownership is enforced (a foreign or unknown request_id
+    404s, the same rule as files/batches; the platform admin may rate
+    anything). key/model/tenant are denormalized from the request-log
+    row at feedback time so admin stats never join, and so a rating
+    still says what model served it even if the model was since
+    deleted. Multiple signals per request are allowed (a client may
+    correct a rating); there is no uniqueness on request_id.
+    """
+
+    __tablename__ = "feedback"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    request_id: Mapped[str] = mapped_column(String(64), index=True)
+    key_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    key_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # Model as logged at feedback time (the request's public model).
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 1..5 — 4/5 read as positive, 1/2 as negative in stats.
+    rating: Mapped[int] = mapped_column(Integer)
+    # Optional client-supplied text, truncated (never bodies: feedback
+    # rows are visible in admin lists, like error messages).
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

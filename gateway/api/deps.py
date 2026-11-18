@@ -39,6 +39,10 @@ def required_scope(path: str) -> str | None:
         return "batch"
     if path == "/v1/batches" or path.startswith("/v1/batches/"):
         return "batch"
+    # Feedback is commentary on chat traffic — the chat scope covers it
+    # (a key that may rate is a key that may chat).
+    if path == "/v1/feedback":
+        return "chat"
     last = path.rsplit("/", 1)[-1]
     if last.endswith(":embedContent") or last.endswith(":batchEmbedContents"):
         return "embeddings"  # Gemini-native embeddings (not chat, despite :method path)

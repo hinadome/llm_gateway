@@ -60,6 +60,8 @@ Event                            Fired / payload
                                  same names as the audit webhook) [details]
 ``tenant.*``, ``breaker.reset``  as above
 ``budget.threshold``             budget alert fired [key, level, spend]
+``feedback.recorded``            client rated a request [request_id,
+                                 model, rating]
 ``batch.created`` / ``batch.cancelled`` / ``batch.completed`` /
 ``batch.failed`` / ``batch.expired`` / ``batch.deferred``
                                  batch lifecycle [batch_id, ...]

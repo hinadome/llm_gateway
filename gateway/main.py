@@ -35,6 +35,7 @@ from .api import audio as audio_api
 from .api import batches as batches_api
 from .api import chat as chat_api
 from .api import embeddings as embeddings_api
+from .api import feedback as feedback_api
 from .api import gemini_native
 from .api import images as images_api
 from .api import models as models_api
@@ -581,6 +582,7 @@ def create_app(
     app.include_router(images_api.router)
     app.include_router(audio_api.router)
     app.include_router(batches_api.router)
+    app.include_router(feedback_api.router)
     app.include_router(admin_api.router)
 
     @app.get("/health")

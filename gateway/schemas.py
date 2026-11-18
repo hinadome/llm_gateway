@@ -220,6 +220,21 @@ class SpeechRequest(BaseModel):
     user: str | None = None
 
 
+class FeedbackRequest(BaseModel):
+    """POST /v1/feedback body — client-reported quality for one request.
+
+    ``request_id`` is the value the gateway returned in the response's
+    ``X-Request-Id`` header (or the completion's ``id``-adjacent log
+    id). ``rating`` is 1..5 (4/5 read as positive, 1/2 negative in
+    admin stats). Feedback must come from the key that made the
+    request; a foreign or unknown id 404s.
+    """
+
+    request_id: str = Field(min_length=1, max_length=64)
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=2000)
+
+
 # --------------------------------------------------------------------------
 # Response models
 # --------------------------------------------------------------------------

@@ -217,6 +217,18 @@ gateway/
 │   │                       Requires a virtual key (the platform admin key has
 │   │                       no key row to own files or bill) + the 'batch'
 │   │                       endpoint scope; batch.enabled: false → 404s
+│   ├── feedback.py        POST /v1/feedback: client-reported quality for
+│   │                       one request-log row (X-Request-Id + rating
+│   │                       1..5 + optional comment). Ownership follows
+│   │                       the files/batches rule — the row must belong
+│   │                       to the calling key (platform admin exempt);
+│   │                       foreign and unknown ids get the same 404.
+│   │                       Rides the chat scope. key/model/tenant
+│   │                       denormalized from the log row at feedback
+│   │                       time; multiple signals per request allowed
+│   │                       (corrections). Counted on FEEDBACK{rating};
+│   │                       feedback.recorded lifecycle event; the admin
+│   │                       list/stats live in admin.py
 │   └── admin.py            Keys CRUD (incl. per-key model_mappings / default_model,
 │                           prompt policy fields and scoping fields; tenancy —
 │                           tenant admins are forced into their own tenant on
@@ -230,7 +242,12 @@ gateway/
 │                           every mutation audited), logs (list omits
 │                           bodies, /admin/logs/{id} returns
 │                           them in full; tenant scoping forced for tenant
-│                           admins, ?tenant_id= filter for platform), stats
+│                           admins, ?tenant_id= filter for platform), feedback
+│                           (GET /admin/feedback list with key/model/rating
+│                           filters + GET /admin/feedback/stats — overall /
+│                           by-model / by-key quality buckets, positive =
+│                           rating 4-5, negative = 1-2; the same forced
+│                           tenant scoping), stats
 │                           (by_tenant breakdown for platform admins),
 │                           usage export (CSV/JSON billing
 │                           extract, tenant filter + per-tenant aggregates),
@@ -961,7 +978,7 @@ Every stage boundary below is also an event emission (the full catalog with payl
 - **`request.routed`** — after deployment selection, on both the stream and non-stream paths (observer-only: the router's retry machinery has the provider call in flight — an in-band veto there would be unsafe, so routing is notification, not a checkpoint).
 - **`response.completed`** — the final non-streaming response, post-guardrails, pre-client, with usage and cost (and `surface` for the non-chat modalities). *Interceptable* — the last in-band veto point; an interceptor raising here fails the request instead of returning the body.
 - **`stream.started` / `stream.completed`** — first chunk / end of the streamed body, emitted from the stream wrapper's iteration and `finally` (any outcome; `ctx.status` says which). Coarse by design; never per-chunk.
-- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired).
+- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request).
 
 Emits enqueue observers *before* an interceptor's abort propagates — subscribers always see the event that was vetoed.
 
@@ -973,6 +990,7 @@ Emits enqueue observers *before* an interceptor's abort propagates — subscribe
 erDiagram
     TENANT ||--o{ VIRTUAL_KEY : "tenant_id"
     VIRTUAL_KEY ||--o{ REQUEST_LOG : "key_name (denormalized)"
+    REQUEST_LOG ||--o{ FEEDBACK : "request_id (no FK — ownership enforced in the API layer)"
     TENANT {
         str id PK "uuid hex"
         str name UK "slug, header-safe pattern"
@@ -1047,6 +1065,17 @@ erDiagram
         str span_id "OTel span (16 hex), NULL when tracing off"
         str auth_method "which chain step authenticated (virtual_key/jwt/...)"
         datetime created_at "indexed"
+    }
+    FEEDBACK {
+        str id PK "uuid hex"
+        str request_id "indexed; the rated request's X-Request-Id"
+        str key_id "indexed; the key that made the request"
+        str key_name "denormalized for stats without joins"
+        str tenant_id "indexed; NULL = platform"
+        str model "as logged at feedback time — stable if the model is later deleted"
+        int rating "1..5; 4-5 positive, 1-2 negative in stats"
+        text comment "optional, bounded; client-chosen, like error_message"
+        datetime created_at
     }
     SETTING_KV {
         str key PK "e.g. admin_key"
@@ -1573,7 +1602,7 @@ A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, 
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 

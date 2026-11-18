@@ -8,6 +8,25 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Feedback capture: `POST /v1/feedback` — clients rate any logged
+  request by its `X-Request-Id` (rating 1..5, optional comment),
+  turning request logs into quality data. The missing half of the
+  shadow/A/B story: mirroring compares outputs, feedback says which
+  one was good. Ownership follows the files/batches rule — the
+  request-log row must belong to the calling key (platform admin
+  exempt), foreign and unknown ids get the same 404 (never confirm
+  another key's request exists); rides the `chat` endpoint scope;
+  multiple signals per request allowed (corrections). Any logged
+  request is rateable — successes, streams and failures alike.
+  key/model/tenant denormalized from the log row at feedback time
+  (stats never join, and stay stable if a model is later deleted).
+  Admin: `GET /admin/feedback` (key/model/request_id/rating filters)
+  and `GET /admin/feedback/stats` (overall / by-model / by-key
+  buckets: count, avg, pct_negative [1-2], pct_positive [4-5]) —
+  the same forced tenant scoping as /admin/logs. Counted on
+  `gateway_feedback_total{rating}`; `feedback.recorded` lifecycle
+  event. New `feedback` table (existing databases auto-upgrade via
+  create_all). 11 new tests.
 - Lifecycle events: a publish/subscribe layer over the request stages
   (`core/events.py`). The pipeline and the surfaces around it (auth
   edge, audit choke point, budget alerts, batch API/worker) emit

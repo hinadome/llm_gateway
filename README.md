@@ -42,6 +42,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Usage export** | `GET /admin/usage/export` (CSV or JSON): billing / chargeback extract of request rows with cost/tokens/latency, time-window + key/model/status filters, and per-key / per-model / per-status aggregates; mirrored shadow calls excluded by default |
 | **Batch API** | OpenAI-style `/v1/files` + `/v1/batches`: upload a JSONL of chat requests, execute them in the background — each line through the *full* pipeline (guardrails, cache, routing, spend, request logs) — then fetch per-line results as output/error JSONL. Rate limits and budgets defer a batch instead of failing lines; the 24h completion window bounds retries (see [Batch API](#batch-api)) |
 | **Lifecycle events** | Subscribe your own handlers to the request-stage boundaries (`request.received` / `routed` / `cache_hit` / `rejected` / `failed`, `response.completed`, `stream.started` / `completed`, `auth.rejected`, `key.*`, `budget.threshold`, `batch.*`) — **observers** are fire-and-forget on a background queue (a slow or crashing handler can never affect a request), **interceptors** run in-band with veto power at the two pre-irreversible events; with no handlers the bus is inert (see [Lifecycle events](#lifecycle-events)) |
+| **Feedback capture** | `POST /v1/feedback` lets clients rate any logged request (by `X-Request-Id`, rating 1–5) — the missing half of the quality story: shadow mirroring and prompt A/B compare *outputs*, feedback says which one was good. Admin list + per-model/per-key quality aggregates; counted on `gateway_feedback_total`; `feedback.recorded` event (see [Feedback](#feedback)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model |
@@ -134,6 +135,7 @@ To terminate TLS in front of the gateway instead (nginx, Caddy, a load balancer)
 | `GET /v1/batches` | List the calling key's batches (cursor-paginated) |
 | `GET /v1/batches/{id}` | Batch status + `request_counts` + output/error file ids once completed |
 | `POST /v1/batches/{id}/cancel` | Cancel an in-progress batch |
+| `POST /v1/feedback` | Rate a request the calling key made (by its `X-Request-Id`; rating 1–5, optional comment) — see [Feedback](#feedback) |
 
 Diagnostic response headers on every data-plane response (completions, embeddings, images, audio): `X-Request-Id`, `X-Gateway-Model`, `X-Gateway-Provider`, `X-Gateway-Deployment`, `X-Gateway-Cache` (HIT/SEMANTIC/MISS; NONE on the non-cacheable surfaces), `X-Gateway-Cost-Usd`, `X-Gateway-Latency-Ms`.
 
@@ -206,6 +208,8 @@ Things to know when pointing a framework at the gateway:
 | `PATCH /admin/prompts/{id}` | Activate a version (promote or rollback — switches serving, no restart), mark it as the A/B **candidate** (unique per name; `ab_fraction` clamped to 0–1), or edit its notes |
 | `DELETE /admin/prompts/{id}` | Delete one version (the active version is refused with 409 — activate another first) |
 | `GET /admin/logs` | Paginated request logs with filters (bodies omitted for size), rows carry `tenant_id` (`?tenant_id=` filter; forced to the admin's own tenant for tenant admins); shadow-mirror rows are included and flagged `shadow`, prompt A/B mirrors also carry `prompt_variant` |
+| `GET /admin/feedback` | Feedback rows, newest first — `key_name`/`model`/`request_id`/`min_rating`/`max_rating` filters; the same forced tenant scoping as logs |
+| `GET /admin/feedback/stats` | Quality aggregates from client feedback: overall + by-model + by-key buckets (`count`, `avg_rating`, `pct_negative` [1–2], `pct_positive` [4–5]); `model`/`key_name`/`tenant_id` filters |
 | `GET /admin/logs/{id}` | One log row in full, including the stored request/response bodies (cross-tenant ids 404 for tenant admins) |
 | `GET /admin/stats` | Requests, error rate, tokens, cost, latency + TTFT percentiles (client traffic only — shadow mirrors are excluded); tenant admins see their own tenant's traffic, platform admins additionally get a `by_tenant` breakdown |
 | `GET /admin/usage/export` | Billing / chargeback export: `format=csv\|json`, `since`/`until` (ISO-8601, default last 30 days), `key_name`/`model`/`status`/`tenant_id` filters, `include_shadow`; JSON adds totals + per-key/model/status aggregates (+ per-tenant for platform admins); tenant admins export their own tenant only |
@@ -340,9 +344,30 @@ Event catalog:
 | `auth.rejected` | credential rejected at the edge | `path`, `reason` |
 | `key.created` / `key.updated` / `key.revoked`, `tenant.*`, `breaker.reset` | admin actions — the audit choke point, same names and payload as the audit webhook | `event`, `actor`, `details` |
 | `budget.threshold` | budget alert fired (per crossed level) | `key`, `key_name`, `level`, `spend_usd`, `budget_usd` |
+| `feedback.recorded` | client rated a request | `request_id`, `model`, `rating`, `key_name` |
 | `batch.created` / `cancelled` / `completed` / `failed` / `deferred` / `expired` | batch lifecycle | `batch_id`, `key_id`, line counts, output/error file ids |
 
 Per-chunk stream events are deliberately absent — the hot path only ever carries the two coarse stream events. Deliveries count on `gateway_events_total{handler,event,outcome}` (delivered / dropped / error / aborted). The `events:` config is hot-reloadable (handlers swap live; `queue_size` applies at restart). 20 tests pin the contract (`tests/test_events.py`).
+
+## Feedback
+
+Clients rate any logged request — the missing half of the quality story. Shadow mirroring and prompt A/B compare *outputs*; feedback is the signal that says which one was actually good, and it's what turns `/admin/stats` latency dashboards into quality dashboards.
+
+```bash
+# The client rates by the id the gateway already returned:
+curl -X POST http://localhost:8000/v1/feedback \
+  -H "Authorization: Bearer sk-gw-..." -H "Content-Type: application/json" \
+  -d '{"request_id": "req_...", "rating": 5, "comment": "exactly right"}'
+# → { "id": "fb-...", "object": "feedback", "request_id": "req_...", ... }
+```
+
+- **Any logged request is rateable** — success, stream, or failure (the client may want to rate the failure itself); the id is the `X-Request-Id` response header.
+- **Ownership follows the files/batches rule** — the request-log row must belong to the calling key (the platform admin may rate anything); foreign and unknown ids get the same 404, never confirming another key's request exists. Feedback rides the `chat` endpoint scope.
+- **Multiple signals per request are allowed** — a client may correct a rating.
+- **Denormalized key/model/tenant** — captured from the log row at feedback time, so stats stay stable if a model is later deleted or remapped, and aggregates never join.
+- **Admin views**: `GET /admin/feedback` (filterable list) and `GET /admin/feedback/stats` (overall / by-model / by-key buckets; positive = rating 4–5, negative = 1–2; tenant admins see their own tenant only). Ratings count on `gateway_feedback_total{rating}` and surface as `feedback.recorded` lifecycle events.
+
+11 tests pin the contract (`tests/test_feedback.py`).
 
 ## Architecture
 
