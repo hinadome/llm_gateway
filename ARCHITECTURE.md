@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 86 Python files, ~31,550 lines, 1200 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 87 Python files, ~31,980 lines, 1210 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -541,6 +541,30 @@ gateway/
 │                           extract, tenant filter + per-tenant
 │                           aggregates; cached_tokens is a column —
 │                           prompt-cache reads itemized for chargeback),
+│                           usage invoices (tier 45, GET
+│                           /admin/invoices — the month statement:
+│                           the same request-log rows rolled up per
+│                           tenant/key/model into line items, with
+│                           the key's and tenant's
+│                           monthly_budget_usd beside the spend so a
+│                           statement doubles as a spend-vs-plan
+│                           check; month=YYYY-MM selects the period
+│                           (calendar months in UTC, default the
+│                           current month, future = 400 — never a
+│                           fake empty invoice); the billing lens
+│                           is client-consumed usage — shadow
+│                           mirrors and trial replays excluded,
+│                           cache hits included at the cached rate;
+│                           zero-usage keys included (an unused key
+│                           is a finops finding), deleted keys bill
+│                           under the tenant they lived in with no
+│                           budget; require_admin: tenant admins
+│                           forced to their own tenant, platform
+│                           admins may ?tenant_id=; format=csv is
+│                           one row per line item in
+│                           INVOICE_CSV_COLUMNS order, attachment
+│                           invoice_<month>.csv; the composition
+│                           lives in core/billing.py),
 │                           routing/guardrail introspection
 │                           (/admin/routing echoes each model's
 │                           context_window, the cost_aware flag and
@@ -1231,6 +1255,45 @@ gateway/
 │   │                       immediate) re-reads app.state.config.
 │   │                       slos each pass; under pytest tests drive
 │   │                       evaluate_once() directly
+│   ├── billing.py         Usage invoices (tier 45): the billing epic's
+│   │                       first surface — a month statement of what
+│   │                       each key and tenant consumed. The usage
+│   │                       export is chargeback raw material (one row
+│   │                       per request); this is the finance
+│   │                       question — what did each tenant consume
+│   │                       in October, per key, per model? Same
+│   │                       measure/pure split as the SLO tiers:
+│   │                       parse_month is pure (calendar months in
+│   │                       UTC, YYYY-MM or the current month by
+│   │                       default; malformed or future months are
+│   │                       400s naming the param — an invoice for a
+│   │                       period that has not happened must not
+│   │                       pretend to be empty), measure_lines is the
+│   │                       query leg (one grouped aggregation over
+│   │                       the period's CLIENT-CONSUMED rows —
+│   │                       shadow mirrors excluded (never cost the
+│   │                       client anything), trial replays excluded
+│   │                       (deliberately re-run traffic), cache hits
+│   │                       included at the cached rate the
+│   │                       calculator already recorded — grouped by
+│   │                       tenant/key/model into requests, errors,
+│   │                       the token splits and cost, rounded 6),
+│   │                       rollup is pure (line items into keys,
+│   │                       keys into tenants by the ROW's tenant —
+│   │                       a deleted key still bills where it
+│   │                       lived, budget None — zero-usage keys
+│   │                       included as empty sections because an
+│   │                       unused key is a finops finding, budget
+│   │                       pct beside every monthly_budget_usd,
+│   │                       unassigned keys a separate bucket, cost-
+│   │                       desc sorting at all three levels), and
+│   │                       statement composes them with the key and
+│   │                       tenant metadata (tenant scope narrows
+│   │                       both). INVOICE_CSV_COLUMNS pins the
+│   │                       downstream column order; the endpoint
+│   │                       (/admin/invoices) owns auth + the
+│   │                       tenant-admin forced scoping + the CSV
+│   │                       reshape
 │   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
 │   │                       that answers "did secrets land in the request
 │   │                       log?"): detectors mirror the pii_redaction
@@ -1742,7 +1805,7 @@ gateway/
                             /admin/ui without auth (the shell holds no data);
                             talks to the JSON admin API above with the admin key
                             pasted into a login overlay (kept in sessionStorage,
-                            sent as Bearer). 9 tabs: overview stats (+ usage CSV
+                            sent as Bearer). 10 tabs: overview stats (+ usage CSV
                             export for the selected window, by-tenant breakdown
                             when tenants have traffic; tier 42 adds the SLO
                             panel above the traffic tables — one row per
@@ -1777,7 +1840,28 @@ gateway/
                             credential manager, hints only), prompt library
                             (versions, activate/candidate patching, the
                             new-version dialog), request logs (filter,
-                            paginate, expand full bodies), routing table with
+                            paginate, expand full bodies), billing (tier
+                            45: the month statement — a month picker
+                            (calendar months in UTC, empty = current)
+                            and a CSV download (one row per line item,
+                            attachment named invoice_<month>.csv) over
+                            totals cards (requests + errors, spend,
+                            the token splits) and three tables reading
+                            GET /admin/invoices: tenants (spend vs the
+                            pooled monthly budget, the pct badge colored
+                            at the 80/100% thresholds, the platform
+                            bucket appended when unassigned keys have
+                            traffic), keys (zero-usage keys included —
+                            an unused key is a finops finding — each
+                            with its own budget badge, deleted keys
+                            showing none) and line items (per key per
+                            model, the CSV's shape; the period line
+                            names the billing lens — shadow mirrors and
+                            trial replays excluded, cache hits included
+                            — and a future month surfaces as the
+                            endpoint's 400, never a fake empty
+                            statement; tenant admins see their own
+                            tenant by construction), routing table with
                             live breaker state + reset — plus, tier 35, the
                             shadow-diff evidence table under it (per shadow
                             deployment: verdict breakdown, match rate, mean
@@ -3153,6 +3237,46 @@ tests/
 │                        verdicts) and the no-targets no-op. A
 │                        third UI-surface pin covers the alerting
 │                        badge (tests/test_admin_ui.py)
+├── test_billing.py      Usage invoices (tier 45): pure units —
+│                        parse_month (explicit YYYY-MM to exact UTC
+│                        bounds, the year rolls over, None = the
+│                        current month, malformed/future months are
+│                        400s naming the param), rollup (line items
+│                        into keys into tenants, cost-desc at all
+│                        three levels, the zero-usage key section,
+│                        the deleted key billing under its tenant
+│                        with no budget, the unassigned bucket,
+│                        budget_pct computed or honestly None,
+│                        exact totals) and the CSV column contract;
+│                        seeded e2e — the full statement pinned
+│                        number for number (two tenants, a two-
+│                        model key with an error row and a cache-
+│                        hit row billed at its cached rate, a
+│                        zero-usage key, a key deleted after its
+│                        traffic, a platform key and an admin-key
+│                        row in unassigned), the shadow/trial
+│                        exclusion (expensive mirror and replay
+│                        rows never bill the tenant), month
+│                        scoping (last month's rows answer to
+│                        month=2026-10 with the period bounds in
+│                        the body, the current month sees only its
+│                        own, malformed/future months return the
+│                        app's 400 envelope — never 422), scoping
+│                        (tenant admin forced to their tenant even
+│                        when asking for another, zero-usage member
+│                        keys included on their statement, plain
+│                        key 403, platform ?tenant_id= and the
+│                        whole platform), the CSV (header pinned to
+│                        the stable columns, one row per line item
+│                        tenants-then-unassigned, attachment
+│                        filename, an out-of-month CSV shipping the
+│                        header alone) and one real-traffic
+│                        statement (a chat completion through a
+│                        tenant key bills at default pricing with
+│                        the mock's 10/7 token usage, under the
+│                        public model name). A fourth UI-surface
+│                        pin covers the Billing tab
+│                        (tests/test_admin_ui.py)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while

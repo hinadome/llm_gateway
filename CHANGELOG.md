@@ -8,6 +8,43 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Usage invoices (tier 45) — the billing epic's first surface. The
+  usage export is chargeback raw material (one row per request);
+  `GET /admin/invoices` answers the finance-side question: what did
+  each tenant consume this month, per key, per model? The same
+  request-log rows rolled up into a month statement, with the key's
+  and tenant's `monthly_budget_usd` beside the spend — so every
+  statement doubles as a spend-vs-plan check.
+  - **The billing lens is client-consumed usage.** Shadow mirrors
+    (never cost the tenant anything) and candidate-trial replays
+    (deliberately re-run traffic) are excluded; cache hits are
+    included — a cached answer is a real served request, already
+    billed at the cached rate the calculator recorded.
+  - **Three levels, sorted by spend everywhere.** Line items per
+    (key, model) with requests, errors, the token splits and cost;
+    keys into tenants (each with `budget_pct` against its own
+    monthly budget and the tenant's pooled one, honestly `null`
+    when no budget is set); platform keys in a separate
+    `unassigned` bucket; exact totals over everything.
+  - **The finops findings ship too.** Zero-spend keys still appear
+    (an unused key is a finding, not an absence), and keys whose
+    row is gone keep their line items under the tenant they lived
+    in, with no budget to compare against — log retention
+    outliving the key row is the normal case.
+  - **Calendar months in UTC**, `month=YYYY-MM` (default the
+    current month); a malformed or future month is the app's 400
+    envelope — an invoice for a period that has not happened must
+    not pretend to be empty.
+  - **Scoping:** tenant admins invoice their own tenant only
+    (forced, even when they ask for another), platform admins may
+    filter `?tenant_id=`, plain keys get the admin 403.
+    `format=csv` is one row per line item in a stable 13-column
+    order, an attachment named `invoice_<month>.csv`.
+  The dashboard grows a Billing tab (month picker, CSV download,
+  totals cards, tenants/keys/line-items tables with the budget
+  badge colored at the 80/100% thresholds). 9 tests + a UI pin in
+  `tests/test_billing.py` / `tests/test_admin_ui.py`; the suite
+  stands at 1210.
 - SLO alert delivery (tier 44) — the tier-42/43 verdicts get teeth.
   Measurement pages no one; delivery does. A background evaluator
   (the canary-loop shape: always started, re-reading `slos:` each

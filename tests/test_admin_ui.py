@@ -293,6 +293,24 @@ async def test_admin_ui_slo_alert_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_billing_surface(env):
+    # Tier 45: the Billing tab — the month statement (month picker,
+    # CSV download, tenants/keys/line-items tables with the budget
+    # badge beside the spend). Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'data-tab="billing"',
+        'id="tab-billing"',
+        "loadInvoices",
+        "/admin/invoices",
+        "inv-month",
+        "btn-invoice-csv",
+        "invBudgetCell",
+        "shadow mirrors and trial replays excluded",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

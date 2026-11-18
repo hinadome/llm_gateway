@@ -33,6 +33,7 @@ from ..config import GatewayConfig
 from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
+from ..core import billing as billing_core
 from ..core import migration as migration_core
 from ..core import promotion as promotion_core
 from ..core import slos as slos_core
@@ -1706,6 +1707,98 @@ async def export_usage(
             "object": "usage_export",
             "summary": summary,
             "requests": [_usage_row(r) for r in rows],
+        }
+    )
+
+
+@router.get("/admin/invoices")
+async def invoice(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    format: str = Query("json", pattern="^(json|csv)$"),
+    month: str | None = None,
+    tenant_id: str | None = None,
+) -> Response:
+    """Usage invoices (tier 45): the billing epic's first surface — a
+    month statement of what each key and tenant consumed.
+
+    The usage export answers "which requests did this key make?" one
+    row at a time; this answers what the finance side asks: "what
+    did each tenant consume in October, per key, per model?" The
+    same request-log rows rolled up into line items — requests,
+    errors, the token splits (cached included — a cached answer is a
+    real served request, already billed at the cached rate), and
+    cost — with the key's and tenant's ``monthly_budget_usd`` beside
+    the spend, so a statement doubles as a spend-vs-plan check.
+    ``month=YYYY-MM`` selects the period (calendar months in UTC;
+    default: the current month; a future month is a 400 — an
+    invoice for a period that has not happened must not pretend to
+    be empty).
+
+    The billing lens is CLIENT-CONSUMED usage: shadow mirrors (they
+    never cost the client anything) and candidate-trial replays
+    (deliberately re-run traffic, not the tenant's doing) are
+    excluded. Keys with no traffic in the period still appear — a
+    zero-spend section with no line items, because an unused key is
+    a finops finding, not an absence — and keys whose row was
+    deleted keep their line items under the tenant they lived in.
+
+    Tenant admins invoice only their own tenant (the scope is
+    forced); platform admins may filter by ``?tenant_id=`` or read
+    the whole platform. Everything sorts by spend — the big numbers
+    are the top of the statement. ``format=csv`` returns one row per
+    line item in a stable column order (download attachment).
+    """
+    # Tenant scoping: forced for tenant admins, opt-in for platform.
+    effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        data = await billing_core.statement(session, month, tenant_id=effective_tenant)
+
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(billing_core.INVOICE_CSV_COLUMNS)
+        columns = billing_core.INVOICE_CSV_COLUMNS
+        for tenant_section in [*data["tenants"]]:
+            tenant_name = tenant_section["tenant_name"]
+            for key_section in tenant_section["keys"]:
+                for line in key_section["line_items"]:
+                    writer.writerow(
+                        [
+                            data["month"],
+                            tenant_section["tenant_id"],
+                            tenant_name or "",
+                            key_section["key_id"] or "",
+                            key_section["key_name"] or "",
+                            line["model"],
+                            *[line[col] for col in columns[6:]],
+                        ]
+                    )
+        for key_section in data["unassigned"]:
+            for line in key_section["line_items"]:
+                writer.writerow(
+                    [
+                        data["month"],
+                        "",
+                        "",
+                        key_section["key_id"] or "",
+                        key_section["key_name"] or "",
+                        line["model"],
+                        *[line[col] for col in columns[6:]],
+                    ]
+                )
+        filename = f"invoice_{data['month']}.csv"
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    return JSONResponse(
+        {
+            "object": "invoice",
+            **data,
         }
     )
 

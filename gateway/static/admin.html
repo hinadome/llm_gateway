@@ -179,6 +179,7 @@
   <button data-tab="vault">Vault</button>
   <button data-tab="prompts">Prompts</button>
   <button data-tab="logs">Request logs</button>
+  <button data-tab="billing">Billing</button>
   <button data-tab="routing">Routing &amp; breakers</button>
   <button data-tab="guardrails">Guardrails</button>
   <button data-tab="playground">Playground</button>
@@ -301,6 +302,38 @@
         <button class="ghost small" id="btn-clearfilter">Reset</button>
       </div>
       <div style="overflow-x:auto"><table id="logs-table"></table></div>
+    </div>
+  </section>
+
+  <!-- Billing (tier 45): usage invoices — the month statement -->
+  <section class="tab" id="tab-billing">
+    <div class="panel">
+      <div class="ph">Monthly invoice
+        <div class="right" style="display:flex;gap:8px;align-items:center">
+          <input type="month" id="inv-month" style="color-scheme:dark;width:150px" title="Calendar month in UTC (YYYY-MM). Empty = the current month.">
+          <button class="small" id="btn-invoice-csv">Download CSV</button>
+        </div>
+      </div>
+      <div class="pb muted" style="font-size:12px" id="inv-period"></div>
+      <div class="cards" id="inv-cards"></div>
+    </div>
+    <div class="panel">
+      <div class="ph">Tenants
+        <div class="right muted" style="font-weight:400;font-size:12px">spend vs the tenant's monthly budget</div>
+      </div>
+      <div style="overflow-x:auto"><table id="inv-tenants"></table></div>
+    </div>
+    <div class="panel">
+      <div class="ph">Keys
+        <div class="right muted" style="font-weight:400;font-size:12px">keys with no traffic still appear — an unused key is a finops finding</div>
+      </div>
+      <div style="overflow-x:auto"><table id="inv-keys"></table></div>
+    </div>
+    <div class="panel">
+      <div class="ph">Line items
+        <div class="right muted" style="font-weight:400;font-size:12px">per key &middot; per model — the CSV's shape, tenant-section grouped</div>
+      </div>
+      <div style="overflow-x:auto"><table id="inv-lines"></table></div>
     </div>
   </section>
 
@@ -663,6 +696,7 @@ const state = {
   platformAdmin: null,    // null = not probed yet; set at sign-in
   tenantNames: {},        // tenant id -> slug (name badges, selects)
   vaultTenant: null,      // tenant id selected on the Vault tab (null = none yet)
+  invMonth: null,         // invoice month on the Billing tab (null = current)
   vaultAdminContext: null, // tenant admin's own tenant (from /admin/vault; null = platform admin)
 };
 
@@ -817,6 +851,7 @@ async function refresh() {
     else if (state.tab === "vault") await loadVault();
     else if (state.tab === "prompts") await loadPrompts();
     else if (state.tab === "logs") await loadLogs();
+    else if (state.tab === "billing") await loadInvoices();
     else if (state.tab === "routing") await loadRouting();
     else if (state.tab === "guardrails") await loadGuardrails();
     else if (state.tab === "playground") await loadPlayground();
@@ -1727,6 +1762,133 @@ async function fillLogDetail(id) {
     cell.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
 }
+
+// ---------- billing (tier 45): usage invoices ---------------------------
+// The month statement the finance side asks for: what did each tenant
+// consume, per key, per model — the request-log rows rolled up into
+// line items, with the monthly budget beside the spend so the
+// statement doubles as a spend-vs-plan check. The billing lens is
+// client-consumed usage: shadow mirrors and trial replays excluded
+// (they never cost the tenant anything), cache hits included (a
+// cached answer is a real served request, billed at its cached rate).
+// Tenant admins see only their own tenant (the endpoint forces the
+// scope); a malformed or future month 400s and surfaces through the
+// connection indicator — an invoice for a period that has not
+// happened must not pretend to be empty.
+
+function invBudgetCell(budget, pct) {
+  if (budget == null)
+    return '<span class="b b-gray" title="no monthly budget set">—</span>';
+  const cls = pct >= 100 ? "b-red" : pct >= 80 ? "b-amber" : "b-green";
+  const tip = `monthly budget ${fmtUsd(budget)} — spent ${Math.round(pct)}% of it`;
+  return `<span class="b ${cls}" title="${esc(tip)}">${Math.round(pct)}% of ${fmtUsd(budget)}</span>`;
+}
+
+function invKeyRows(keys, tenantName) {
+  return keys.map(k => `<tr>
+    <td>${esc(tenantName)}</td>
+    <td>${k.key_name == null ? '<span class="muted">—</span>' : esc(k.key_name)}</td>
+    <td>${invBudgetCell(k.monthly_budget_usd, k.budget_pct)}</td>
+    <td class="num">${fmtInt(k.requests)}</td>
+    <td class="num">${fmtInt(k.errors)}</td>
+    <td class="num">${fmtInt(k.total_tokens)}</td>
+    <td class="num">${fmtUsd(k.cost_usd)}</td>
+  </tr>`).join("");
+}
+
+function invLineRows(keys, tenantName) {
+  return keys.flatMap(k => (k.line_items || []).map(li => `<tr>
+    <td>${esc(tenantName)}</td>
+    <td>${k.key_name == null ? '<span class="muted">—</span>' : esc(k.key_name)}</td>
+    <td class="mono">${esc(li.model)}</td>
+    <td class="num">${fmtInt(li.requests)}</td>
+    <td class="num">${fmtInt(li.errors)}</td>
+    <td class="num">${fmtInt(li.prompt_tokens)}</td>
+    <td class="num">${fmtInt(li.completion_tokens)}</td>
+    <td class="num">${fmtInt(li.cached_tokens)}</td>
+    <td class="num">${fmtUsd(li.cost_usd)}</td>
+  </tr>`)).join("");
+}
+
+async function loadInvoices() {
+  const month = state.invMonth || new Date().toISOString().slice(0, 7);
+  state.invMonth = month;
+  $("#inv-month").value = month;
+  const inv = await api("/admin/invoices?month=" + encodeURIComponent(month));
+  const t = inv.totals;
+  $("#inv-period").textContent =
+    `month ${inv.month} · ${inv.period.since.slice(0, 10)} → ${inv.period.until.slice(0, 10)} UTC · ` +
+    `client-consumed usage: shadow mirrors and trial replays excluded, cache hits included`;
+  $("#inv-cards").innerHTML = `
+    <div class="card"><div class="k">Requests (${inv.month})</div><div class="v">${fmtInt(t.requests)}</div><div class="sub">${fmtInt(t.errors)} errors</div></div>
+    <div class="card"><div class="k">Spend</div><div class="v">${fmtUsd(t.cost_usd)}</div><div class="sub">month total</div></div>
+    <div class="card"><div class="k">Tokens</div><div class="v">${fmtInt(t.total_tokens)}</div><div class="sub">prompt ${fmtInt(t.prompt_tokens)} · completion ${fmtInt(t.completion_tokens)} · cached ${fmtInt(t.cached_tokens)}</div></div>`;
+
+  // Tenants — spend vs the pooled monthly budget — plus the platform
+  // bucket (keys with no tenant) when it has anything in it.
+  const un = inv.unassigned || [];
+  const unCost = un.reduce((a, k) => a + (k.cost_usd || 0), 0);
+  const tenantRows = inv.tenants.map(tn => `<tr>
+    <td><b>${esc(tn.tenant_name || tn.tenant_id)}</b></td>
+    <td>${invBudgetCell(tn.monthly_budget_usd, tn.budget_pct)}</td>
+    <td class="num">${fmtInt(tn.requests)}</td>
+    <td class="num">${fmtInt(tn.total_tokens)}</td>
+    <td class="num">${fmtUsd(tn.cost_usd)}</td>
+  </tr>`).join("");
+  const platformRow = un.length ? `<tr>
+    <td><span class="muted">platform keys (no tenant)</span></td>
+    <td><span class="b b-gray" title="platform keys carry their own budgets, not a pooled one">per key</span></td>
+    <td class="num">${fmtInt(un.reduce((a, k) => a + k.requests, 0))}</td>
+    <td class="num">${fmtInt(un.reduce((a, k) => a + k.total_tokens, 0))}</td>
+    <td class="num">${fmtUsd(unCost)}</td>
+  </tr>` : "";
+  $("#inv-tenants").innerHTML = "<thead><tr><th>Tenant</th><th>Budget</th><th class=num>Requests</th><th class=num>Tokens</th><th class=num>Cost</th></tr></thead><tbody>" +
+    (tenantRows || platformRow
+      ? tenantRows + platformRow
+      : `<tr><td colspan="5" class="empty">No usage in ${esc(month)}</td></tr>`) + "</tbody>";
+
+  // Keys — zero-usage keys included (an unused key is a finops
+  // finding) — then the line items underneath, same statement.
+  const keyRows = [
+    ...inv.tenants.flatMap(tn => invKeyRows(tn.keys, tn.tenant_name || tn.tenant_id)),
+    ...invKeyRows(un, "—"),
+  ];
+  $("#inv-keys").innerHTML = "<thead><tr><th>Tenant</th><th>Key</th><th>Budget</th><th class=num>Requests</th><th class=num>Errors</th><th class=num>Tokens</th><th class=num>Cost</th></tr></thead><tbody>" +
+    (keyRows || `<tr><td colspan="7" class="empty">No keys</td></tr>`) + "</tbody>";
+
+  const lineRows = [
+    ...inv.tenants.flatMap(tn => invLineRows(tn.keys, tn.tenant_name || tn.tenant_id)),
+    ...invLineRows(un, "—"),
+  ];
+  $("#inv-lines").innerHTML = "<thead><tr><th>Tenant</th><th>Key</th><th>Model</th><th class=num>Requests</th><th class=num>Errors</th><th class=num>Prompt</th><th class=num>Completion</th><th class=num>Cached</th><th class=num>Cost</th></tr></thead><tbody>" +
+    (lineRows || `<tr><td colspan="9" class="empty">No line items in ${esc(month)}</td></tr>`) + "</tbody>";
+}
+
+$("#inv-month").addEventListener("change", e => {
+  state.invMonth = e.target.value || state.invMonth;
+  loadInvoices();
+});
+
+$("#btn-invoice-csv").addEventListener("click", async () => {  // the CSV is a file download (api() assumes JSON)
+  try {
+    const month = state.invMonth || new Date().toISOString().slice(0, 7);
+    const res = await fetch("/admin/invoices?format=csv&month=" + encodeURIComponent(month),
+      { headers: { Authorization: "Bearer " + state.key } });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      toast("Invoice CSV failed: " + (body && body.error ? body.error.message : res.status), true);
+      return;
+    }
+    const blob = await res.blob();
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(blob),
+      download: (res.headers.get("content-disposition") || "").match(/"([^"]+)"/)?.[1] || `invoice_${month}.csv`,
+    });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast("Invoice CSV downloaded");
+  } catch (e) { toast("Invoice CSV failed: " + (e.message || e), true); }
+});
 
 // ---------- routing ----------------------------------------------------
 
