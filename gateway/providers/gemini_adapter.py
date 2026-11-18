@@ -490,6 +490,11 @@ class GeminiProviderAdapter(ProviderAdapter):
             "Content-Type": "application/json",
         }
 
+    def ws_headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
+        # Gemini-style realtime relays take the key in x-goog-api-key,
+        # matching the HTTP surface.
+        return {"x-goog-api-key": provider_cfg.resolve_key() or ""}
+
     async def complete(
         self,
         deployment: DeploymentConfig,

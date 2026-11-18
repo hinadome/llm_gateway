@@ -343,6 +343,23 @@ class Router:
             return cfg
         return cfg.model_copy(update={"api_key": entry.key, "api_key_env": None})
 
+    async def resolve_realtime(
+        self,
+        model: str,
+        residencies: frozenset[str] | None = None,
+    ) -> list[DeploymentConfig]:
+        """The candidate ladder for a realtime (WebSocket) session
+        (tier 32): resolve → breaker-filter, in priority order. The
+        CALLER owns failover — a long-lived session cannot be retried
+        mid-stream the way HTTP dispatch can, so realtime walks
+        candidates at CONNECT time only (a deployment whose WS
+        handshake fails moves the ladder to the next one) and stays
+        on the deployment it connected to for the session's life.
+        Callers further filter to providers with realtime_base set —
+        the realtime-capability requirement is a provider property."""
+        deployments = self.resolve(model, residencies)
+        return await self._available(deployments)
+
     @staticmethod
     def _backoff(attempt: int, base: float) -> float:
         return min(8.0, base * (2**attempt)) * (0.5 + random.random())

@@ -40,6 +40,7 @@ from .api import gemini_native
 from .api import images as images_api
 from .api import models as models_api
 from .api import openai_responses as responses_api
+from .api import realtime as realtime_api
 from .bootstrap import ensure_admin_key, ensure_default_key
 from .config import GatewayConfig, Settings, get_settings
 from .core.alerts import BudgetAlertManager
@@ -679,6 +680,7 @@ def create_app(
     app.include_router(responses_api.router)
     app.include_router(images_api.router)
     app.include_router(audio_api.router)
+    app.include_router(realtime_api.router)
     app.include_router(batches_api.router)
     app.include_router(feedback_api.router)
     app.include_router(admin_api.router)

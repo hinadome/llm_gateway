@@ -120,6 +120,16 @@ class ProviderAdapter(ABC):
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
 
+    def ws_headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
+        """Auth headers for a realtime (WebSocket) upstream handshake —
+        the same credential the adapter's HTTP calls send, in the same
+        header shape (tier 32: /v1/realtime sessions). The default is
+        OpenAI-style Bearer; providers with their own header conventions
+        override. The credential itself resolves through the BYOK vault
+        like every serving path — the pipeline hands us a config whose
+        key is already the tenant's when they brought their own."""
+        return {"Authorization": f"Bearer {provider_cfg.resolve_key() or ''}"}
+
     @abstractmethod
     async def complete(
         self,

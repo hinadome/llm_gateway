@@ -136,6 +136,15 @@ class ProviderConfig(BaseModel):
     # Provider API version (Azure OpenAI: the ?api-version= query param).
     # Adapters that don't version ignore it.
     api_version: str | None = None
+    # Realtime (WebSocket) base URL (tier 32): where this provider's
+    # OpenAI-compatible realtime endpoint lives, e.g.
+    # "wss://api.openai.com/v1" — the gateway appends "/realtime" and
+    # the deployment's native model. A provider without realtime_base
+    # is not realtime-capable: /v1/realtime sessions asking for its
+    # deployments fail with a clear error (never a silent HTTP fallback).
+    # Credentials reuse the same api_key/api_key_env (BYOK applies) in
+    # the provider's own header shape (see ws_headers on the adapter).
+    realtime_base: str | None = None
 
     def resolve_key(self) -> str | None:
         if self.api_key:

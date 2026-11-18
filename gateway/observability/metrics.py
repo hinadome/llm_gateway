@@ -162,6 +162,14 @@ INFLIGHT = Gauge(
     "(streams count until the response body is fully sent).",
 )
 
+REALTIME_SESSIONS = Gauge(
+    "gateway_realtime_sessions",
+    "Realtime (WebSocket) sessions currently open, by provider and "
+    "public model. A session holds an upstream connection (and a "
+    "concurrency slot, when the caller has one) for its whole life.",
+    ["provider", "model"],
+)
+
 CIRCUIT_STATE = Gauge(
     "gateway_circuit_state",
     "Circuit breaker state per deployment (0=closed, 1=half_open, 2=open).",

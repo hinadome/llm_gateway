@@ -21,7 +21,12 @@ logger = logging.getLogger("gateway.auth")
 # all exercise the same underlying completions machinery. "batch" covers
 # the files/batches surfaces (their lines execute as chat anyway, but
 # the scope is granted separately so a key may chat without batching).
-ENDPOINT_SCOPES = frozenset({"chat", "embeddings", "images", "audio", "models", "batch"})
+# "realtime" is the WebSocket session surface (/v1/realtime): granted
+# separately like batch — a key may chat without holding live sessions,
+# and sessions consume concurrency slots for their whole life.
+ENDPOINT_SCOPES = frozenset(
+    {"chat", "embeddings", "images", "audio", "models", "batch", "realtime"}
+)
 
 
 def required_scope(path: str) -> str | None:
@@ -39,6 +44,11 @@ def required_scope(path: str) -> str | None:
         return "batch"
     if path == "/v1/batches" or path.startswith("/v1/batches/"):
         return "batch"
+    # The WebSocket session surface (its own scope: sessions hold
+    # concurrency slots for their whole life, so a key may chat
+    # without being allowed to hold live sessions).
+    if path == "/v1/realtime":
+        return "realtime"
     # Feedback is commentary on chat traffic — the chat scope covers it
     # (a key that may rate is a key that may chat).
     if path == "/v1/feedback":

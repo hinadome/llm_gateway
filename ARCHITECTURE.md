@@ -126,7 +126,9 @@ gateway/
 │   │                       scoping (allowed_endpoints — chat / embeddings
 │   │                       (incl. Gemini :embedContent/:batchEmbedContents) /
 │   │                       images / audio / models / batch (files +
-│   │                       batches) — + allowed_ips, never
+│   │                       batches) / realtime (WS sessions — checked by
+│   │                       api/realtime.py's authenticate_websocket, the
+│   │                       WS twin of require_api_key) — + allowed_ips, never
 │   │                       on admins); require_admin gates the admin API,
 │   │                       require_platform_admin additionally excludes
 │   │                       tenant admins (the platform's own config
@@ -187,6 +189,31 @@ gateway/
 │   │                       Also attaches the original body + a pristine
 │   │                       messages snapshot as private attrs, feeding
 │   │                       the native Responses southbound
+│   ├── realtime.py         WS /v1/realtime — the fifth inbound surface and the
+│   │                       first stateful one: one long-lived session instead
+│   │                       of request/response. The route is the HTTP-layer
+│   │                       twin of every other api/ module (accept →
+│   │                       authenticate → delegate): authenticate_websocket
+│   │                       extracts the same credential namespace
+│   │                       (Bearer / x-api-key / x-goog-api-key / api-key
+│   │                       — plus ?key=, because browsers cannot set
+│   │                       WebSocket headers), runs the same chain and the
+│   │                       same scoping (allowed_ips; the 'realtime'
+│   │                       endpoint scope — its own, since a session is a
+│   │                       different kind of commitment than a call), then
+│   │                       requires ?model= and hands the socket to
+│   │                       pipeline.handle_realtime. Rejection semantics
+│   │                       are accept-first: every failure to OPEN
+│   │                       (auth, scope, model permission, rate limit,
+│   │                       budget, realtime_unavailable, refused
+│   │                       handshakes) is an OpenAI-shaped realtime
+│   │                       {"type":"error","error":{...}} event followed
+│   │                       by close 1008 — the session-shaped equivalent
+│   │                       of the HTTP error envelope, so a client with
+│   │                       no HTTP surface still gets a debuggable
+│   │                       message instead of a bare refusal; a normal
+│   │                       disconnect returns quietly (the pipeline's
+│   │                       teardown wrote the row), a crash closes 1011
 │   ├── images.py           POST /v1/images/generations → pipeline
 │   │                       .handle_image_generation (stream: true rejected
 │   │                       with a 400 — it would bypass accounting) +
@@ -392,7 +419,62 @@ gateway/
 │   │                       a bad config raises with the old one still live),
 │   │                       and _spawn/drain_background_tasks track that
 │   │                       fire-and-forget work so shutdown drains it before
-│   │                       the engine goes away
+│   │                       the engine goes away; handle_realtime (tier 32)
+│   │                       is the session twin of _handle — the open gates
+│   │                       run ONCE per session, in HTTP order (model
+│   │                       resolution/permission, the realtime scope via the
+│   │                       route, RPM at open, budget, a concurrency slot
+│   │                       held for the session's LIFE, INFLIGHT +
+│   │                       REALTIME_SESSIONS gauges), then routing walks
+│   │                       the residency/breaker-filtered ladder at CONNECT
+│   │                       time only (websockets.connect per candidate with
+│   │                       the BYOK-resolved cfg + adapter.ws_headers — a
+│   │                       long-lived session cannot fail over mid-stream),
+│   │                       then the relay (core/realtime.py) owns everything
+│   │                       per-event; teardown on EVERY exit path closes the
+│   │                       upstream session first, then row/metric/slot/
+│   │                       INFLIGHT/span — one _log call, one row per
+│   │                       session ("realtime session completed")
+│   ├── realtime.py         RealtimeRelay (tier 32) — the stateful twin of the
+│   │                       streaming chat path: two pumps (client→upstream,
+│   │                       upstream→client) supervised by one asyncio.wait
+│   │                       (FIRST_COMPLETED — either leg ending ends the
+│   │                       session), relaying the OpenAI Realtime event
+│   │                       protocol with policy applied where content
+│   │                       actually moves. Client leg: response.create
+│   │                       builds a ChatCompletionRequest (the create's
+│   │                       own input — fork semantics — or the SHADOWED
+│   │                       conversation the relay keeps from
+│   │                       conversation.item.create/delete events when
+│   │                       the create carries none) and runs the request
+│   │                       phase: BLOCK swallows the create (error
+│   │                       event, nothing forwarded — the session
+│   │                       lives on), modified messages are written
+│   │                       back into the forwarded event;
+│   │                       malformed events get error events and are
+│   │                       skipped. Upstream leg: session.created
+│   │                       passes through; output_text.delta runs
+│   │                       block-style stream checks on the SOURCE
+│   │                       text and chains rewriters (the same
+│   │                       held-back protocol as SSE — the client
+│   │                       sees rewritten text, the final flush at
+│   │                       output_text.done; a mid-response BLOCK
+│   │                       sends the error event, response.cancel
+│   │                       upstream and suppresses the rest of THAT
+│   │                       response via a response-id set — its
+│   │                       response.done still bills, the provider
+│   │                       ran); response.done accounts (usage→
+│   │                       prompt/completion tokens, TPM, cost, spend
+│   │                       — the session's ctx accumulates across
+│   │                       responses, so the ONE log row sums them);
+│   │                       the first delta sets TTFT; budget
+│   │                       re-checks that raise mid-session close
+│   │                       1008 with the error event (session-fatal,
+│   │                       unlike a guardrail block); audio deltas and
+│   │                       other event types pass through untouched
+│   │                       (text is the guarded surface). _send_error
+│   │                       is the OpenAI shape shared with the route's
+│   │                       rejections
 │   ├── context.py          RequestContext / AuthContext — per-request state threaded
 │   │                       everywhere; AuthContext carries the key's routing
 │   │                       overrides (model_mappings / default_model) and prompt
@@ -402,7 +484,7 @@ gateway/
 │   │                       the same auth-time-consistency trade-off the key's
 │   │                       budget fields make); RequestContext.route names
 │   │                       the inbound surface (chat / responses /
-│   │                       messages / gemini) that guardrail route
+│   │                       messages / gemini / realtime) that guardrail route
 │   │                       scopes match against
 │   ├── concurrency.py      Concurrency admission control + QoS:
 │   │                       ConcurrencyLimiter bounds how many
@@ -507,7 +589,18 @@ gateway/
 │   │                       platform-key fallback. Shadow mirrors,
 │   │                       canary probes and embed_fn_for keep the sync
 │   │                       _provider_cfg: the platform's machinery
-│   │                       rides platform credentials by design
+│   │                       rides platform credentials by design.
+│   │                       resolve_realtime (tier 32) is the ladder's
+│   │                       stateless front half, exported for the
+│   │                       session surface: priority-ordered,
+│   │                       breaker-filtered, residency-filtered and
+│   │                       realtime_base-filtered (a provider without
+│   │                       a realtime endpoint is never realtime-
+│   │                       routed) — pipeline.handle_realtime walks
+│   │                       it at CONNECT time (per-candidate
+│   │                       _resolve_provider_cfg + ws_headers +
+│   │                       websockets.connect; first handshake wins,
+│   │                       the session stays on its leg)
 │   ├── breaker.py         Per-deployment circuit breakers: closed → open (skip) → half-open (probe);
 │   │                       request-level failure counting, Prometheus state gauge,
 │   │                       admin reset; register() is idempotent — a config
@@ -1146,6 +1239,8 @@ classDiagram
 
 **The key contract**: adapters *speak OpenAI on both sides*. `complete()` returns an OpenAI `chat.completion` dict; `stream()` yields OpenAI `chat.completion.chunk` dicts (usage attached to a final empty-choices chunk); `embed()` returns an OpenAI `list[embedding]` dict (canonical float form — `encoding_format: base64` is applied by the pipeline on the way out, so cache entries stay provider-neutral). This is what decouples the entire upper stack from provider specifics — the pipeline doesn't know Anthropic exists. Chat-only providers keep the base `embed()` default: a clear 501 that the router treats as "not retryable here, fall through to the next deployment".
 
+`ws_headers(provider_cfg)` (tier 32) is the contract's one non-HTTP member: the auth headers for a realtime upstream handshake, in the provider's own shape — `Authorization: Bearer` on the base class (any OpenAI-compatible `realtime_base`), `api-key` for Azure, `x-api-key` + `anthropic-version` for Anthropic, `x-goog-api-key` for Gemini. It reads the same resolved `provider_cfg` every HTTP path gets (BYOK vault included — a tenant-keyed provider's session handshakes with the tenant's credential), which is what lets `handle_realtime`'s connect-time ladder authenticate each candidate without any provider-specific code in the pipeline.
+
 Two structural choices make adapters independently testable:
 
 - **Translation is pure** — `anthropic_adapter.translate_request(request, native_model) → dict` and `translate_response(native, public_model) → dict` are side-effect-free functions (unit-tested without HTTP).
@@ -1358,6 +1453,8 @@ flowchart TD
     FB -->|"none left"| RAISE
 ```
 
+**Realtime sessions route at CONNECT time only.** A WebSocket session is a stateful commitment — the ladder above (resolve → breaker filter → BYOK resolution → candidate) runs in a single loop over `Router.resolve_realtime` results while the gateway opens the upstream handshake, failing over between refused handshakes, and then the session *stays on its leg*: there is no retry protocol for a stream that is already 40 minutes in. So a dead openai leg moves a *new* session to the azure fallback, but a leg that dies mid-session simply ends that session (the client reconnects, which re-runs the ladder). Residency filtering applies identically (the ladder is pre-filtered), and the breaker state the walk consults is the same shared machinery as HTTP routing.
+
 ### 5.4 Lifecycle-event emission points
 
 Every stage boundary below is also an event emission (the full catalog with payloads lives in the README's "Lifecycle events" section). Each emission is a no-op until a handler subscribes:
@@ -1543,7 +1640,7 @@ erDiagram
     BATCH ||--o{ BATCH_RESULT : "batch_id"
 ```
 
-**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays. **BYOK vault (tier 31):** a tenant can additionally store its *own* provider credentials — one encrypted entry per (tenant, provider), `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every member request through that provider then authenticates with the tenant's key instead of the platform's configured one (see `core/vault.py`; the swap happens in `Router._resolve_provider_cfg`, per candidate inside the retry/fallback loop, so the stored key follows every leg and an unkeyed fallback provider rides the platform's credential alone). Raw keys are Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (env only; MultiFernet list = rotation), exist only in the PUT body and the upstream auth header, and are never echoed, logged or audited — the API and audit records speak `key_hint`, log rows `byok_provider` (the provider name). Undecryptable entries (a rotated-away master key) fail closed with `byok_key_unreadable` — a tenant that deliberately brought its own key is never silently re-billed to the platform's; platform callers are untouched. Tenant admins manage their own tenant's credentials only (cross-tenant 404, like everything tenant-scoped); without a master key the vault is simply off — endpoints 400 honestly, serving unchanged.
+**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays. **BYOK vault (tier 31):** a tenant can additionally store its *own* provider credentials — one encrypted entry per (tenant, provider), `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every member request through that provider then authenticates with the tenant's key instead of the platform's configured one (see `core/vault.py`; the swap happens in `Router._resolve_provider_cfg`, per candidate inside the retry/fallback loop, so the stored key follows every leg and an unkeyed fallback provider rides the platform's credential alone — realtime sessions included: `handle_realtime` resolves per candidate at the upstream handshake, so a tenant that keyed the provider connects its WebSocket sessions with *their* credential, and the session row records `byok_provider` like any HTTP row). Raw keys are Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (env only; MultiFernet list = rotation), exist only in the PUT body and the upstream auth header, and are never echoed, logged or audited — the API and audit records speak `key_hint`, log rows `byok_provider` (the provider name). Undecryptable entries (a rotated-away master key) fail closed with `byok_key_unreadable` — a tenant that deliberately brought its own key is never silently re-billed to the platform's; platform callers are untouched. Tenant admins manage their own tenant's credentials only (cross-tenant 404, like everything tenant-scoped); without a master key the vault is simply off — endpoints 400 honestly, serving unchanged.
 
 Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` (the `postgres` extra, asyncpg) with no code changes — only async SQLAlchemy is used. JSON columns compile to JSONB on PostgreSQL via a shared variant type (`JSONColumn` in `models.py`), which keeps the budget-alert compare-and-swap meaningful there (semantic JSONB equality; plain `json` has no `=` operator); PostgreSQL engines also pre-ping pooled connections so server-side drops recycle instead of surfacing as 500s. The whole test suite runs against either backend — `GATEWAY_TEST_DATABASE_URL` points `conftest` at a live PostgreSQL server, where each test gets its own database (created and dropped around the run; the `VACUUM INTO` backup tests skip, and a test pins the `pg_dump`-pointing 400 refusal). Online backups stay SQLite-only by construction.
 
@@ -1649,7 +1746,7 @@ Shutdown is the mirror image of composition, in reverse dependency order: `/read
 
 Being honest about the seams — these are the current trade-offs (all are localizable; none require redesigning the pipeline concept):
 
-1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Images and audio now exist as first-class non-chat surfaces (`generate_image` / `edit_image` / `vary_image` / `transcribe` / `speak` on `ProviderAdapter`, 501-with-fallback defaults so chat-only providers need no special handling — the router falls through), with OpenAI/Azure passing all of them through, Gemini translating image generation *and editing* to `generateContent` and speaking TTS natively (voice mapping, PCM-as-WAV), and speech streaming end to end. Audio *in chat* works across every inbound format — `input_audio` parts in, `message.audio`/`modalities`+`audio` out (Anthropic refuses both directions — no audio in the Messages API — and falls through, see §4.5) — and Gemini image models serve image-to-image chat with images in and out. Native Gemini *embeddings* are inbound too (`:embedContent`/`:batchEmbedContents`, §4.5), so every Gemini chat client can point at the gateway wholesale. The modality matrix is deliberately shallow: no Gemini or Anthropic *audio understanding* (no Whisper-style transcription APIs), Gemini images have no size/quality/mask mapping and `n` means `n` sequential calls, transcription is billed only from the duration `verbose_json` reports, Gemini TTS and audio-output chat are not transcoded to mp3 & friends (WAV or raw PCM), audio-output chat does not stream on Gemini (no WAV re-framing mid-stream), and audio *uploads* are OpenAI-multipart-shaped only. Still missing: native Responses for Anthropic/Gemini (no such endpoint). Adding that means generalizing `ProviderAdapter` and the schema layer, not just registering something.
+1. **One endpoint domain (southbound).** The core abstraction is chat-completions-shaped; the four *inbound* wire formats — OpenAI chat, Anthropic Messages, Gemini generateContent, and the OpenAI Responses API (a stateless bridge in `api/openai_responses.py` covering the chat-convertible subset the Agents SDK sends) — are thin translations over it; adding a fifth is one more such file, not a core change. The fifth inbound surface, realtime (`WS /v1/realtime`), proved a different face of the same claim: a *stateful* transport rides the identical policy spine (auth chain, scopes, model permission, rate limits, budgets, concurrency, guardrail phases, routing ladder, accounting) through a session-shaped entry — `pipeline.handle_realtime` + `core/realtime.py` — with the per-request phases re-anchored to session semantics (gates once at open, budget re-checked per create, one log row summing the session), and zero changes to any HTTP path. Southbound Responses now exists *for OpenAI and Azure OpenAI* (`deployment.native_responses`, `providers/responses_native.py`: the original body forwarded to the provider's `/responses`, the response translated back into the chat shape — policy/cache/accounting unchanged, with a pristine-messages fallback so a guardrail or prompt-policy modification is never silently dropped). Images and audio now exist as first-class non-chat surfaces (`generate_image` / `edit_image` / `vary_image` / `transcribe` / `speak` on `ProviderAdapter`, 501-with-fallback defaults so chat-only providers need no special handling — the router falls through), with OpenAI/Azure passing all of them through, Gemini translating image generation *and editing* to `generateContent` and speaking TTS natively (voice mapping, PCM-as-WAV), and speech streaming end to end. Audio *in chat* works across every inbound format — `input_audio` parts in, `message.audio`/`modalities`+`audio` out (Anthropic refuses both directions — no audio in the Messages API — and falls through, see §4.5) — and Gemini image models serve image-to-image chat with images in and out. Native Gemini *embeddings* are inbound too (`:embedContent`/`:batchEmbedContents`, §4.5), so every Gemini chat client can point at the gateway wholesale. The modality matrix is deliberately shallow: no Gemini or Anthropic *audio understanding* (no Whisper-style transcription APIs), Gemini images have no size/quality/mask mapping and `n` means `n` sequential calls, transcription is billed only from the duration `verbose_json` reports, Gemini TTS and audio-output chat are not transcoded to mp3 & friends (WAV or raw PCM), audio-output chat does not stream on Gemini (no WAV re-framing mid-stream), and audio *uploads* are OpenAI-multipart-shaped only. Still missing: native Responses for Anthropic/Gemini (no such endpoint). Adding that means generalizing `ProviderAdapter` and the schema layer, not just registering something.
 2. **Pipeline phase order is fixed in code.** auth → runaway-jail → rate-limit → idempotency → budget → guardrails → cache → concurrency-admission → routing → respond. You cannot reorder or disable phases via config (e.g., "check cache before rate limits"). Guardrails *within* the request phase are ordered; *phases* are not. Idempotency sits before budget on purpose: a retry must still serve even if the ceiling was crossed after the original was authorized. The runaway jail sits before everything else in `_handle` on the same logic: nothing a stuck agent sends is useful — not even an idempotent replay or a request the cache would serve free. Concurrency admission sits *after* the cache on the opposite logic: a hit or a replay never touches the upstream, so it never needs a slot — only the call the slot wraps pays for it.
 3. ~~Request-phase guardrails can only modify `messages`~~ **Solved:** `GuardrailResult` now carries `modified_model` (reject-and-redirect — "serve this on the small model" instead of blocking, with the pipeline re-checking the key's allowlist after the guardrail phase, fail closed) and `modified_request_fields` (arbitrary `ChatCompletionRequest` fields: `temperature`, `tools`, ...). All three compose and chain across guardrails (one `model_copy` per guardrail, each seeing the previous one's output).
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
@@ -1989,6 +2086,32 @@ tests/
 │                        serving, streaming refusal 400, native-Gemini
 │                        audio round trip, response- and stream-phase
 │                        guardrail blocks on transcripts)
+├── test_byok_vault.py   BYOK vault (tier 31): Fernet/MultiFernet units (rotation,
+│                        undecryptable fail-closed), service TTL/negative
+│                        caches + invalidate-on-write, admin API (hint-only
+│                        echo, cross-tenant 404, disabled-vault 400),
+│                        e2e serving with the tenant's key on the upstream
+│                        call (per-candidate: keyed openai leg rides the
+│                        tenant's key, unkeyed azure fallback the platform's),
+│                        row/metric/hint observability
+├── test_realtime.py     Realtime surface (tier 32): hand-rolled WSClient
+│                        (drives the app's websocket scope over ASGI —
+│                        accept handshake, event queues, close 1008) + a
+│                        websockets-server MockRealtime (records handshakes,
+│                        scripts responses per create with inter-delta
+│                        yields so mid-response blocks cancel mid-burst).
+│                        Open gates (auth incl. ?key=, 'realtime' scope,
+│                        model permission, realtime_unavailable), per-event
+│                        policy (request-phase block kills the response not
+│                        the session, rewriter masking across split chunks,
+│                        stream block = error + response.cancel upstream +
+│                        suppression while the cancelled done still bills,
+│                        conversation-mirror block of inputless creates),
+│                        budget re-check mid-session, concurrency slot held
+│                        for the session's life, connect-time failover to
+│                        azure (api-key handshake), BYOK on the handshake,
+│                        one-row-per-session accounting (tokens/cost summed,
+│                        TTFT on first delta)
 └── test_core.py         CostCalculator (prefix pricing + modality unit prices) + RateLimiter windows
 ```
 
@@ -2012,7 +2135,7 @@ A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, 
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` (prompt / completion / cached_input — the latter only when the upstream reports prompt-cache reads, so the uncached series stays comparable with pre-existing data) · `gateway_cost_usd_total{model}` (bills the cached split at the entry's cached_input price, 50% of input by default; always ACTUAL provider cost — tenant markups never touch it) · `gateway_markup_usd_total{tenant}` (tenant pricing-markup revenue: billed minus actual, from `pricing_markup_pct`) · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_prompt_compression_saved_tokens_total{model}` (estimated input tokens removed by enforced prompt_compression folds/truncations — the guardrail's ROI metric; observe mode and replay-harness runs never count) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_pii_scan_findings_total{kind}` (scanned request-log rows whose stored bodies matched a PII/secret detector kind) · `gateway_idempotency_total{outcome}` (Idempotency-Key outcomes: replayed / stored / rejected) · `gateway_replay_total{result}` (capture-replay harness line outcomes: changed / unchanged / not_comparable / error — POST /admin/replay; guardrail enforcement counters are suppressed during replay, so harness runs never touch `gateway_guardrail_blocks_total`) · `gateway_runaway_trips_total{key}` (runaway-agent loop detections: identical-request threshold reached, key jailed for an escalating cooldown — labeled via the KeyLabeler, so cardinality is capped like the per-key family even though it's always emitted) · `gateway_concurrency_inflight{key}` / `gateway_concurrency_queued{key}` (gauges: upstream requests holding vs queueing for a concurrency slot — the limiter's own ground truth; capless callers never appear) · `gateway_concurrency_rejected_total{key}` (queue waits that expired past concurrency.wait_seconds → 429 + Retry-After) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded; reports the BILLED cost when the key's tenant carries a `pricing_markup_pct` — consistent with spend/logs/exports) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_realtime_sessions{provider,model}` (gauge; open realtime WebSocket sessions — a session holds its upstream connection for its whole life) · `gateway_tokens_total{type}` (prompt / completion / cached_input — the latter only when the upstream reports prompt-cache reads, so the uncached series stays comparable with pre-existing data) · `gateway_cost_usd_total{model}` (bills the cached split at the entry's cached_input price, 50% of input by default; always ACTUAL provider cost — tenant markups never touch it) · `gateway_markup_usd_total{tenant}` (tenant pricing-markup revenue: billed minus actual, from `pricing_markup_pct`) · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_prompt_compression_saved_tokens_total{model}` (estimated input tokens removed by enforced prompt_compression folds/truncations — the guardrail's ROI metric; observe mode and replay-harness runs never count) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_pii_scan_findings_total{kind}` (scanned request-log rows whose stored bodies matched a PII/secret detector kind) · `gateway_idempotency_total{outcome}` (Idempotency-Key outcomes: replayed / stored / rejected) · `gateway_replay_total{result}` (capture-replay harness line outcomes: changed / unchanged / not_comparable / error — POST /admin/replay; guardrail enforcement counters are suppressed during replay, so harness runs never touch `gateway_guardrail_blocks_total`) · `gateway_runaway_trips_total{key}` (runaway-agent loop detections: identical-request threshold reached, key jailed for an escalating cooldown — labeled via the KeyLabeler, so cardinality is capped like the per-key family even though it's always emitted) · `gateway_concurrency_inflight{key}` / `gateway_concurrency_queued{key}` (gauges: upstream requests holding vs queueing for a concurrency slot — the limiter's own ground truth; capless callers never appear) · `gateway_concurrency_rejected_total{key}` (queue waits that expired past concurrency.wait_seconds → 429 + Retry-After) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded; reports the BILLED cost when the key's tenant carries a `pricing_markup_pct` — consistent with spend/logs/exports) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 
@@ -2041,7 +2164,7 @@ The one structural subtlety is the **streaming span lifetime**: `handle_chat()` 
 
 ### 10.3 Logs — DB rows, JSON stdout, and the OTel pipeline
 
-Every request produces exactly one `RequestLog` row (queryable via `/admin/logs`, now filterable by `?trace_id=`) **and** one structured log record (`logger.info("chat request completed", extra={...})` on `gateway.pipeline` carrying request_id, trace_id, span_id, model, provider, deployment, status, stream, cache_hit, tokens, cost, latency, error). Two optional outputs ride on that record:
+Every request produces exactly one `RequestLog` row (a realtime *session* is one row too — tokens, cost and spend summed across its responses — queryable via `/admin/logs`, now filterable by `?trace_id=`) **and** one structured log record (`logger.info("chat request completed", extra={...})` on `gateway.pipeline` carrying request_id, trace_id, span_id, model, provider, deployment, status, stream, cache_hit, tokens, cost, latency, error). Two optional outputs ride on that record:
 
 - **JSON stdout** (`GATEWAY_LOG_FORMAT=json`): a `JsonFormatter` serializes the record to one JSON line — `extra` fields become top-level keys, `None` values are dropped. `text` keeps stdlib formatting.
 - **OTel logs pipeline** (tracing on + OTLP log endpoint): `logs.py`'s `OTelLogHandler` translates Python records to OTel log records and stamps them with the **current span's** trace/span ids. The per-request record is emitted while `gateway.chat` is still active (the pipeline restructured `handle_chat` so all logging happens inside the `use_span` scope), so exported logs join their trace in OTel-native backends. The SDK's own `LoggingHandler` is deprecated, hence the small custom one.

@@ -8,6 +8,61 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Realtime API — `WS /v1/realtime?model=<public-model>`, the fifth
+  inbound surface and the first STATEFUL one: a long-lived
+  bidirectional event session speaking the OpenAI Realtime protocol
+  on both legs, where the gateway holds the matching upstream
+  WebSocket open for the session's whole life and applies policy
+  where a session actually differs from a request. Open gates run
+  ONCE per session, accept-first (every failure to open is delivered
+  in-band — an OpenAI-shaped {"type":"error","error":{...}} event
+  followed by close 1008, the session-shaped equivalent of the HTTP
+  error envelope): the same auth chain and credential namespace as
+  HTTP (Authorization/x-api-key/x-goog-api-key/api-key, plus ?key=
+  in the query string because browsers cannot set WebSocket headers),
+  the 'realtime' endpoint scope (its own — a session is a different
+  kind of commitment than a call; chat/embeddings/images/audio/models
+  vocabulary extended), model permission, RPM at open (tokens accrue
+  per response), the budget check, and a concurrency slot HELD for
+  the session's life (max_concurrency counts sessions — they occupy
+  upstream capacity like an in-flight stream; the second session
+  429s at the open, not at first use). Routing walks the residency-
+  and breaker-filtered ladder at CONNECT time only
+  (Router.resolve_realtime → per-candidate _resolve_provider_cfg +
+  adapter.ws_headers + websockets.connect; a dead leg fails over
+  between handshakes, then the session stays put — there is no retry
+  protocol for a stream already 40 minutes in); a provider without
+  realtime_base is never realtime-routed (realtime_unavailable, never
+  a silent HTTP fallback), and the BYOK vault rides the handshake
+  like every serving path (a tenant that keyed the provider connects
+  with THEIR credential; the row records byok_provider). Per-event
+  guardrails: the request phase runs over each response.create —
+  over its own input (fork semantics) or the SHADOWED conversation
+  the relay keeps from conversation.item.create/delete events when
+  the create carries none — and BLOCK kills that response, not the
+  session (error event, nothing forwarded upstream); the stream
+  phase + held-back rewriting (the same protocol the SSE path uses)
+  run over output_text.delta — block checks see the SOURCE text,
+  rewriters see what the client receives, the final flush lands at
+  output_text.done so nothing a rewriter masks ever leaks no matter
+  how the provider chunked; a mid-response stream BLOCK sends the
+  error event, forwards response.cancel upstream and suppresses the
+  rest of THAT response while its response.done still bills (the
+  provider ran) and the session lives on. Budgets re-check on every
+  create: exhaustion mid-session is session-fatal (error event +
+  close 1008, the row records why). Text is the guarded surface —
+  audio deltas and other event types pass through. Accounting: ONE
+  request-log row per session (route 'realtime', stream true) with
+  tokens/cost summed across responses, usage input→prompt mapping,
+  TTFT on the first delta — so budgets, exports, /admin/logs and
+  gateway_realtime_sessions{provider,model} see realtime traffic
+  exactly like HTTP. Deliberately not on this surface: the response
+  caches, idempotency, runaway detection and X-Gateway-* headers (a
+  WebSocket has no response headers). Requires websockets>=12
+  (pyproject base dependency). 17 new tests (tests/test_realtime.py —
+  hand-rolled ASGI WSClient + a websockets-server mock upstream that
+  scripts responses per create with inter-delta yields so mid-response
+  blocks cancel mid-burst); full suite 1009 passing.
 - BYOK vault — tenants bring their OWN provider credentials, encrypted
   at rest: one Fernet-encrypted entry per (tenant, provider)
   (`PUT /admin/tenants/{id}/provider-keys/{provider}`,

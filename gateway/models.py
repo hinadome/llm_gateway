@@ -330,10 +330,10 @@ class RequestLog(Base):
     # names are unique today, but ids are the exact-caller identity.
     key_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     # Which inbound surface served the request ("chat" | "responses" |
-    # "messages" | "gemini"; NULL for batch lines and rows written
-    # before the column existed). Guardrail route scoping matches on
-    # this, so the replay harness re-executes each captured request on
-    # its original surface.
+    # "messages" | "gemini" | "realtime"; NULL for batch lines and rows
+    # written before the column existed). Guardrail route scoping
+    # matches on this, so the replay harness re-executes each captured
+    # request on its original surface.
     route: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # The tenant the calling key belonged to (NULL = platform key / no
     # tenant — also admin-key requests, which carry no key row). Copied

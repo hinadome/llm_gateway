@@ -90,6 +90,11 @@ class AzureProviderAdapter(OpenAIProviderAdapter):
             "Content-Type": "application/json",
         }
 
+    def ws_headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
+        # Azure's realtime handshake authenticates the same way its
+        # HTTP calls do: the api-key header, not Bearer.
+        return {"api-key": provider_cfg.resolve_key() or ""}
+
     def _auth_headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
         # Multipart uploads: httpx owns the Content-Type (boundary).
         return {"api-key": provider_cfg.resolve_key() or ""}

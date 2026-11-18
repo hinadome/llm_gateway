@@ -417,6 +417,14 @@ class AnthropicProviderAdapter(ProviderAdapter):
             "Content-Type": "application/json",
         }
 
+    def ws_headers(self, provider_cfg: ProviderConfig) -> dict[str, str]:
+        # An Anthropic-compatible realtime endpoint wants the same
+        # x-api-key + version headers as its HTTP surface.
+        return {
+            "x-api-key": provider_cfg.resolve_key() or "",
+            "anthropic-version": ANTHROPIC_VERSION,
+        }
+
     async def complete(
         self,
         deployment: DeploymentConfig,

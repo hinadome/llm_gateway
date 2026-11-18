@@ -27,7 +27,7 @@ import asyncio
 import random
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -41,6 +41,7 @@ from ..errors import (
     GatewayError,
     GuardrailBlocked,
     ModelNotAllowedError,
+    ModelNotFoundError,
     ProviderError,
     RateLimitError,
     ToolsNotAllowedError,
@@ -66,6 +67,7 @@ from .idempotency import IdempotencyStore
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
 from .cost import CostCalculator, cached_tokens_from_usage
+from .realtime import RealtimeRelay
 from .runaway import RunawayProtector
 from .concurrency import ConcurrencyLimiter
 from .vault import VaultService
@@ -862,6 +864,181 @@ class GatewayPipeline:
         ctx.idempotency_key = store_key
         ctx.idempotency_fingerprint = fingerprint
         return None
+
+    # ------------------------------------------------------------------
+    # Realtime (WebSocket) sessions — tier 32
+    # ------------------------------------------------------------------
+
+    async def handle_realtime(
+        self,
+        ws: "Any",
+        model: str,
+        auth: AuthContext,
+        request_id: str | None = None,
+    ) -> None:
+        """One realtime session, end to end (``ws`` is a Starlette
+        WebSocket). The open gates mirror the HTTP surfaces exactly —
+        model permission, rate limit (one RPM hit at open; tokens
+        accrue per response), budget, a concurrency slot held for the
+        session's life — then routing walks the residency- and
+        breaker-filtered ladder at CONNECT time (a long-lived session
+        cannot fail over mid-stream), authenticating the upstream
+        handshake with the BYOK-resolved credential in the provider's
+        own header shape. The relay (core/realtime.py) owns everything
+        per-event afterwards.
+
+        Raises GatewayError for every gate/routing failure — the API
+        route translates those into an OpenAI-shaped realtime error
+        event + close, the session-shaped equivalent of an HTTP error
+        envelope. Returns normally on any disconnect; the finally-block
+        writes the log row, the metrics and gives the slot back.
+        """
+        import websockets  # local: the realtime-only dependency
+
+        ctx = RequestContext(
+            request_id=request_id or f"req_{uuid.uuid4().hex}",
+            auth=auth,
+            model=model,
+            stream=True,
+            # Surface NAME, like every other inbound route ("chat",
+            # "responses", ...) — guardrail scope.routes patterns match
+            # on this value.
+            route="realtime",
+            request_body={"model": model},
+        )
+        metrics.INFLIGHT.inc()
+        span = self._tracer.start_span("gateway.realtime", kind=SpanKind.INTERNAL)
+        ctx.otel_span = span
+        span.set_attribute("gateway.request_id", ctx.request_id)
+        span.set_attribute("gateway.model", ctx.model)
+        span.set_attribute("gateway.stream", True)
+        span.set_attribute("gateway.route", ctx.route)
+        span.set_attribute("gateway.key_name", auth.key_name or "admin")
+        span_context = span.get_span_context()
+        if span_context.is_valid:  # invalid = tracing disabled (no-op span)
+            ctx.trace_id = format(span_context.trace_id, "032x")
+            ctx.span_id = format(span_context.span_id, "016x")
+        # Initialized before the try so the finally can close it on
+        # every exit path (a gate failure must not leak the handshake,
+        # and a normal disconnect must not leak the session upstream).
+        upstream = None
+        with use_span(
+            span,
+            end_on_exit=False,
+            record_exception=False,
+            set_status_on_exception=False,
+        ):
+            try:
+                # The open gates, in the HTTP order.
+                ctx.model = self._resolve_model(model, auth)
+                self._check_model_permission(auth, ctx.model)
+                await self._check_rate_limit(ctx, 0)
+                self._check_budget(ctx)
+                await self._acquire_slot(ctx)
+
+                # Routing: the candidate ladder for a long-lived
+                # session, filtered to realtime-capable providers.
+                residencies = auth.effective_residencies()
+                candidates = await self.router.resolve_realtime(ctx.model, residencies)
+
+                def _realtime_base(candidate) -> str | None:
+                    cfg = self.router.config.providers.get(candidate.provider)
+                    return getattr(cfg, "realtime_base", None) if cfg is not None else None
+
+                capable = [d for d in candidates if _realtime_base(d)]
+                if not candidates:
+                    raise ModelNotFoundError(ctx.model)
+                if not capable:
+                    raise GatewayError(
+                        404,
+                        f"Model '{ctx.model}' has no realtime-capable deployment — "
+                        "no provider in its routing group has realtime_base "
+                        "configured. Realtime sessions are WebSocket-only; "
+                        "use /v1/chat/completions for this model.",
+                        "invalid_request_error",
+                        code="realtime_unavailable",
+                    )
+
+                # Connect-time failover: walk the ladder, first
+                # handshake that accepts wins. The session then stays
+                # on that deployment for its life.
+                upstream = None
+                attempts: list[str] = []
+                deployment = None
+                for candidate in capable:
+                    cfg = await self.router._resolve_provider_cfg(candidate, auth)
+                    adapter = self.router.providers[candidate.provider]
+                    url = f"{cfg.realtime_base}/realtime?model={candidate.model}"
+                    try:
+                        upstream = await websockets.connect(
+                            url, additional_headers=adapter.ws_headers(cfg)
+                        )
+                        deployment = candidate
+                        break
+                    except Exception as exc:
+                        attempts.append(f"{candidate.name}: {exc}")
+                        continue
+                if upstream is None:
+                    raise ProviderError(
+                        502,
+                        "All realtime-capable deployments refused the WebSocket "
+                        "handshake ("
+                        + "; ".join(attempts)[:800]
+                        + ").",
+                        "api_error",
+                    )
+                ctx.provider = deployment.provider
+                ctx.deployment = deployment.name
+                ctx.native_model = deployment.model
+                await self._note_byok(ctx, deployment)
+                await self._emit(
+                    "request.routed",
+                    ctx,
+                    deployment=deployment.name,
+                    provider=deployment.provider,
+                    realtime=True,
+                )
+                gauge = metrics.REALTIME_SESSIONS.labels(
+                    provider=ctx.provider, model=ctx.model
+                )
+                gauge.inc()
+                try:
+                    relay = RealtimeRelay(
+                        self, ctx, ws, upstream, deployment.model
+                    )
+                    await relay.run()
+                finally:
+                    gauge.dec()
+            finally:
+                # Session teardown: the row, the metric, the slot, the
+                # span — on any exit path (gate failure, disconnect,
+                # upstream death). The upstream WebSocket closes first:
+                # the provider's session ends with the gateway's, never
+                # after the log row says the session is over.
+                if upstream is not None:
+                    with suppress(Exception):
+                        await upstream.close()
+                try:
+                    if ctx.provider:
+                        self._request_metric(ctx)
+                finally:
+                    self._release_slot(ctx)
+                    metrics.INFLIGHT.dec()
+                    if ctx.status == "success" and ctx.error_message:
+                        ctx.status = "error"
+                    try:
+                        await self._log(ctx, "realtime session completed")
+                    except Exception:
+                        logger.exception("realtime log write failed")
+                    if span is not None:
+                        self._annotate_span(span, ctx)
+                        if ctx.status in ("error", "blocked"):
+                            span.set_status(
+                                Status(StatusCode.ERROR, ctx.error_message or ctx.status)
+                            )
+                        else:
+                            span.set_status(Status(StatusCode.OK))
+                        span.end()
 
     # ------------------------------------------------------------------
     # Embeddings
