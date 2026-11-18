@@ -340,6 +340,9 @@
       <label class="fld">Allowed models (comma-separated fnmatch patterns; empty = all)
         <input id="k-models" placeholder="gpt-4o*, claude-*" autocomplete="off">
       </label>
+      <label class="fld" title="Tool-call policy: fnmatch patterns over the tool names this key may declare in a request (every surface — OpenAI chat, Responses, native Anthropic/Gemini). A declared tool outside the patterns 400s tool_not_allowed; empty = all tools. Intersected with the tenant's tool policy — the tenant can only narrow.">Allowed tools (comma-separated fnmatch patterns; empty = all)
+        <input id="k-tools" placeholder="search_*, get_weather" autocomplete="off">
+      </label>
       <label class="fld" title="Guardrails skipped for requests from this key — a runtime override of the config scope">
         Disabled guardrails (comma-separated names; empty = none)
         <input id="k-guardrails" placeholder="prompt_injection, pii_redaction" autocomplete="off">
@@ -412,6 +415,9 @@
       </label>
       <label class="fld" title="Model allowlist every member key must pass (fnmatch patterns; empty = all) — it can only narrow what the member keys allow.">Allowed models (comma-separated fnmatch patterns; empty = all)
         <input id="t-models" placeholder="gpt-4o*, claude-*" autocomplete="off">
+      </label>
+      <label class="fld" title="Pooled tool policy: fnmatch patterns over the tool names member keys may declare — intersected with each key's own patterns, the tenant can only narrow. Empty = the tenant sets no tool policy.">Allowed tools (comma-separated fnmatch patterns; empty = all)
+        <input id="t-tools" placeholder="search_*, get_weather" autocomplete="off">
       </label>
       <div class="grid2">
         <label class="fld" title="Pooled RPM ceiling across every member key">RPM limit <input id="t-rpm" type="number" min="0" placeholder="unlimited"></label>
@@ -745,6 +751,9 @@ async function loadKeys() {
     const ipLock = (k.allowed_ips || []).length
       ? ` <span class="b b-gray" title="Calls must come from these IP/CIDR entries">🔒 ${k.allowed_ips.map(esc).join(", ")}</span>`
       : "";
+    const toolLock = (k.allowed_tools || []).length
+      ? ` <span class="b b-teal" title="Tool policy: only tools matching ${(k.allowed_tools || []).map(esc).join(", ")} may be declared (intersected with the tenant's policy)">🛠 ${(k.allowed_tools || []).map(esc).join(",")}</span>`
+      : "";
     const promptBits = [];
     if (k.system_prompt_ref) promptBits.push("library prompt '" + k.system_prompt_ref + "'");
     if (k.system_prompt) promptBits.push("inline system prompt");
@@ -769,7 +778,7 @@ async function loadKeys() {
       <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
-      <td>${models}${grOff}${scoped}${ipLock}${promptPolicy}${concBadge}${resBadge}</td>
+      <td>${models}${grOff}${scoped}${ipLock}${toolLock}${promptPolicy}${concBadge}${resBadge}</td>
       <td class="num">${k.rpm_limit == null ? "—" : fmtInt(k.rpm_limit)} / ${k.tpm_limit == null ? "—" : fmtInt(k.tpm_limit)}</td>
       <td>${budgetCell}</td>
       <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
@@ -815,6 +824,7 @@ function openKeyDialog(k) {
   $("#k-admin").checked = k ? !!k.is_admin : false;
   $("#k-admin").disabled = !!k; // admin rights are set at creation only
   $("#k-models").value = k && k.allowed_models ? k.allowed_models.join(", ") : "";
+  $("#k-tools").value = k && k.allowed_tools ? k.allowed_tools.join(", ") : "";
   $("#k-guardrails").value = k && k.disabled_guardrails ? k.disabled_guardrails.join(", ") : "";
   $("#k-mappings").value = k && k.model_mappings
     ? Object.entries(k.model_mappings).map(([a, b]) => a + "=" + b).join(", ") : "";
@@ -867,6 +877,8 @@ async function submitKeyDialog() {
   const body = {
     allowed_models: $("#k-models").value.trim()
       ? $("#k-models").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    allowed_tools: $("#k-tools").value.trim()
+      ? $("#k-tools").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     disabled_guardrails: $("#k-guardrails").value.trim()
       ? $("#k-guardrails").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     model_mappings: Object.keys(mappings).length ? mappings : null,
@@ -900,6 +912,7 @@ async function submitKeyDialog() {
       toast("Key updated");
     } else {
       if (body.allowed_models == null) delete body.allowed_models;
+      if (body.allowed_tools == null) delete body.allowed_tools;
       if (body.disabled_guardrails == null) delete body.disabled_guardrails;
       if (body.model_mappings == null) delete body.model_mappings;
       if (body.default_model == null) delete body.default_model;
@@ -992,6 +1005,9 @@ async function loadTenants() {
   const rows = (tr.data || []).map(t => {
     const models = !t.allowed_models ? '<span class="b b-blue">all</span>' :
       t.allowed_models.map(m => `<span class="b b-gray mono">${esc(m)}</span>`).join(" ");
+    const tools = (t.allowed_tools || []).length
+      ? ` <span class="b b-teal" title="Pooled tool policy: member keys may only declare tools matching ${(t.allowed_tools || []).map(esc).join(", ")}">🛠 ${(t.allowed_tools || []).map(esc).join(",")}</span>`
+      : "";
     const nameCell = `<b>${esc(t.name)}</b>` +
       (t.display_name ? ` <span class="muted" style="font-size:12px">${esc(t.display_name)}</span>` : "");
     const stateBadge = t.is_active
@@ -1010,7 +1026,7 @@ async function loadTenants() {
       <td>${nameCell}</td>
       <td>${stateBadge}</td>
       <td class="num">${fmtInt(keyCounts[t.id] || 0)}</td>
-      <td>${models}</td>
+      <td>${models}${tools}</td>
       <td class="num">${t.rpm_limit == null ? "—" : fmtInt(t.rpm_limit)} / ${t.tpm_limit == null ? "—" : fmtInt(t.tpm_limit)}</td>
       <td>${markupBadge}${concBadge}${resBadge}</td>
       <td>${budgetCellHtml(t)}</td>
@@ -1052,6 +1068,7 @@ function openTenantDialog(t) {
   $("#t-name").disabled = !!t; // slug is immutable
   $("#t-display").value = t && t.display_name ? t.display_name : "";
   $("#t-models").value = t && t.allowed_models ? t.allowed_models.join(", ") : "";
+  $("#t-tools").value = t && t.allowed_tools ? t.allowed_tools.join(", ") : "";
   $("#t-rpm").value = t && t.rpm_limit != null ? t.rpm_limit : "";
   $("#t-tpm").value = t && t.tpm_limit != null ? t.tpm_limit : "";
   $("#t-conc").value = t && t.max_concurrency != null ? t.max_concurrency : "";
@@ -1072,6 +1089,8 @@ async function submitTenantDialog() {
     display_name: $("#t-display").value.trim() || null,
     allowed_models: $("#t-models").value.trim()
       ? $("#t-models").value.split(",").map(s => s.trim()).filter(Boolean) : null,
+    allowed_tools: $("#t-tools").value.trim()
+      ? $("#t-tools").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     rpm_limit: num("t-rpm"),
     tpm_limit: num("t-tpm"),
     pricing_markup_pct: num("t-markup"),

@@ -163,6 +163,7 @@ async def create_key(
             tenant_id=tenant_id,
             is_admin=body.is_admin,
             allowed_models=body.allowed_models,
+            allowed_tools=body.allowed_tools,
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
             max_concurrency=body.max_concurrency,
@@ -264,6 +265,7 @@ async def update_key(
         budget_changed = "max_budget_usd" in updates
         for field in (
             "allowed_models",
+            "allowed_tools",
             "rpm_limit",
             "tpm_limit",
             "max_concurrency",
@@ -351,6 +353,7 @@ async def create_tenant(
             display_name=body.display_name,
             is_active=body.is_active,
             allowed_models=body.allowed_models,
+            allowed_tools=body.allowed_tools,
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
             pricing_markup_pct=body.pricing_markup_pct,
@@ -422,6 +425,7 @@ async def update_tenant(
             "display_name",
             "is_active",
             "allowed_models",
+            "allowed_tools",
             "rpm_limit",
             "tpm_limit",
             "pricing_markup_pct",

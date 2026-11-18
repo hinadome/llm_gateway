@@ -321,6 +321,23 @@ gateway/
 │   │                       (per-key model_mappings → real names → global aliases →
 │   │                       key default_model → global default) before any check,
 │   │                       so permissions/caches/scopes/logs see one name;
+│   │                       step 1.1 checks the tool-call policy (tier 30):
+│   │                       allowed_tools fnmatch patterns on the key (platform
+│   │                       admins exempt) and pooled on the tenant (no bypass —
+│   │                       a declared tool must pass BOTH, tenant only narrows);
+│   │                       None = unrestricted and tool-less requests are
+│   │                       unchanged; a violation 400s tool_not_allowed naming
+│   │                       up to five offenders, and an unnameable tool fails
+│   │                       closed as <unnamed>. One shared check covers every
+│   │                       inbound surface — OpenAI chat, Responses, native
+│   │                       Anthropic/Gemini all normalize tools to the OpenAI
+│   │                       shape before the pipeline (_tool_names reads
+│   │                       function.name, then a top-level name extra);
+│   │                       step 4.6 re-checks it after the guardrail phase (a
+│   │                       guardrail overlaying tools via
+│   │                       modified_request_fields can never inject a tool
+│   │                       past the allowlist — the same hard boundary model
+│   │                       redirects get at 4.5);
 │   │                       step 0.5 applies the prompt policy (core/prompts.py) —
 │   │                       managed system prompt + {{variables}} — before guardrails
 │   │                       and cache lookup, so checks and cache identity see the
@@ -1168,6 +1185,7 @@ sequenceDiagram
     Note over P: 0. model resolution (key model_mappings → real name →<br/>global aliases → key/global default_model).<br/>Resolved name drives every later check,<br/>original kept in log request_body)
     Note over P: 0.5 prompt policy (managed system prompt prepended<br/>when the request has none, template variables resolved,<br/>client system messages always win, prompt-library refs<br/>resolve to the active version, fail-closed 400<br/>when the name has none) — before<br/>guardrails and cache identity, deliberately
     Note over P: 1. model permission (fnmatch vs allowed_models,<br/>platform admins exempt, then the TENANT allowlist,<br/>which binds every member, no bypass)
+    Note over P: 1.1 tool-call policy (fnmatch vs allowed_tools,<br/>same two layers as models: key patterns,<br/>admins exempt, then the tenant's — no bypass,<br/>a tool must pass BOTH, tenant only narrows).<br/>A declared tool outside the lists 400s<br/>tool_not_allowed naming the offenders.<br/>Every inbound surface funnels through this<br/>one check — all normalize tools to the<br/>OpenAI shape before the pipeline
     Note over P: 1.5 runaway jail check (loop-detection cooldown:<br/>identical-fingerprint hits at threshold jail the key,<br/>escalating cooldown) — BEFORE rate limit,<br/>idempotency and cache: nothing a stuck agent<br/>sends is useful, not even a replay or a free hit.<br/>Admin/env-key traffic exempt (no key id)
     Note over P: 2. rate limit RPM/TPM (sliding window) — then the<br/>pooled tenant window (tenant:{id} namespace)
     Note over P: 2b. Idempotency-Key replay (caller-keyed store +<br/>in-flight map): a retry replays the stored<br/>success — no re-execution, zero cost. BEFORE<br/>budget on purpose: the original was authorized
@@ -1186,6 +1204,7 @@ sequenceDiagram
     alt a guardrail modifies (messages, model redirect, fields)
         G-->>P: modified request
         Note over P: 4.5 redirect re-validation: allowlist<br/>re-checked against the new model (fail closed),<br/>ctx.model/span updated — logs, scopes,<br/>cache identity and routing see the final model
+        Note over P: 4.6 tool-policy re-check: a guardrail may<br/>overlay tools (modified_request_fields) —<br/>the policy is a hard boundary, re-checked<br/>so a guardrail can never inject a tool past<br/>the key's allowlist (same fail-closed shape<br/>as the model redirect re-check above)
     end
 
     Note over P: 4. cache lookup (exact hash match,<br/>then semantic similarity if enabled) — keys salted<br/>by the response-policy token (tenant + active<br/>response-capable guardrails): entries never cross<br/>tenants or policies, identical-policy keys share
@@ -1312,6 +1331,7 @@ erDiagram
         str display_name "free-form label for dashboards"
         bool is_active "false = kill switch for every member key"
         json allowed_models "fnmatch patterns, NULL = all"
+        json allowed_tools "pooled fnmatch over tool names members may declare, NULL = all"
         int rpm_limit "pooled requests/min, NULL = unlimited"
         int tpm_limit "pooled tokens/min, NULL = unlimited"
         float max_budget_usd "pooled across member keys"
@@ -1338,6 +1358,7 @@ erDiagram
         bool is_admin "platform admin (tenant_id NULL) or tenant admin"
         str tenant_id FK "NULL = platform key, no tenant checks"
         json allowed_models "fnmatch patterns, NULL = all"
+        json allowed_tools "fnmatch over tool names this key may declare, NULL = all"
         int rpm_limit "requests/min, NULL = unlimited"
         int tpm_limit "tokens/min, NULL = unlimited"
         int max_concurrency "in-flight upstream cap, NULL = unlimited"
@@ -1454,7 +1475,7 @@ erDiagram
     BATCH ||--o{ BATCH_RESULT : "batch_id"
 ```
 
-**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays.
+**Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays.
 
 Storage is swappable at the engine level: `GATEWAY_DATABASE_URL=sqlite+aiosqlite:///...` → `postgresql+asyncpg://...` (the `postgres` extra, asyncpg) with no code changes — only async SQLAlchemy is used. JSON columns compile to JSONB on PostgreSQL via a shared variant type (`JSONColumn` in `models.py`), which keeps the budget-alert compare-and-swap meaningful there (semantic JSONB equality; plain `json` has no `=` operator); PostgreSQL engines also pre-ping pooled connections so server-side drops recycle instead of surfacing as 500s. The whole test suite runs against either backend — `GATEWAY_TEST_DATABASE_URL` points `conftest` at a live PostgreSQL server, where each test gets its own database (created and dropped around the run; the `VACUUM INTO` backup tests skip, and a test pins the `pg_dump`-pointing 400 refusal). Online backups stay SQLite-only by construction.
 

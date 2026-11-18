@@ -8,6 +8,31 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Tool-call policy (MCP-lite) — the agent-era sibling of model
+  allowlists: `allowed_tools` on a virtual key (and pooled on its
+  tenant) is a list of fnmatch patterns over the tool NAMES a request
+  may declare, with exactly allowed_models' mechanics (None = all
+  tools, an explicit-null PATCH clears, admin API + admin UI fields
+  on the key/tenant dialogs with b-teal badges on the rows). One
+  shared check runs at phase 1.1, right after model permission, and
+  every inbound surface funnels through it because all of them —
+  OpenAI chat, the Responses bridge, native Anthropic, native Gemini
+  — normalize tools into the OpenAI shape before the pipeline.
+  Two layers like every ceiling: the key's patterns (platform admins
+  bypass — they are the operators) and the tenant's pooled patterns
+  (no bypass; binds every member, tenant admins included — a tool
+  must pass BOTH lists, so the tenant can only narrow). A request
+  declaring a tool that matches neither list fails with a 400
+  tool_not_allowed naming up to five offenders (the caller sent the
+  names — nothing to leak, everything to debug). Guardrails can
+  overlay tools (request-phase modified_request_fields); the policy
+  is re-checked at 4.6 after the guardrail phase, so a guardrail can
+  never inject a tool past the key's allowlist — the same hard
+  boundary model redirects get at 4.5. A tool whose name cannot be
+  extracted (an exotic future tool type) fails closed as <unnamed>.
+  Requests without tools pass trivially, and callers with no
+  allowed_tools anywhere are byte-for-byte unchanged. 7 new tests
+  (tests/test_tool_policy.py); full suite 981 passing.
 - Prompt compression guardrail — the remediation counterpart of
   context_window: where that guardrail blocks (or redirects) an
   over-window request, prompt_compression deterministically

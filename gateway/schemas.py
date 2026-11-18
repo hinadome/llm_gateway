@@ -346,6 +346,10 @@ class KeyCreateRequest(_ResidencyRequirement):
     # endpoint (platform-only endpoints stay 403). Not patchable later.
     is_admin: bool = False
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
+    # Tool-call policy (tier 30, MCP-lite): fnmatch patterns over tool
+    # names this key may declare (None = all). A declared tool must pass
+    # both the key's and the tenant's patterns — the tenant narrows.
+    allowed_tools: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
     # Concurrency admission: max simultaneous upstream requests (None
@@ -391,6 +395,7 @@ class KeyCreateRequest(_ResidencyRequirement):
 
 class KeyUpdateRequest(_ResidencyRequirement):
     allowed_models: list[str] | None = None
+    allowed_tools: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
     max_concurrency: int | None = Field(default=None, ge=1)
@@ -423,6 +428,10 @@ class TenantCreateRequest(_ResidencyRequirement):
     display_name: str | None = Field(default=None, max_length=128)
     is_active: bool = True
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
+    # Tool-call policy (tier 30, MCP-lite): fnmatch patterns over tool
+    # names this key may declare (None = all). A declared tool must pass
+    # both the key's and the tenant's patterns — the tenant narrows.
+    allowed_tools: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
     # Cost-plus billing: percent markup on provider cost (20.0 = bill
@@ -449,6 +458,7 @@ class TenantUpdateRequest(_ResidencyRequirement):
     display_name: str | None = Field(default=None, max_length=128)
     is_active: bool | None = None
     allowed_models: list[str] | None = None
+    allowed_tools: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
     pricing_markup_pct: float | None = Field(default=None, ge=0, le=1000)

@@ -50,6 +50,10 @@ class VirtualKey(Base):
     # own limits and the tenant's; the tenant can only narrow.
     tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     allowed_models: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    # Tool-call policy (tier 30, MCP-lite): fnmatch patterns over the
+    # tool names this key may declare. None = all tools. A declared tool
+    # must pass both this and the tenant's patterns — tenant only narrows.
+    allowed_tools: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Concurrency admission (tier 27): max simultaneous UPSTREAM
@@ -131,6 +135,7 @@ class VirtualKey(Base):
             "is_admin": self.is_admin,
             "tenant_id": self.tenant_id,
             "allowed_models": self.allowed_models,
+            "allowed_tools": self.allowed_tools,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "max_concurrency": self.max_concurrency,
@@ -188,6 +193,10 @@ class Tenant(Base):
     display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     allowed_models: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
+    # Pooled tool policy: fnmatch patterns binding every member key.
+    # None = the tenant sets no tool policy; a tool must pass both the
+    # key's and these patterns.
+    allowed_tools: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Cost-plus billing: percent markup on the provider cost of every
@@ -234,6 +243,7 @@ class Tenant(Base):
             "display_name": self.display_name,
             "is_active": self.is_active,
             "allowed_models": self.allowed_models,
+            "allowed_tools": self.allowed_tools,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "pricing_markup_pct": self.pricing_markup_pct,

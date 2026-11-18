@@ -43,6 +43,7 @@ from ..errors import (
     ModelNotAllowedError,
     ProviderError,
     RateLimitError,
+    ToolsNotAllowedError,
 )
 from .prompt_library import CandidatePrompt, PromptLibrary, ResolvedPrompt
 from ..guardrails.manager import GuardrailManager
@@ -480,6 +481,12 @@ class GatewayPipeline:
         # 1. Model permission: key allowlist (platform admins bypass
         # inside) + the tenant's allowlist, which binds every member.
         self._check_model_permission(ctx.auth, request.model)
+        # 1.1 Tool-call policy: which tools this key may DECLARE. Same
+        # two-layer shape as model permission (key + tenant, tenant
+        # only narrows, admins exempt) — one check shared by every
+        # inbound surface, since all of them normalize tools into the
+        # OpenAI shape before the pipeline.
+        self._check_tool_policy(ctx, request)
         return request
 
     async def _apply_request_guardrails(
@@ -515,6 +522,11 @@ class GatewayPipeline:
             ctx.context_window = self._model_windows.get(request.model)
             if ctx.otel_span is not None:
                 ctx.otel_span.set_attribute("gateway.model", request.model)
+        # 4.6 Tool-policy re-check: a guardrail may have overlaid
+        # ``tools`` (modified_request_fields). The policy is a hard
+        # boundary — a guardrail must never be able to inject tools
+        # past the key's allowlist, exactly like model redirects above.
+        self._check_tool_policy(ctx, request)
         return request
 
     async def _handle(
@@ -1750,6 +1762,78 @@ class GatewayPipeline:
         if auth.tenant_id is not None and tenant_patterns:
             if not any(fnmatch.fnmatch(model, pattern) for pattern in tenant_patterns):
                 raise ModelNotAllowedError(model)
+
+    @staticmethod
+    def _tool_names(request: "ChatCompletionRequest") -> list[str]:
+        """Names of the tools a request declares. OpenAI shape (every
+        inbound surface normalizes to it): ``function`` tools carry the
+        name on ``function.name``; custom tool types may carry a
+        top-level ``name`` extra. Unnameable tools surface as
+        "<unnamed>" so a policy still fails closed against them."""
+        names: list[str] = []
+        for tool in request.tools or []:
+            if tool.function is not None and tool.function.name:
+                names.append(tool.function.name)
+                continue
+            extra = tool.model_extra or {}
+            name = extra.get("name")
+            names.append(str(name) if name else "<unnamed>")
+        return names
+
+    def _check_tool_policy(
+        self, ctx: RequestContext, request: "ChatCompletionRequest"
+    ) -> None:
+        """Tool-call policy (tier 30, MCP-lite): which tool names a
+        request may DECLARE. Same two-layer shape as model permission —
+        the key's ``allowed_tools`` (platform admins bypass; they are
+        the operators) and the tenant's pooled ``allowed_tools`` (no
+        bypass; binds every member — the tenant can only narrow). A
+        tool must match BOTH lists. None = no restriction: callers
+        without the field anywhere are completely unchanged. Requests
+        with no tools pass trivially — the check costs two fnmatch
+        lists against an empty set.
+
+        Fail-closed detail: a tool whose name cannot be extracted is
+        treated as non-compliant — a policy the request can't prove it
+        passes is a policy it fails.
+        """
+        import fnmatch
+
+        names = self._tool_names(request)
+        if not names:
+            return
+        if not ctx.auth.is_admin:
+            patterns = ctx.auth.allowed_tools
+            if patterns and not all(
+                any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+                for name in names
+            ):
+                raise ToolsNotAllowedError(
+                    [
+                        name
+                        for name in names
+                        if not any(
+                            fnmatch.fnmatch(name, pattern) for pattern in patterns
+                        )
+                    ]
+                )
+        # The tenant layer has no admin bypass — same as models.
+        tenant_patterns = ctx.auth.tenant_allowed_tools
+        if ctx.auth.tenant_id is not None and tenant_patterns:
+            if not all(
+                any(fnmatch.fnmatch(name, pattern) for pattern in tenant_patterns)
+                for name in names
+            ):
+                raise ToolsNotAllowedError(
+                    [
+                        name
+                        for name in names
+                        if not any(
+                            fnmatch.fnmatch(name, pattern)
+                            for pattern in tenant_patterns
+                        )
+                    ]
+                )
 
     async def _check_runaway(
         self, ctx: RequestContext, request: ChatCompletionRequest

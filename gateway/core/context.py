@@ -28,6 +28,10 @@ class AuthContext:
     tenant_id: str | None = None
     tenant_name: str | None = None
     tenant_allowed_models: list[str] | None = None  # fnmatch; None = tenant allows all
+    # Pooled tool policy: binds every member key (the ceiling pattern —
+    # a tool must pass BOTH the key's and the tenant's patterns, so the
+    # tenant can only narrow). None = the tenant sets no tool policy.
+    tenant_allowed_tools: list[str] | None = None
     tenant_rpm_limit: int | None = None
     tenant_tpm_limit: int | None = None
     tenant_max_budget_usd: float | None = None
@@ -49,6 +53,13 @@ class AuthContext:
     # member key must pass both its own cap and the tenant's.
     tenant_max_concurrency: int | None = None
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
+    # Tool-call policy (tier 30, MCP-lite): fnmatch patterns over the
+    # tool names a request may DECLARE (the `tools` field, every
+    # inbound surface — OpenAI chat, Responses, native Anthropic/Gemini
+    # all normalize to it). None = all tools allowed; a request
+    # declaring a tool that matches neither the key's nor the tenant's
+    # patterns 400s tool_not_allowed. Admin/env keys exempt.
+    allowed_tools: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
     # Concurrency admission (tier 27): max simultaneous UPSTREAM

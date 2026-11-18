@@ -142,6 +142,29 @@ class ModelNotAllowedError(GatewayError):
         )
 
 
+class ToolsNotAllowedError(GatewayError):
+    """Tool-call policy (tier 30): the request declares tools this key
+    (or its tenant) may not use. Unlike model permission this is a 400
+    naming the offending tools — the caller sent them, so there is no
+    existence to leak and a debuggable error beats a mysterious one."""
+
+    def __init__(self, tools: list[str]) -> None:
+        listed = ", ".join(sorted(tools)[:5]) + (
+            f" (+{len(tools) - 5} more)" if len(tools) > 5 else ""
+        )
+        super().__init__(
+            status_code=400,
+            message=(
+                f"This API key may not use the following tools: {listed}. "
+                "Remove them from the request or contact the operator to "
+                "extend the key's allowed_tools."
+            ),
+            error_type="invalid_request_error",
+            code="tool_not_allowed",
+            param="tools",
+        )
+
+
 class ModelNotFoundError(GatewayError):
     def __init__(self, model: str) -> None:
         super().__init__(

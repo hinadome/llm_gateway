@@ -103,6 +103,7 @@ def auth_context_from_key(
         tenant_id=(tenant.id if tenant is not None else None),
         tenant_name=(tenant.name if tenant is not None else None),
         tenant_allowed_models=(tenant.allowed_models if tenant is not None else None),
+        tenant_allowed_tools=(tenant.allowed_tools if tenant is not None else None),
         tenant_rpm_limit=(tenant.rpm_limit if tenant is not None else None),
         tenant_tpm_limit=(tenant.tpm_limit if tenant is not None else None),
         tenant_max_budget_usd=(
@@ -135,6 +136,7 @@ def auth_context_from_key(
             tenant.max_concurrency if tenant is not None else None
         ),
         allowed_models=vkey.allowed_models,
+        allowed_tools=vkey.allowed_tools,
         rpm_limit=vkey.rpm_limit,
         tpm_limit=vkey.tpm_limit,
         max_concurrency=vkey.max_concurrency,
