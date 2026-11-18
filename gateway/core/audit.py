@@ -46,6 +46,11 @@ _MESSAGES = {
     "tenant.updated": "Tenant '{details[tenant_name]}' was updated by {actor} (fields: {details[fields]}).",
     "tenant.deleted": "Tenant '{details[tenant_name]}' was deleted by {actor}.",
     "breaker.reset": "Circuit breaker '{details[deployment]}' was reset by {actor}.",
+    "runaway.released": (
+        "Virtual key '{details[key_id]}' was released from the runaway-agent "
+        "cooldown jail by {actor} (jail, offense history and loop windows "
+        "cleared; a still-looping agent re-trips on fresh hits)."
+    ),
 }
 
 

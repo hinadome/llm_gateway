@@ -542,6 +542,37 @@ replay:
   enabled: true
   max_entries: 500
 
+# Runaway-agent protection: identical-request loop detection with an
+# escalating cooldown jail. An agent stuck in a loop (retry storm,
+# regenerating tool-call loop) sends the SAME request over and over at
+# a rate no legitimate caller produces — every request individually
+# legal, so RPM/TPM cannot see it. What identifies the runaway is the
+# fingerprint (the same normalized identity the response cache keys on)
+# repeated `identical_request_threshold` times inside the window. On
+# trip the KEY is jailed: every request from it answers 429
+# (rate_limit_exceeded + Retry-After) until the cooldown expires —
+# including would-be cache hits and idempotent replays; a still-looping
+# agent re-trips on fresh hits after the cooldown, escalating each
+# time (multiplier per offense, capped); a quiet reset_after_seconds
+# decays the offense count. Detection state is in-process (like the
+# idempotency in-flight map): a multi-replica fleet detects at
+# per-replica rate — bounded, just slower to trip. Chat-family
+# surfaces only (embeddings/images/audio are single-shot, not loops).
+# Admin: GET /admin/runaway (jail snapshot + config echo),
+# POST /admin/runaway/{key_id}/release (escape hatch, audited).
+# gateway_runaway_trips_total{key} counts trips; a `runaway.trip`
+# observer event fires per trip. Raise the threshold if you run
+# legitimate identical-request fan-out (benchmarks) through the
+# gateway.
+runaway:
+  enabled: true
+  identical_request_threshold: 10   # identical requests inside the window = a stuck loop
+  identical_request_window_seconds: 60
+  cooldown_seconds: 30              # first offense; repeats escalate
+  cooldown_multiplier: 2.0          # 30s -> 60s -> 120s ...
+  cooldown_max_seconds: 3600        # 1h ceiling
+  reset_after_seconds: 600         # quiet period that clears the offense count
+
 # Lifecycle events: subscribe handlers to the request-stage boundaries
 # (request.received / request.routed / response.completed / stream.* /
 # auth.rejected / key.* / budget.threshold / batch.* ...). Two kinds:

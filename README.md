@@ -47,6 +47,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **PII/secret scan** | On-demand audit over *stored* request bodies (`GET /admin/pii-scan` bulk, `GET /admin/logs/{id}/pii-scan` per row): the log keeps the original as received, so this is where exposure actually shows — clients paste API keys into prompts; guardrails may be off or only masking the upstream copy. Detectors mirror the `pii_redaction` guardrail plus jwt/private-key shapes, extendable via `pii_scan.extra_patterns`; findings are kind + count only, never the matched text (see [PII scan](#pii-scan)) |
 | **Idempotency keys** | Retry-safe chat completions: send an `Idempotency-Key` header on any chat-family surface (OpenAI chat, `/v1/responses`, native Anthropic/Gemini) and retried POSTs replay the stored successful response instead of re-executing — no double generation, no double billing (replays are zero-cost `cache_hit` log rows, `X-Gateway-Cache: IDEMPOTENT`). Only successes are stored; key reuse with different parameters is a 400; in-flight duplicates wait for the original. Same backend selection as the response cache, namespaced apart (see [Idempotency](#idempotency)) |
 | **Capture-replay harness** | Config-change safety net built on the request log: `GET /admin/logs/export` captures real traffic as JSONL (bodies + the recorded baseline: caller, route, model, status, deployment, guardrail verdicts), `POST /admin/replay` re-executes those requests through the request-policy phases ONLY — resolution, prompt policy, permissions, guardrails, routing selection — with no upstream calls, no counters, no spend, no log rows, then **diffs** each line against the record. Replays run as the recorded caller's *current* key (edited/revoked keys replay under what they are *now* — a revoked key shows up as would-now-401), guardrail counters are suppressed so a harness run can never trip block alerts, and tenant admins replay only their own tenant's traffic (see [Capture-replay harness](#capture-replay-harness)) |
+| **Runaway-agent protection** | Identical-request loop detection with an escalating cooldown jail: an agent stuck in a retry/tool loop sends the *same* request over and over — every one individually legal, so RPM/TPM can't see it. The fingerprint (the cache's normalized request identity — stable across chat/Responses/native routes, stream or not) repeated `threshold` times inside the window trips, and the *key* answers 429 + `Retry-After` for everything until the cooldown expires — would-be cache hits and idempotent replays included. Re-trips escalate (30s → 60s → ... capped), a quiet period decays the offense count, `GET /admin/runaway` shows the jail and `POST /admin/runaway/{key_id}/release` is the escape hatch; `runaway.trip` event + `gateway_runaway_trips_total{key}` (see [Runaway-agent protection](#runaway-agent-protection)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model — including **provider prompt-cache discounts**: cached input tokens (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, Gemini `cachedContentTokenCount`) bill at the `cached_input` price, default 50% of input |
@@ -223,6 +224,8 @@ Things to know when pointing a framework at the gateway:
 | `GET /admin/usage/export` | Billing / chargeback export: `format=csv\|json`, `since`/`until` (ISO-8601, default last 30 days), `key_name`/`model`/`status`/`tenant_id` filters, `include_shadow`; JSON adds totals + per-key/model/status aggregates (+ per-tenant for platform admins); tenant admins export their own tenant only |
 | `GET /admin/routing` | The routing table (public models → deployments, with each deployment's circuit-breaker state; shadow deployments flagged with their mirror fraction) |
 | `POST /admin/routing/breakers/{deployment}/reset` | Force-close a deployment's circuit (next request probes it again) |
+| `GET /admin/runaway` | Runaway-agent protection view: keys currently in the loop-detection cooldown jail (remaining cooldown, offense count, key name), the live `runaway:` config echo and the `enabled` flag. In-process state — a multi-replica fleet reports its own jail here (platform admin) |
+| `POST /admin/runaway/{key_id}/release` | Release a key from the runaway jail (escape hatch): clears the jail, the offense history and the loop windows — the key serves again immediately, and a still-looping agent re-trips from a *first-offense* cooldown. Audited as `runaway.released` |
 | `GET /admin/guardrails` | Registered guardrails, their params and mode (enforce/observe) |
 | `POST /admin/reload` | **Hot-reload config.yaml** without a restart (same as SIGHUP): guardrails, models/deployments, routing policy, pricing and prompt knobs swap in place; an invalid config is a 400 with the running one untouched; fields that cannot be hot-swapped (provider credentials, auth chain, cache backends, telemetry) are listed in `restart_required` |
 | `POST /admin/backup` | Snapshot the SQLite database (online `VACUUM INTO` — consistent copy of the live DB, no downtime) into `GATEWAY_BACKUP_DIR`; returns name + size. SQLite-only: with a PostgreSQL `GATEWAY_DATABASE_URL` the call is refused with a 400 (`backup_not_supported`) — use `pg_dump` |
@@ -583,6 +586,35 @@ The rules, so the accounting is never surprising:
 - Rounding matches the calculator's (8 decimals), so `billed = cost × (1 + pct/100)` reconciles exactly against the log.
 
 10 tests pin the contract (`tests/test_tenant_markup.py`).
+
+## Runaway-agent protection
+
+Agents get stuck: a retry storm without backoff, a tool-call loop that regenerates forever, a temperature-zero do/while. Each request is individually legal, so RPM/TPM never trips — what identifies the runaway is the **fingerprint** (the response cache's normalized request identity) repeated `identical_request_threshold` times inside `identical_request_window_seconds` (default: 10 in 60s — above any sane retry pattern; raise it if you run legitimate identical-request fan-out, e.g. benchmarks, through the gateway).
+
+On trip, the **key** enters a cooldown jail: every request from it answers `429 rate_limit_exceeded` + `Retry-After` until the cooldown expires — including requests the response cache would serve free and idempotency replays. Nothing a stuck agent sends is useful.
+
+The semantics that keep it safe:
+
+- **Escalating** — a still-looping agent re-trips after the cooldown, and the sentence doubles per offense (`cooldown_multiplier`, capped at `cooldown_max_seconds`); a quiet `reset_after_seconds` decays the offense count.
+- **Punishment, not a grudge** — loop windows are cleared on trip: after the cooldown a single investigation retry passes while a real loop re-trips on fresh hits.
+- **Cross-surface** — the fingerprint is the normalized request, stable across OpenAI chat / `/v1/responses` / native Anthropic & Gemini, and streaming doesn't change it: an agent looping across surfaces or alternating stream flags is still one loop.
+- **Exemptions** — admin/env-key traffic (no key id) is exempt, like every key-layer ceiling. Chat-family only: embeddings/images/audio are single-shot surfaces, not loops.
+- **Hot-reloadable** — thresholds read the live config per call; jail state survives a reload (same trade the router makes with breakers). In-process detection state (like the idempotency in-flight map): a multi-replica fleet detects at per-replica rate — bounded, just slower to trip.
+
+Observability: `runaway.trip` observer event (`key_name`, `model`, `count`, `threshold`, `cooldown_seconds`, `offenses` — alarm or revoke from your orchestration layer), `gateway_runaway_trips_total{key}` counter, and the admin surface — `GET /admin/runaway` (jail snapshot + config echo, key names joined) and `POST /admin/runaway/{key_id}/release` (the escape hatch: clears jail, offense history and loops; audited as `runaway.released`; a released key that loops again starts at the first-offense cooldown).
+
+```yaml
+runaway:
+  enabled: true
+  identical_request_threshold: 10   # identical requests inside the window = a stuck loop
+  identical_request_window_seconds: 60
+  cooldown_seconds: 30              # first offense; repeats escalate
+  cooldown_multiplier: 2.0          # 30s -> 60s -> 120s ...
+  cooldown_max_seconds: 3600        # 1h ceiling
+  reset_after_seconds: 600         # quiet period that clears the offense count
+```
+
+14 tests pin the contract (`tests/test_runaway.py`).
 
 ## Architecture
 
@@ -1007,6 +1039,7 @@ Because the OpenAI adapter is a passthrough, you can point `providers.openai.api
 | `gateway_key_label_overflow_total` | counter | per-key labels collapsed into `__overflow__` past `metrics.per_key_max_series` distinct keys |
 | `gateway_shadow_requests_total` | counter | deployment, outcome (success / error) — requests mirrored to shadow deployments (never affect the client) |
 | `gateway_shadow_latency_seconds` | histogram | deployment — latency of mirrored (shadow) upstream calls |
+| `gateway_runaway_trips_total` | counter | key — runaway-agent loop detections (each trip jails the key for an escalating cooldown) |
 
 **Request logs (always on)** — every request lands in the DB (request/response bodies, guardrail decisions, tokens, cost, latency, cache status; streamed rows additionally carry `ttft_ms` — milliseconds from request start to the first content-bearing chunk off the wire — and the derived decode rate, completion tokens per second after the first token) and is queryable via `GET /admin/logs` and `GET /admin/stats` (which reports TTFT percentiles over streamed rows). TTFT semantics: provider-side (cache-hit replays record `NULL`, same rule as wire capture — nothing went on the wire); the Prometheus `gateway_stream_ttft_seconds` histogram is the client-side counterpart (first chunk delivered, cache hits included). Three compliance knobs in `logging:`: `store_bodies: false` stops persisting request/response bodies (metadata — tokens, cost, latency, status, guardrail verdicts — still is; note `guardrail_actions` details and `error_message` may still quote traffic fragments), `retention_days` makes a background task delete older rows (counted on `gateway_logs_pruned_total`), and `background_write: true` queues the row INSERT to a background consumer instead of awaiting it in the response path — see the design notes below for the trade.
 

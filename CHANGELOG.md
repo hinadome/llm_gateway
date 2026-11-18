@@ -8,6 +8,45 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Runaway-agent protection — identical-request loop detection with an
+  escalating cooldown jail. Agents stuck in loops (retry storms,
+  regenerating tool-call loops) send the SAME request over and over;
+  every one is individually legal, so RPM/TPM ceilings cannot see
+  them. The detector fingerprints each chat-family request with the
+  same normalized identity the response cache and idempotency key on
+  (sha256 of cache_payload_for — stable across OpenAI chat /
+  /v1/responses / native Anthropic & Gemini, and stream is not part
+  of the identity, so a loop alternating stream flags is one loop)
+  and counts hits per (key, fingerprint) inside a sliding window;
+  reaching the threshold (default 10 in 60s) jails the KEY: every
+  request from it answers 429 rate_limit_exceeded + Retry-After
+  until the cooldown expires — including would-be cache hits and
+  idempotent replays, because nothing a stuck agent sends is useful.
+  The tripping request itself is refused. Re-trips escalate
+  geometrically (30s -> 60s -> ... capped at 1h; the offense ledger
+  survives jail expiry, decays after a quiet reset_after_seconds),
+  and loop windows are CLEARED on trip: after the cooldown a human's
+  single investigation retry passes while a still-looping agent
+  re-trips on fresh hits. Phase 1.5 in _handle — before rate limit,
+  idempotency, budget and cache. Admin/env-key traffic (no key_id)
+  is exempt, like every key-layer ceiling; embeddings/images/audio
+  (_serve_simple) are out of scope, honestly: single-shot surfaces,
+  not loops. Thresholds read the live config per call (hot reload
+  applies; jail state survives, same trade the router makes with
+  breakers); detection state is in-process (like the idempotency
+  in-flight map): a multi-replica fleet detects at per-replica rate
+  — bounded, just slower to trip. The clock is injectable for tests.
+  Surface: runaway: config section (enabled, threshold, window,
+  cooldown, multiplier, cap, reset_after); observer-only
+  runaway.trip event (key_name, model, count, threshold, window,
+  cooldown_seconds, offenses — never interceptable, the jail is the
+  decision); gateway_runaway_trips_total{key} counter (KeyLabeler-
+  capped cardinality, always emitted); GET /admin/runaway (platform
+  admin: jail snapshot with remaining cooldown/offenses + key-name
+  join + live config echo) and POST /admin/runaway/{key_id}/release
+  (escape hatch — clears jail, offense history and loop windows, so
+  a re-trip starts at the first-offense cooldown; audited as
+  runaway.released). 14 new tests (tests/test_runaway.py).
 - Tenant pricing markup — cost-plus billing for resellers/chargeback.
   A tenant can carry pricing_markup_pct (e.g. 20.0 = bill member-key
   traffic at 1.2x provider cost), applied to every modality and every

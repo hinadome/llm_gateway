@@ -1600,6 +1600,74 @@ async def guardrails(raw_request: Request, admin: Annotated[AuthContext, Depends
 
 
 # ----------------------------------------------------------------------
+# Runaway-agent protection: jail view + release
+# ----------------------------------------------------------------------
+
+
+@router.get("/admin/runaway")
+async def runaway_view(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Runaway-agent protection: currently jailed keys (with remaining
+    cooldown and offense count), the live config echo, and the lifetime
+    trip count per key. Read-only — POST .../release is the escape
+    hatch. In-process state, so a multi-replica fleet reports its own
+    jail here."""
+    pipeline = raw_request.app.state.pipeline
+    protector = pipeline.runaway
+    cfg = pipeline.config.runaway
+    jailed = await protector.snapshot() if protector is not None else []
+    # Join the key rows for display names — the jail stores key ids.
+    names: dict[str, str] = {}
+    ids = [entry["key_id"] for entry in jailed]
+    if ids:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            rows = await session.execute(
+                select(VirtualKey).where(VirtualKey.id.in_(ids))
+            )
+            names = {vk.id: vk.name for vk in rows.scalars()}
+    return {
+        "enabled": cfg.enabled,
+        "config": cfg.model_dump(),
+        "jailed": [
+            {**entry, "key_name": names.get(entry["key_id"])}
+            for entry in jailed
+        ],
+    }
+
+
+@router.post("/admin/runaway/{key_id}/release")
+async def runaway_release(
+    key_id: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Release a key from the runaway cooldown jail: clears the jail,
+    the offense history (so a re-trip starts back at the first-offense
+    cooldown, not escalated) and the loop windows. The key serves again
+    immediately; a genuinely still-looping agent re-trips on fresh hits."""
+    protector = raw_request.app.state.pipeline.runaway
+    if protector is None:  # standalone pipeline construction — never via create_app
+        raise GatewayError(
+            404, "Runaway-agent protection is not active.", "invalid_request_error"
+        )
+    released = await protector.release(key_id)
+    if not released:
+        raise GatewayError(
+            404,
+            f"Key '{key_id}' is not in a runaway cooldown jail.",
+            "invalid_request_error",
+            code="key_not_jailed",
+        )
+    raw_request.app.state.audit.record(
+        "runaway.released", actor=admin, key_id=key_id
+    )
+    return {"key_id": key_id, "released": True}
+
+
+# ----------------------------------------------------------------------
 # Operations: hot-reload + SQLite backup/restore
 # ----------------------------------------------------------------------
 

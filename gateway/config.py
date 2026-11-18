@@ -612,6 +612,49 @@ class ReplayConfig(BaseModel):
     max_entries: int = 500
 
 
+class RunawayConfig(BaseModel):
+    """Runaway-agent protection: loop detection with an escalating
+    cooldown jail.
+
+    An agent stuck in a loop — a retry storm, a tool-call loop that
+    regenerates forever, a temperature-zero do/while — sends the SAME
+    request over and over at a rate no legitimate caller produces.
+    RPM/TPM ceilings cannot see it (each request is individually
+    legal); what identifies the runaway is the *fingerprint* — the
+    same normalized request identity the response cache keys on —
+    repeated ``identical_request_threshold`` times inside
+    ``identical_request_window_seconds``.
+
+    On trip the *key* enters a cooldown jail: every request from it
+    answers 429 (``rate_limit_exceeded`` + ``Retry-After``) until the
+    cooldown expires — including requests that would otherwise hit
+    the response cache or replay an idempotency entry, because
+    nothing a stuck agent sends is useful. Re-trips escalate
+    (``cooldown_multiplier`` per offense, capped at
+    ``cooldown_max_seconds``); a quiet ``reset_after_seconds`` decays
+    the offense count back to zero. Detection state is in-process
+    (like the idempotency in-flight map): a multi-replica fleet
+    detects at per-replica rate — bounded, just slower to trip.
+    """
+
+    enabled: bool = True
+    # Identical fingerprints (>= threshold) within the window = a
+    # stuck loop. The tripping request itself is refused. Deliberately
+    # above any sane retry/backoff pattern (<=5/min) — raise it if you
+    # run legitimate identical-request fan-out (benchmarks) through
+    # the gateway.
+    identical_request_threshold: int = 10
+    identical_request_window_seconds: float = 60.0
+    # Cooldown jail: first offense lasts cooldown_seconds, each
+    # repeat multiplies (capped). While jailed, ALL the key's requests
+    # 429 with Retry-After.
+    cooldown_seconds: float = 30.0
+    cooldown_multiplier: float = 2.0
+    cooldown_max_seconds: float = 3600.0
+    # Quiet period (no trips) after which the offense count resets.
+    reset_after_seconds: float = 600.0
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -703,6 +746,7 @@ class GatewayConfig(BaseModel):
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
+    runaway: RunawayConfig = Field(default_factory=RunawayConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 

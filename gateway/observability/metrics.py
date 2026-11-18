@@ -35,6 +35,13 @@ MARKUP_USD = Counter(
     ["tenant"],
 )
 
+RUNAWAY = Counter(
+    "gateway_runaway_trips_total",
+    "Runaway-agent loop detections per virtual key (identical-request "
+    "threshold trips; each trip jails the key for an escalating cooldown).",
+    ["key"],
+)
+
 GUARDRAIL_BLOCKS = Counter(
     "gateway_guardrail_blocks_total",
     "Requests/chunks blocked by guardrails.",

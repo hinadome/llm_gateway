@@ -65,6 +65,7 @@ from .idempotency import IdempotencyStore
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
 from .cost import CostCalculator, cached_tokens_from_usage
+from .runaway import RunawayProtector
 from .events import EventBus
 from .logging_svc import LoggingService
 from .router import Router
@@ -163,6 +164,7 @@ class GatewayPipeline:
         prompt_library: PromptLibrary | None = None,
         events: EventBus | None = None,
         idempotency: IdempotencyStore | None = None,
+        runaway: RunawayProtector | None = None,
     ) -> None:
         self.config = config
         # Per-key metric series (metrics.per_key — opt-in; the labeler's
@@ -195,6 +197,10 @@ class GatewayPipeline:
         # entirely). Wraps a response-cache backend with caller-keyed
         # entries + in-flight dedup — see core/idempotency.py.
         self.idempotency = idempotency
+        # Runaway-agent protection (None = disabled — standalone
+        # constructions): loop detection + escalating cooldown jail —
+        # see core/runaway.py.
+        self.runaway = runaway
         # OTel API is a no-op until a provider is installed (spans are then
         # invalid and cost ~nothing), so this is safe unconditionally.
         self._tracer = tracer or trace.get_tracer("gateway")
@@ -506,6 +512,16 @@ class GatewayPipeline:
             key_name=ctx.auth.key_name,
         )
         request = await self._prepare_request_policy(request, ctx)
+
+        # 1.5 Runaway-agent protection (pre-flight): a key in a runaway
+        # cooldown fails fast — nothing a stuck agent sends is useful,
+        # not even an idempotent replay — and this request's fingerprint
+        # joins its loop window. The fingerprint is the same normalized
+        # request identity the response cache keys on, so an agent
+        # looping across routes (chat / responses / native) trips as
+        # one loop. Admin/env-key traffic (no key_id) is exempt, like
+        # every key-layer ceiling.
+        await self._check_runaway(ctx, request)
 
         # 2. Rate limit (pre-flight)
         estimated_tokens = sum(
@@ -1665,6 +1681,74 @@ class GatewayPipeline:
         if auth.tenant_id is not None and tenant_patterns:
             if not any(fnmatch.fnmatch(model, pattern) for pattern in tenant_patterns):
                 raise ModelNotAllowedError(model)
+
+    async def _check_runaway(
+        self, ctx: RequestContext, request: ChatCompletionRequest
+    ) -> None:
+        """Runaway-agent loop detection (pre-flight, chat-family). A key
+        in a runaway cooldown fails fast with Retry-After — nothing a
+        stuck agent sends is useful, not even an idempotent replay or a
+        request the response cache would serve free. Otherwise this
+        request's fingerprint (the same normalized identity the
+        response cache and idempotency key on — identical across the
+        chat/responses/native routes) joins the key's loop window; when
+        it reaches the configured identical-request threshold inside
+        the window, the key is jailed for an escalating cooldown and
+        the tripping request is refused."""
+        protector = self.runaway
+        cfg = self.config.runaway
+        key_id = ctx.auth.key_id
+        if protector is None or not cfg.enabled or key_id is None:
+            return
+        allowed, retry_after = await protector.check(key_id)
+        if not allowed:
+            raise RateLimitError(
+                "Runaway-agent protection: this key is in a "
+                f"loop-detection cooldown for another {retry_after:.0f}s — "
+                "identical-request retry loops are being refused. If this "
+                "is legitimate traffic, see the runaway: config section.",
+                retry_after=retry_after,
+            )
+        fingerprint = hashlib.sha256(cache_payload_for(request).encode()).hexdigest()
+        count = await protector.observe(
+            key_id,
+            fingerprint,
+            threshold=cfg.identical_request_threshold,
+            window_seconds=cfg.identical_request_window_seconds,
+        )
+        if count is None:
+            return
+        cooldown, offenses = await protector.trip(
+            key_id,
+            base_seconds=cfg.cooldown_seconds,
+            multiplier=cfg.cooldown_multiplier,
+            max_seconds=cfg.cooldown_max_seconds,
+            reset_after_seconds=cfg.reset_after_seconds,
+        )
+        metrics.RUNAWAY.labels(key=self._key_labeler.label(ctx.auth.key_name)).inc()
+        # Observer-only lifecycle event: an agent-orchestration layer
+        # can alarm (or revoke the key) on it. Deliberately not
+        # interceptable — the jail is the decision.
+        await self._emit(
+            "runaway.trip",
+            ctx,
+            key_name=ctx.auth.key_name,
+            model=ctx.model,
+            count=count,
+            threshold=cfg.identical_request_threshold,
+            window_seconds=cfg.identical_request_window_seconds,
+            cooldown_seconds=cooldown,
+            offenses=offenses,
+        )
+        raise RateLimitError(
+            "Runaway-agent protection: "
+            f"{count} identical requests to model '{ctx.model}' within "
+            f"{cfg.identical_request_window_seconds:.0f}s — a stuck agent "
+            f"loop. The key is in a {cooldown:.0f}s cooldown (repeats "
+            "escalate). Fix the agent's retry/tool loop, or tune the "
+            "runaway: config if this is legitimate load.",
+            retry_after=cooldown,
+        )
 
     async def _check_rate_limit(self, ctx: RequestContext, estimated_tokens: int) -> None:
         key = ctx.auth.key_id
