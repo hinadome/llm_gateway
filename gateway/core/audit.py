@@ -2,8 +2,8 @@
 external audit trail.
 
 An audit record is emitted whenever an administrator changes the security
-posture of the gateway — creating, updating or revoking a virtual key, or
-force-resetting a deployment's circuit breaker. Each record identifies
+posture of the gateway — creating, updating, rotating or revoking a
+virtual key, or force-resetting a deployment's circuit breaker. Each record identifies
 *who* did it (the admin key name and the auth chain step that
 authenticated them — ``admin_key``, ``jwt``, a custom step) and *what*
 changed, and is POSTed as JSON to the configured webhook
@@ -14,8 +14,8 @@ blocking the admin operation itself (records are delivered by a background
 task), failures logged and counted on
 ``gateway_audit_events_total{event,outcome}``. With no webhook configured,
 events are only counted as ``outcome="skipped"``. The raw key material of
-a newly created virtual key is never part of any record — it is shown to
-the administrator exactly once and then nowhere.
+a newly created or rotated virtual key is never part of any record — it is
+shown to the administrator exactly once and then nowhere.
 """
 
 from __future__ import annotations
@@ -41,6 +41,10 @@ logger = logging.getLogger("gateway.audit")
 _MESSAGES = {
     "key.created": "Virtual key '{details[key_name]}' was created by {actor}.",
     "key.updated": "Virtual key '{details[key_name]}' was updated by {actor} (fields: {details[fields]}).",
+    "key.rotated": (
+        "Virtual key '{details[key_name]}' was rotated by {actor} "
+        "(grace window: {details[grace_seconds]}s)."
+    ),
     "key.revoked": "Virtual key '{details[key_name]}' was revoked by {actor}.",
     "tenant.created": "Tenant '{details[tenant_name]}' was created by {actor}.",
     "tenant.updated": "Tenant '{details[tenant_name]}' was updated by {actor} (fields: {details[fields]}).",

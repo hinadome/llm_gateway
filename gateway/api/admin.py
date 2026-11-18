@@ -50,6 +50,7 @@ from ..observability.metrics import PII_FINDINGS
 from ..schemas import (
     ChatCompletionRequest,
     KeyCreateRequest,
+    KeyRotateRequest,
     KeyUpdateRequest,
     PlaygroundChatRequest,
     PromotionRequest,
@@ -271,6 +272,12 @@ async def update_key(
         updates = body.model_dump(exclude_unset=True)
         if "expires_at" in updates:
             vkey.expires_at = _parse_expires(updates.pop("expires_at"))
+        if "grace_until" in updates:
+            # Rotation grace management: an explicit null ends the
+            # previous credential's window at once (the incident knob
+            # when the old key leaked mid-rotation); a future timestamp
+            # re-arms or extends it.
+            vkey.grace_until = _parse_expires(updates.pop("grace_until"))
         if "allowed_endpoints" in updates:
             _validate_scoping(updates["allowed_endpoints"])
         # Re-homing a key is a platform-admin operation — a tenant admin
@@ -360,6 +367,70 @@ async def revoke_key(
             "key.revoked", actor=admin, key_id=key_id, key_name=vkey.name
         )
         return {"id": key_id, "revoked": True}
+
+
+@router.post("/admin/keys/{key_id}/rotate")
+async def rotate_key(
+    key_id: str,
+    body: KeyRotateRequest,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """Replace a key's credential; the row keeps its identity.
+
+    Name, tenant, budgets, spend, limits, logs and policies all stay
+    with the row — callers switch credentials without switching
+    identity. The new raw key is returned exactly once (like creation);
+    only its hash is stored. ``grace_seconds`` keeps the *previous*
+    credential authenticating as the same key until the window ends;
+    0 (the default) is an immediate cutover — the old credential then
+    fails with an explicit "rotated" error, not a generic 401. Rotating
+    again replaces the previous credential outright: an older one
+    stops working immediately, even mid-window.
+    """
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        vkey = await session.get(VirtualKey, key_id)
+        if vkey is None:
+            raise GatewayError(404, f"Key '{key_id}' not found.", "invalid_request_error")
+        _require_key_access(admin, vkey)
+        if not vkey.is_active:
+            raise GatewayError(
+                400,
+                f"Key '{vkey.name}' is revoked — re-enable it before rotating.",
+                "invalid_request_error",
+            )
+        raw_key = _generate_key("sk-gw")
+        grace_until = None
+        if body.grace_seconds > 0:
+            grace_until = datetime.now(timezone.utc) + timedelta(
+                seconds=body.grace_seconds
+            )
+        # The old credential moves to the previous_* columns even on an
+        # immediate cutover: a caller still holding it then gets the
+        # honest "rotated" answer instead of unknown-key 401.
+        vkey.previous_key_hash = vkey.key_hash
+        vkey.previous_key_prefix = vkey.key_prefix
+        vkey.key_hash = hash_key(raw_key)
+        vkey.key_prefix = raw_key[:12]
+        vkey.grace_until = grace_until
+        await session.commit()
+        await session.refresh(vkey)
+        result = vkey.to_public_dict()
+    # Audit AFTER a successful commit — and never either raw key: the
+    # new one is shown to the administrator once and nowhere else, the
+    # old one is already gone.
+    raw_request.app.state.audit.record(
+        "key.rotated",
+        actor=admin,
+        key_id=key_id,
+        key_name=result["name"],
+        tenant_id=result["tenant_id"],
+        grace_seconds=body.grace_seconds,
+    )
+    # The new raw key is returned exactly once, at rotation time.
+    result["key"] = raw_key
+    return result
 
 
 # ----------------------------------------------------------------------

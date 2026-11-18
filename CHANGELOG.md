@@ -8,6 +8,38 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Key rotation & grace windows (tier 51) — `POST /admin/keys/{id}/rotate`
+  replaces a key's *credential* while the row keeps its identity: name,
+  tenant, allowlists, budgets, limits, spend and logs all stay with the
+  row, so callers switch secrets without switching identity. The new
+  raw key is returned exactly once (like creation); only its hash is
+  stored.
+  - **Grace window**: `grace_seconds` (default 0) keeps the *previous*
+    credential authenticating as the same key until the window ends —
+    budgets, limits, spend and logs accrue to the row whichever
+    credential was presented. Past the window the old credential
+    fails with an explicit 401 ("This API key has been rotated — its
+    grace window has ended") instead of a generic unknown-key error;
+    an immediate cutover (0) stores the old hash anyway, so its
+    holders get the honest message.
+  - **The row's checks fire first**: revocation (`DELETE
+    /admin/keys/{id}`) and `expires_at` refuse *both* credentials,
+    mid-window or not — rotation never resurrects a revoked key or
+    moves an expiry deadline. Rotating again supersedes the previous
+    credential outright, even mid-window.
+  - **The incident knob**: `PATCH /admin/keys/{id}` accepts
+    `grace_until` — explicit `null` kills the old credential
+    immediately (the old key leaked mid-rotation), a future timestamp
+    re-arms or extends its window.
+  - **Audited, never leaked**: each rotation emits a `key.rotated`
+    audit record (who, which key, the grace window); no record, log or
+    public API surface ever carries either raw key or the previous
+    key's hash. JWTs keep working across rotation untouched — a token
+    names the key, not the credential.
+  - **Dashboard**: a Rotate button on every active key (grace prompt →
+    the one-time raw-key reveal), and rows in grace show an amber
+    badge with the dying prefix and the window's end. 12 tests pin the
+    contract (`tests/test_key_rotation.py`).
 - Projected budget enforcement (tier 50) — `budget_enforcement:` gives
   the request-time budget gate the leg its hard caps lack. The caps
   (`max_budget_usd`, the daily/monthly windows, key and tenant) are

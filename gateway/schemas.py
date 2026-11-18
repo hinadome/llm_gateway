@@ -443,9 +443,28 @@ class KeyUpdateRequest(_ResidencyRequirement):
     prompt_variables: dict[str, str] | None = None
     allowed_endpoints: list[str] | None = None
     allowed_ips: list[str] | None = None
+    # Rotation grace management: move (or end) the previous credential's
+    # window — the incident knob when the old key leaked mid-rotation.
+    # An explicit null kills it at once; a future ISO timestamp re-arms
+    # or extends it. No-op when the key was never rotated.
+    grace_until: str | None = None
     # Moving a key between tenants is a platform-admin operation
     # (tenant admins are refused — it would let keys escape their scope).
     tenant_id: str | None = None
+
+
+class KeyRotateRequest(BaseModel):
+    """POST /admin/keys/{id}/rotate — replace the key's credential.
+
+    The row keeps its identity (name, tenant, budgets, spend, logs,
+    policies); only the credential changes, and the new raw key is
+    returned exactly once — like creation. ``grace_seconds`` keeps the
+    previous credential authenticating as the same key for that long
+    (both credentials share the row's limits and spend either way);
+    0 — the default — is an immediate cutover.
+    """
+
+    grace_seconds: int = Field(default=0, ge=0)
 
 
 class TenantCreateRequest(_ResidencyRequirement):

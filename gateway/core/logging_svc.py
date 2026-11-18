@@ -276,10 +276,27 @@ class LoggingService:
 
 
 async def get_key_by_hash(key_hash: str) -> VirtualKey | None:
+    """The key row whose CURRENT credential hashes to ``key_hash`` — or,
+    on a miss, the row whose PREVIOUS credential does (key rotation:
+    inside its grace window both credentials are the same key).
+
+    The grace-time judgment stays with the caller (the authenticator,
+    where the error vocabulary lives): this lookup only finds the row,
+    so a rotated-away credential past its window still resolves here
+    and is refused one step later, with an honest message.
+    """
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         result = await session.execute(
             select(VirtualKey).where(VirtualKey.key_hash == key_hash)
+        )
+        vkey = result.scalar_one_or_none()
+        if vkey is not None:
+            return vkey
+        # Values arriving here came from the unique key_hash column, so
+        # at most one row can hold any given previous credential.
+        result = await session.execute(
+            select(VirtualKey).where(VirtualKey.previous_key_hash == key_hash)
         )
         return result.scalar_one_or_none()
 

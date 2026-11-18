@@ -609,7 +609,7 @@
 
 <!-- raw key reveal -->
 <dialog id="dlg-rawkey">
-  <div class="dh">Key created</div>
+  <div class="dh" id="rawkey-title">Key created</div>
   <div class="db">
     <p class="muted" style="margin:0">Copy the raw key now — it is shown <b>only once</b>.
        Only its hash is stored.</p>
@@ -1071,6 +1071,10 @@ async function loadKeys() {
       ? ` <span class="b b-purple" title="Data-residency requirement: only deployments tagged ${(k.required_residencies || []).map(esc).join(" or ")} may serve this key (intersected with its tenant's requirement); untagged deployments never qualify.">⌖ ${(k.required_residencies || []).map(esc).join(",")}</span>`
       : "";
     const expired = k.expires_at && new Date(k.expires_at) < new Date();
+    const inGrace = k.is_active && k.grace_until && new Date(k.grace_until) > new Date();
+    const graceBadge = inGrace
+      ? ` <span class="b b-amber" title="Rotated: the previous credential ${esc(k.previous_key_prefix || "")}… still authenticates as this key until ${fmtWhen(k.grace_until)}, then hard-fails. Budgets, limits and logs are shared by both credentials.">grace ${fmtWhen(k.grace_until)}</span>`
+      : "";
     const tenantBadge = k.tenant_id
       ? ` <span class="b b-purple" title="Tenant: must also pass this tenant's pooled policy ceiling (models, RPM/TPM, budgets)">${esc(state.tenantNames[k.tenant_id] || k.tenant_id)}</span>`
       : "";
@@ -1078,7 +1082,7 @@ async function loadKeys() {
       ? ` <span class="b b-amber" title="${k.tenant_id ? "Tenant administrator — manages this tenant's keys, logs and usage; still subject to the tenant's policy" : "Platform administrator — the operator's full power"}">admin</span>`
       : "";
     return `<tr>
-      <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}</td>
+      <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}${graceBadge}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
       <td>${k.is_active ? '<span class="b b-green">active</span>' : '<span class="b b-red">off</span>'}</td>
       <td>${models}${grOff}${scoped}${ipLock}${toolLock}${mcpLock}${promptPolicy}${concBadge}${resBadge}</td>
@@ -1087,6 +1091,7 @@ async function loadKeys() {
       <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
       <td style="white-space:nowrap">
         <button class="small ghost" data-edit="${esc(k.id)}">Edit</button>
+        ${k.is_active ? `<button class="small ghost" data-rotate="${esc(k.id)}" data-name="${esc(k.name)}">Rotate</button>` : ""}
         ${k.is_active ? `<button class="small danger" data-revoke="${esc(k.id)}" data-name="${esc(k.name)}">Revoke</button>` : ""}
       </td></tr>`;
   }).join("");
@@ -1108,6 +1113,29 @@ $("#keys-table").addEventListener("click", async e => {
     try {
       await api("/admin/keys/" + revoke.dataset.revoke, { method: "DELETE" });
       toast("Key revoked");
+      loadKeys();
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
+  const rotate = e.target.closest("button[data-rotate]");
+  if (rotate) {
+    const name = rotate.dataset.name;
+    const answer = prompt(
+      `Rotate key '${name}'? The key keeps its identity (tenant, budgets, limits, logs); a NEW raw key is issued and shown exactly once.\n\n` +
+      "Grace window (seconds) during which the OLD credential keeps working — 0 for immediate cutover:",
+      "0"
+    );
+    if (answer === null) return;
+    const grace = parseInt(answer, 10);
+    if (isNaN(grace) || grace < 0) { toast("Grace seconds must be a non-negative integer", true); return; }
+    try {
+      const rotated = await api("/admin/keys/" + rotate.dataset.rotate + "/rotate", {
+        method: "POST",
+        body: JSON.stringify({ grace_seconds: grace }),
+      });
+      $("#rawkey-title").textContent = "Key rotated";
+      $("#rawkey").textContent = rotated.key;
+      $("#dlg-rawkey").showModal();
       loadKeys();
     } catch (err) { toast(err.message, true); }
   }
@@ -1246,6 +1274,7 @@ async function submitKeyDialog() {
         method: "POST",
         body: JSON.stringify(payload),
       });
+      $("#rawkey-title").textContent = "Key created";
       $("#rawkey").textContent = created.key;
       $("#dlg-rawkey").showModal();
     }

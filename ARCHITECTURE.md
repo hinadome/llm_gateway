@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 90 Python files, ~33,900 lines, 1275 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 90 Python files, ~34,100 lines, 1287 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -303,7 +303,17 @@ gateway/
 │   │                       feedback.recorded lifecycle event; the admin
 │   │                       list/stats live in admin.py
 │   └── admin.py            Keys CRUD (incl. per-key model_mappings / default_model,
-│                           prompt policy fields and scoping fields; tenancy —
+│                           prompt policy fields and scoping fields; POST
+│                           /admin/keys/{id}/rotate — tier 51: replaces the
+│                           credential, the row keeps its identity; new raw
+│                           key shown exactly once, previous hash remembered
+│                           for the honest post-grace 401, grace_seconds
+│                           0 = immediate cutover, a second rotation
+│                           supersedes mid-window, revoked keys refused
+│                           (400), audited as key.rotated, never either raw
+│                           key; PATCH grace_until is the incident knob —
+│                           explicit null kills the old credential at once,
+│                           a future timestamp re-arms it; tenancy —
 │                           tenant admins are forced into their own tenant on
 │                           create (mismatch 400), refused re-homing (403),
 │                           and see 404s for other tenants' keys/logs),
@@ -1126,7 +1136,13 @@ gateway/
 │   │                       cost-aware router's ranking key
 │   ├── auth.py             Pluggable auth chain (Authenticator ABC → AuthChain.
 │   │                       from_config): built-in admin_key (constant-time vs
-│   │                       app.state), virtual_key (SHA-256 row lookup) and jwt
+│   │                       app.state), virtual_key (SHA-256 row lookup, with a
+│   │                       grace-window fallback: inside grace_until the row's
+│   │                       PREVIOUS credential resolves to the same row —
+│   │                       identity continuity, shared budgets/logs; past it
+│   │                       an explicit "rotated" AuthError, and the row's own
+│   │                       is_active/expires_at checks fire first so revocation
+│   │                       and expiry refuse both credentials) and jwt
 │   │                       (HS256 secret or JWKS with kid-rotation refresh; the
 │   │                       token's key_claim names the virtual key whose row
 │   │                       supplies all policy) steps + "pkg.module:ClassName"
@@ -1141,9 +1157,10 @@ gateway/
 │   │                       tenant (the kill switch), so a member key is
 │   │                       never served as an unrestricted platform key
 │   ├── audit.py             AuditLogger: one JSON record per security-relevant
-│   │                       admin action (key create/update/revoke, breaker
-│   │                       reset), delivered best-effort by a background task
-│   │                       (never blocks the admin call), counted on AUDIT
+│   │                       admin action (key create/update/rotate/revoke,
+│   │                       breaker reset), delivered best-effort by a
+│   │                       background task (never blocks the admin call),
+│   │                       counted on AUDIT
 │   ├── prompts.py          Gateway-managed prompt policy: apply_prompt_policy
 │   │                       (managed system prompt prepended when the request
 │   │                       carries none — client system/developer messages,
@@ -1182,6 +1199,12 @@ gateway/
 │                           store_bodies=false skips persisting bodies (PII-safe mode),
 │                           prune() deletes rows older than retention_days (called from
 │                           the lifespan retention loop, counted on LOGS_PRUNED);
+│                           get_key_by_hash / get_tenant_by_id are the auth
+│                           chain's row lookups — the key leg falls back to
+│                           previous_key_hash (rotation's grace window; the
+│                           window judgment stays in the authenticator),
+│                           values there always came from key_hash's unique
+│                           column, so at most one row matches;
 │                           every RequestContext field maps to a column —
 │                           tier 35's shadow_verdict/shadow_similarity
 │                           persist on mirror rows like prompt_variant;
@@ -2455,7 +2478,7 @@ sequenceDiagram
     participant DB as Database
 
     C->>A: POST /v1/chat/completions (Bearer sk-gw-... / token)
-    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ jwt → custom steps, first match wins<br/>(a key with a tenant loads its row —<br/>dangling tenant_id or disabled tenant<br/>fails closed, 401)
+    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ jwt → custom steps, first match wins<br/>(a key with a tenant loads its row —<br/>dangling tenant_id or disabled tenant<br/>fails closed, 401 — and a rotated key<br/>accepts its previous credential inside<br/>the grace window as the same identity,<br/>past it an explicit rotated 401)
     A-->>A: token scoping (allowed_endpoints / allowed_ips)
     A->>P: handle_chat(request, auth)
 
@@ -2663,6 +2686,9 @@ erDiagram
         json allowed_endpoints "data-plane scopes (chat/embeddings/images/audio/models/batch), NULL = all"
         json allowed_ips "source IPs/CIDRs calls must come from, NULL = any"
         datetime expires_at
+        str previous_key_hash "indexed; the rotated-away credential's hash (tier 51), NULL = never rotated"
+        str previous_key_prefix "display-only: which credential is in its grace window"
+        datetime grace_until "until it, the previous credential authenticates as this same key"
         json metadata_json
     }
     REQUEST_LOG {
@@ -2900,7 +2926,7 @@ Being honest about the seams — these are the current trade-offs (all are local
 3. ~~Request-phase guardrails can only modify `messages`~~ **Solved:** `GuardrailResult` now carries `modified_model` (reject-and-redirect — "serve this on the small model" instead of blocking, with the pipeline re-checking the key's allowlist after the guardrail phase, fail closed) and `modified_request_fields` (arbitrary `ChatCompletionRequest` fields: `temperature`, `tools`, ...). All three compose and chain across guardrails (one `model_copy` per guardrail, each seeing the previous one's output).
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
 5. **Service selection beyond the built-ins is code.** The rate limiter, response cache and circuit-breaker registry have two built-in backends each (in-memory, Redis) selectable from `config.yaml`, but swapping in something else (e.g., a DynamoDB cache) still means calling `create_app` differently — the selection switch covers the shipped implementations only.
-6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. Not covered: mTLS client certificates, and per-key *cache* overrides (per-team TTL/size) still don't exist — the cache is global.
+6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. The same choice is why rotation never touches tokens: a JWT names the *key*, not its credential, so every token naming a key keeps working across its rotations (tier 51) — only raw-credential holders need the new secret. Not covered: mTLS client certificates, and per-key *cache* overrides (per-team TTL/size) still don't exist — the cache is global.
 7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
 9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
@@ -3022,6 +3048,18 @@ tests/
 │                        RS256 via JWKS (caching, kid-rotation refresh, 503 when
 │                        the IdP is down), custom Authenticator steps, invalid
 │                        chain entries failing at construction
+├── test_key_rotation.py  Tier 51: rotate issues a new raw key once (old prefix
+│                        kept for display, hashes never exposed), both
+│                        credentials inside grace, honest post-grace 401
+│                        (pinned via direct row UPDATE), immediate cutover,
+│                        identity continuity (one row, same id/policy, logs
+│                        from both credentials, spend on the row), revoke
+│                        kills both, second rotation supersedes mid-window,
+│                        tenant-admin scoping (own 200 / cross-tenant 404),
+│                        revoked-key rotate 400, negative grace 400 (app
+│                        envelope), PATCH grace_until null-kill + re-arm,
+│                        expired rows stay expired, key.rotated audit record
+│                        (details + never either raw key)
 ├── test_token_scoping.py  Per-key allowed_endpoints (chat covers native formats
 │                        + Responses bridge; embeddings/models 403) and
 │                        allowed_ips (plain/CIDR, malformed entries restrict),

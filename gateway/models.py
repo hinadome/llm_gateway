@@ -134,6 +134,22 @@ class VirtualKey(Base):
     allowed_endpoints: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     allowed_ips: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Key rotation (tier 51): the previous credential's hash and the
+    # instant its grace window ends. Until grace_until, BOTH the current
+    # and the previous credential authenticate as this same row —
+    # identity continuity: budgets, limits, spend and logs accrue here
+    # whichever credential was presented. After it, the previous
+    # credential is refused with an explicit "rotated" error (rotation
+    # with grace_seconds=0 stores the hash too, so the dead credential
+    # gets the honest message instead of a generic unknown-key 401).
+    # Rotating again replaces the previous credential outright — an
+    # older one stops working immediately, even mid-window.
+    # previous_key_prefix is display-only (the dashboard shows which
+    # credential is dying). The hash itself is a secret, like key_hash:
+    # never in any public dict, never in any audit record.
+    previous_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    previous_key_prefix: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    grace_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -174,6 +190,8 @@ class VirtualKey(Base):
             "allowed_endpoints": self.allowed_endpoints,
             "allowed_ips": self.allowed_ips,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "grace_until": self.grace_until.isoformat() if self.grace_until else None,
+            "previous_key_prefix": self.previous_key_prefix,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

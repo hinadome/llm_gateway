@@ -16,7 +16,10 @@ Built-in steps:
   value seeded on ``app.state`` at startup).
 - ``virtual_key`` — the raw credential is a gateway-issued virtual key
   (SHA-256 lookup); the key row is the single source of policy (allowlists,
-  budgets, guardrail/model-routing overrides).
+  budgets, guardrail/model-routing overrides). Rotation: for the duration
+  of a key's grace window the row's *previous* credential resolves to the
+  same row — after the window it is refused with an explicit "rotated"
+  error (see ``POST /admin/keys/{id}/rotate``).
 - ``jwt`` — the credential is a JWT/OAuth bearer token (``header.payload.
   signature``). The token proves *identity* only: its ``key_claim``
   (default ``sub``) names the virtual key whose *policy* applies — so
@@ -241,6 +244,21 @@ class VirtualKeyAuthenticator(Authenticator):
             raise AuthError()
         if _is_expired(vkey.expires_at):
             raise AuthError("This API key has expired.")
+        if hash_key(credential) != vkey.key_hash:
+            # Rotation: the credential matched the row's PREVIOUS hash.
+            # The row's own checks above fired first — a revoked or
+            # expired key refuses both credentials identically; only
+            # then does the grace window decide. Inside it, the caller
+            # is this key, full stop: same policy, same budgets, same
+            # logs as the current credential. Past it (or with no
+            # window at all — an immediate-cutover rotation), the old
+            # credential is refused with an honest, actionable error
+            # instead of a generic unknown-key 401.
+            if vkey.grace_until is None or _is_expired(vkey.grace_until):
+                raise AuthError(
+                    "This API key has been rotated — its grace window "
+                    "has ended. Use the key's current credential."
+                )
         tenant = await load_tenant_for_key(vkey)
         return auth_context_from_key(
             vkey, tenant=tenant, auth_method=self.name
