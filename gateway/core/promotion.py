@@ -36,6 +36,17 @@ made deliberate and safe:
   disagreement between the running config and the file (a shadow
   deployment whose entry has no ``shadow:`` line) is a refusal, never a
   best-effort edit.
+* **Rollback is the same discipline in reverse (tier 39).** Every
+  apply (promote, rollback) leaves a timestamped backup next to the
+  file. The rollback surface lists those backups with an honest
+  explanation of what restoring each would do
+  (``compare_configs`` — parsed configs compared: shadow flags
+  re-set, weight/priority edits, deployments added/removed), and
+  applying one restores through the exact apply discipline: the
+  chosen backup must parse, the live file is backed up FIRST (a
+  rollback is itself one rollback away from undone), the reload
+  runs, the refusal path restores, the act is audited. The escape
+  hatch is a deliberate act too — never an automatic one.
 """
 
 from __future__ import annotations
@@ -559,3 +570,129 @@ def restore_backup(backup: Path, path: Path) -> None:
     """Put the backup back — the reload-refusal path, so the file
     always matches the running config again."""
     shutil.copy2(backup, path)
+
+
+# ---------------------------------------------------------------------------
+# rollback (tier 39): list, explain, compare the promotion backups
+# ---------------------------------------------------------------------------
+
+# The stamp write_with_backup puts in a backup name; the format sorts
+# lexicographically = chronologically, so name order is time order.
+_BACKUP_STAMP_FORMAT = "%Y%m%dT%H%M%S%fZ"
+# Flat names only: a backup name may never carry a path separator, so
+# the endpoints can never reach outside the config file's directory.
+BACKUP_NAME_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+)
+
+
+def parse_backup_stamp(name: str) -> datetime | None:
+    """The UTC stamp embedded in a promotion backup name
+    (``config.yaml.bak-<stamp>``), or None when the name carries no
+    parseable stamp."""
+    marker = ".bak-"
+    idx = name.rfind(marker)
+    if idx < 0:
+        return None
+    try:
+        return datetime.strptime(
+            name[idx + len(marker) :], _BACKUP_STAMP_FORMAT
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def list_config_backups(path: Path) -> list[Path]:
+    """Every promotion backup next to the config file, newest first —
+    the stamp in the name sorts chronologically, so the name order IS
+    the time order (no stat races, no clock)."""
+    prefix = f"{path.name}.bak-"
+    backups = [
+        entry
+        for entry in path.parent.iterdir()
+        if entry.is_file() and entry.name.startswith(prefix)
+    ]
+    return sorted(backups, key=lambda entry: entry.name, reverse=True)
+
+
+def compare_configs(current: GatewayConfig, target: GatewayConfig) -> list[dict]:
+    """The auditable story of what rolling CURRENT back to TARGET
+    does — a pure function over two parsed configs, one entry per
+    change the restore would apply, in stable (model, deployment)
+    order:
+
+    * ``add_deployment`` / ``remove_deployment`` — a deployment the
+      backup has that the live config doesn't (a cross-model insert,
+      undone) and vice versa;
+    * ``shadow`` / ``unshadow`` — the shadow flag the restore re-sets
+      (a promotion's flip, undone: the candidate goes back to
+      mirroring);
+    * ``set_weight`` / ``set_priority`` — routing-knob edits, with
+      ``from`` (live) and ``to`` (the backup's) values.
+
+    Identical configs compare to ``[]`` — the honest no-op."""
+    changes: list[dict] = []
+    current_models = {m.name: m for m in current.models}
+    target_models = {m.name: m for m in target.models}
+    for name in sorted(set(current_models) | set(target_models)):
+        cur_m = current_models.get(name)
+        tgt_m = target_models.get(name)
+        if cur_m is None or tgt_m is None:
+            # A model that exists on only one side: all of its
+            # deployments come or go with the restore.
+            only = (tgt_m or cur_m).deployments
+            action = "add_deployment" if tgt_m is not None else "remove_deployment"
+            for d in only:
+                changes.append({"model": name, "deployment": d.name, "action": action})
+            continue
+        cur_d = {d.name: d for d in cur_m.deployments}
+        tgt_d = {d.name: d for d in tgt_m.deployments}
+        for dname in sorted(set(cur_d) | set(tgt_d)):
+            cur = cur_d.get(dname)
+            tgt = tgt_d.get(dname)
+            if cur is None or tgt is None:
+                changes.append(
+                    {
+                        "model": name,
+                        "deployment": dname,
+                        "action": "add_deployment" if tgt is not None else "remove_deployment",
+                    }
+                )
+                continue
+            if cur.shadow != tgt.shadow:
+                changes.append(
+                    {
+                        "model": name,
+                        "deployment": dname,
+                        "action": "shadow" if tgt.shadow else "unshadow",
+                    }
+                )
+            for key in ("weight", "priority"):
+                cur_val, tgt_val = getattr(cur, key), getattr(tgt, key)
+                if cur_val != tgt_val:
+                    changes.append(
+                        {
+                            "model": name,
+                            "deployment": dname,
+                            "action": f"set_{key}",
+                            "from": cur_val,
+                            "to": tgt_val,
+                        }
+                    )
+    return changes
+
+
+def unified_diff(current_text: str, target_text: str, tofile: str) -> str:
+    """The human preview of what a restore applies: the live file →
+    the target text. Newline style follows the live file (CRLF files
+    diff against CRLF)."""
+    nl = "\r\n" if "\r\n" in current_text else "\n"
+    return "\n".join(
+        difflib.unified_diff(
+            current_text.split(nl),
+            target_text.split(nl),
+            fromfile="config.yaml (current)",
+            tofile=tofile,
+            lineterm="",
+        )
+    )

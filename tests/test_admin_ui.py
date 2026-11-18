@@ -158,6 +158,31 @@ async def test_admin_ui_promotion_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_rollback_surface(env):
+    # Tier 39: the Routing tab's Backups button opens the promotion
+    # backups dialog — one row per config.yaml.bak-<stamp> with the
+    # parsed what-rolling-back-changes story, a Preview that renders
+    # the detail diff, and the Rollback-to-this apply (POST
+    # /admin/migration/rollback) that toasts the undo point and
+    # refreshes the routing tables. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="dlg-backups"',
+        'id="backups-table"',
+        'id="backups-preview"',
+        'id="backups-diff"',
+        'id="backups-err"',
+        'id="btn-backups"',
+        "data-backup-preview",
+        "data-backup-rollback",
+        "loadBackups",
+        "rollbackChangeText",
+        "/admin/migration/backups",
+        "/admin/migration/rollback",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

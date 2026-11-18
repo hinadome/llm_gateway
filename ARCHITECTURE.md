@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 84 Python files, ~29,400 lines, 1132 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 84 Python files, ~29,800 lines, 1142 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -379,6 +379,37 @@ gateway/
 │                           refusal the backup is restored and the
 │                           running config never moved — see
 │                           core/promotion;
+│                           GET /admin/migration/backups +
+│                           /admin/migration/backups/{name} +
+│                           POST /admin/migration/rollback (tier 39,
+│                           same platform-admin boundary) are the
+│                           undo surface over the backups every apply
+│                           leaves next to config.yaml: the list is
+│                           a pure read, newest first (the name's
+│                           stamp IS the order), each row explaining
+│                           its backup (parses — schema drift is
+│                           honest; is_current — byte-identical to
+│                           live; changes — compare_configs over the
+│                           parsed pair), the detail adds the
+│                           line-level diff (the human preview);
+│                           rollback applies the same discipline in
+│                           reverse — the chosen backup (None = the
+│                           latest, "undo the last promotion") must
+│                           parse (409 backup_invalid — never start
+│                           an edit that cannot land), a
+│                           byte-identical one is refused as the
+│                           no-op it is (409 rollback_noop), the
+│                           live file is backed up FIRST (the
+│                           rollback's own undo point — one rollback
+│                           away from undone, in both directions:
+│                           rolling back again with no body REDOES
+│                           the promotion), then write → the
+│                           /admin/reload path (source="rollback")
+│                           → promotion.rolled_back audit, with the
+│                           undo point restored on reload refusal;
+│                           flat names only (charset bars path
+│                           separators — the resolution can never
+│                           leave the config directory);
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -1294,7 +1325,18 @@ gateway/
 │   │                       the write) + restore_backup are the apply
 │   │                       side's safety net; read_config_text refuses
 │   │                       newline translation so CRLF files survive
-│   │                       byte-for-byte.
+│   │                       byte-for-byte. Tier 39 adds the rollback
+│   │                       side over the backups every apply leaves:
+│   │                       list_config_backups (newest first — the
+│   │                       stamp in the name sorts chronologically,
+│   │                       so name order IS time order, no clock),
+│   │                       parse_backup_stamp, compare_configs (the
+│   │                       auditable story of what restoring a
+│   │                       backup does — pure over two parsed
+│   │                       configs: shadow/unshadow flags re-set,
+│   │                       set_weight/set_priority with from/to,
+│   │                       add_deployment/remove_deployment) and
+│   │                       unified_diff (the human preview).
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -1512,7 +1554,18 @@ gateway/
                             backup name and refreshes the routing tables;
                             a promotion_blocked 409 stays in the dialog,
                             message verbatim, so the operator can check
-                            force and resubmit —
+                            force and resubmit. Tier 39 adds the Backups
+                            button beside the shadow-diff table, opening
+                            the promotion-backups dialog: one row per
+                            config.yaml.bak-<stamp> with the parsed
+                            changes story (does-not-parse and no-op
+                            rows carry honest badges instead of a
+                            rollback button), a Preview that fetches
+                            the detail diff, and the confirm-guarded
+                            Rollback-to-this apply (POST
+                            /admin/migration/rollback) that toasts the
+                            undo point and refreshes the routing
+                            tables —
                             guardrail inventory, system (health/readiness,
                             config reload, backups). A test enforces the
                             no-external-resources invariant.
@@ -2544,6 +2597,41 @@ tests/
 │                        environment points config_path at a tmp_path
 │                        file it owns; the repo's ./config.yaml is
 │                        never touched
+├── test_rollback.py     Promotion rollback (tier 39): units — the
+│                        stamp format round-trips (write_with_backup's
+│                        own stamp parses back, fresh UTC; anything
+│                        else parses to None), list_config_backups is
+│                        newest-first and prefix-strict (neighbors,
+│                        prefix-less strays and directories never
+│                        list), compare_configs tells the restore
+│                        story in sorted (model, deployment) order
+│                        (shadow re-set + weight edits + the
+│                        cross-model insert undone as
+│                        add_deployment; identical configs = the
+│                        honest empty no-op); e2e — the ladder
+│                        undone (two promotes leave two explained
+│                        backups; rollback to the first restores the
+│                        pre-promotion file byte-for-byte, the
+│                        running config follows, mirroring RESUMES —
+│                        two log rows per chat — the act is audited
+│                        with its own undo point, and the undo point
+│                        holds the replaced file), latest-by-default
+│                        + the no-op refusal (byte-identical backup
+│                        → 409 rollback_noop, nothing written or
+│                        audited) + the redo (rolling back with no
+│                        body after a rollback picks the undo point
+│                        — the promotion is back), the unparseable
+│                        backup (listed parses:false, refused 409
+│                        backup_invalid before anything moves), name
+│                        validation (traversal/wrong-prefix/empty =
+│                        400s, well-formed but missing = 404), the
+│                        reload-failure safety net (monkeypatched
+│                        reload → 400, file byte-identical, running
+│                        config the same object), 403s for
+│                        tenant/plain on all three endpoints + the
+│                        empty 404 + missing-config 409s; like the
+│                        promotion tests, config_path always points
+│                        at a tmp_path file the test owns
 ├── test_usage_export.py  /admin/usage/export: CSV columns/order/attachment download,
 │                        JSON summary + by_key/by_model/by_status aggregates, key/model/
 │                        status filters, time windows (default 30d, naive=UTC), shadow

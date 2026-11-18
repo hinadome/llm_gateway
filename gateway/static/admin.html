@@ -307,7 +307,10 @@
     </div>
     <div class="panel" style="margin-top:14px">
       <div class="ph">Shadow diff evidence
-        <div class="right muted" style="font-weight:400;font-size:12px">mirrored pairs, scored raw-vs-raw &middot; exact = 1.0 &middot; near &ge; 0.80 &middot; deltas vs the paired primaries &middot; go / no-go vs the <span class="mono" style="font-size:11px">migration:</span> thresholds</div>
+        <div class="right" style="font-weight:400">
+          <button class="ghost small" id="btn-backups" title="Promotion backups: the timestamped config.yaml copies every promote/rollback writes, and the one-click undo that restores one (live file backed up first, hot-reloaded, audited).">&#128190; Backups</button>
+          <span class="muted" style="font-weight:400;font-size:12px">mirrored pairs, scored raw-vs-raw &middot; exact = 1.0 &middot; near &ge; 0.80 &middot; deltas vs the paired primaries &middot; go / no-go vs the <span class="mono" style="font-size:11px">migration:</span> thresholds</span>
+        </div>
       </div>
       <div style="overflow-x:auto"><table id="shadow-diff-table"></table></div>
     </div>
@@ -573,6 +576,21 @@
       <button value="ok" class="primary">Promote</button>
     </div>
   </form>
+</dialog>
+
+<!-- promotion backups (tier 39): what every apply left, and the undo -->
+<dialog id="dlg-backups">
+  <div class="dh">Promotion backups</div>
+  <div class="db" style="min-width:860px;max-width:1020px;max-height:70vh;overflow:auto">
+    <div class="muted" style="font-size:12.5px;margin-bottom:10px">Every apply &mdash; promote or rollback &mdash; writes a timestamped config.yaml backup next to the file. Rolling back restores one through the same discipline: the live file is backed up first (the rollback&rsquo;s own undo point), then hot-reloaded and audited &mdash; so a rollback is itself one rollback away from undone.</div>
+    <div style="overflow-x:auto"><table id="backups-table"></table></div>
+    <div id="backups-preview" hidden>
+      <div class="dh" style="margin-top:14px" id="backups-preview-title">Preview</div>
+      <pre id="backups-diff" style="max-height:240px;overflow:auto;font-size:12px;line-height:1.45;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--panel2)"></pre>
+    </div>
+    <div class="err" id="backups-err"></div>
+  </div>
+  <form method="dialog" class="df"><button>Close</button></form>
 </dialog>
 
 <div id="toasts"></div>
@@ -1797,6 +1815,98 @@ $("#form-promotion").addEventListener("submit", async e => {
     // e.g. promotion_blocked: the message says what the evidence found —
     // the operator can check force and submit again.
     err.textContent = e.message || String(e);
+  }
+});
+
+// ---------- promotion backups + rollback (tier 39) ------------------------
+
+function rollbackChangeText(c) {
+  const where = `${esc(c.model)} / ${esc(c.deployment)}`;
+  switch (c.action) {
+    case "shadow": return `${where}: back to mirroring`;
+    case "unshadow": return `${where}: starts serving`;
+    case "set_weight": return `${where}: weight ${c.from} → ${c.to}`;
+    case "set_priority": return `${where}: priority ${c.from} → ${c.to}`;
+    case "add_deployment": return `${where}: re-added`;
+    case "remove_deployment": return `${where}: removed`;
+    default: return `${where}: ${esc(c.action)}`;
+  }
+}
+
+async function loadBackups() {
+  const box = $("#backups-table");
+  const err = $("#backups-err");
+  err.textContent = "";
+  box.innerHTML = '<tbody><tr><td class="muted">Loading…</td></tr></tbody>';
+  try {
+    const r = await api("/admin/migration/backups");
+    if (!r.data.length) {
+      box.innerHTML = '<tbody><tr><td class="muted">No backups yet — one is written by every promotion (and by every rollback).</td></tr></tbody>';
+      return;
+    }
+    const html = ["<tbody><tr><th>Backup</th><th>Created (UTC)</th><th>Size</th><th>What rolling back changes</th><th></th></tr>"];
+    for (const b of r.data) {
+      const story = b.parses === false
+        ? '<span class="b b-red">does not parse — cannot be restored</span>'
+        : b.is_current
+          ? '<span class="b b-gray">identical to the live file (no-op)</span>'
+          : (b.changes || []).map(rollbackChangeText).join("<br>")
+            || '<span class="b b-green">no routing change</span>';
+      html.push(`<tr>
+        <td class="mono" style="font-size:11px">${esc(b.name)}</td>
+        <td style="white-space:nowrap">${b.created_at ? esc(b.created_at.replace("T", " ").slice(0, 19)) : "—"}</td>
+        <td class="mono" style="font-size:11px">${(b.size_bytes / 1024).toFixed(1)} KiB</td>
+        <td style="font-size:12px">${story}</td>
+        <td style="white-space:nowrap">
+          <button class="small ghost" data-backup-preview="${esc(b.name)}">Preview</button>
+          ${b.parses && !b.is_current ? `<button class="small ghost" data-backup-rollback="${esc(b.name)}">Rollback to this</button>` : ""}
+        </td></tr>`);
+    }
+    box.innerHTML = html.join("") + "</tbody>";
+  } catch (e) {
+    box.innerHTML = "";
+    err.textContent = e.message || String(e);
+  }
+}
+
+$("#btn-backups").addEventListener("click", () => {
+  $("#backups-preview").hidden = true;
+  $("#dlg-backups").showModal();
+  loadBackups();
+});
+
+$("#backups-table").addEventListener("click", async e => {
+  const preview = e.target.closest("button[data-backup-preview]");
+  if (preview) {
+    const err = $("#backups-err");
+    err.textContent = "";
+    try {
+      const d = await api(`/admin/migration/backups/${encodeURIComponent(preview.dataset.backupPreview)}`);
+      $("#backups-preview-title").textContent = `config.yaml → ${d.name}`;
+      $("#backups-diff").textContent = d.diff || "(identical to the live file — nothing to preview)";
+      $("#backups-preview").hidden = false;
+    } catch (er) {
+      err.textContent = er.message || String(er);
+    }
+    return;
+  }
+  const rb = e.target.closest("button[data-backup-rollback]");
+  if (!rb) return;
+  if (!confirm(`Roll config.yaml back to ${rb.dataset.backupRollback}? The live file is backed up first (the rollback's own undo point), then the backup is restored and hot-reloaded — routing goes back to this state.`)) return;
+  const err = $("#backups-err");
+  err.textContent = "Rolling back — backup, restore, hot-reload…";
+  try {
+    const result = await api("/admin/migration/rollback", {
+      method: "POST",
+      body: JSON.stringify({ backup: rb.dataset.backupRollback }),
+    });
+    $("#dlg-backups").close();
+    toast(`Rolled back to ${result.backup} (undo point ${result.undo_point})`);
+    loadRouting(); // routing, shadow-diff rows and trials all went back
+  } catch (er) {
+    // e.g. rollback_noop or config_invalid: the message says exactly
+    // what refused and why.
+    err.textContent = er.message || String(er);
   }
 });
 

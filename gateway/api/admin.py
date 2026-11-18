@@ -21,6 +21,7 @@ from sqlalchemy import func, select, update
 
 from ..core.alerts import BudgetAlertManager
 from ..core.context import AuthContext
+from ..config import GatewayConfig
 from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
@@ -40,6 +41,7 @@ from ..schemas import (
     PromptPatchRequest,
     ProviderKeyUpsertRequest,
     ReplayRequest,
+    RollbackRequest,
     TenantCreateRequest,
     TenantUpdateRequest,
     TrialCreateRequest,
@@ -2047,6 +2049,238 @@ async def migration_promote(
         "evidence_source": source,
         "forced": body.force,
         "backup": backup.name,
+        "reload": reload_summary,
+    }
+
+
+# -- promotion rollback (tier 39) -------------------------------------------
+# Promotion's undo, with the same discipline: every apply (promote,
+# rollback) leaves a timestamped backup; the rollback surface lists
+# those backups with an honest explanation of what restoring each
+# would do, and applying one runs the apply discipline in reverse —
+# the live file is backed up FIRST (a rollback is itself one rollback
+# away from undone), the reload refusal path restores, the act is
+# audited. Never an automatic act: no evidence gate, no force flag —
+# rollback IS the escape hatch.
+
+
+def _resolve_config_backup(app: Any, name: str | None) -> tuple[Path, Path]:
+    """The config file and the chosen backup file, validated: flat
+    names only (the charset bars path separators, so the resolution
+    can never leave the config file's directory), the
+    ``config.yaml.bak-`` prefix, and existence. ``name=None`` picks
+    the LATEST backup — the common "undo the last promotion" case."""
+    config_path = Path(app.state.settings.config_path)
+    if not config_path.exists():
+        raise GatewayError(
+            409,
+            f"Config file not found at {config_path} — rollback restores "
+            "the file the gateway loads, so both must exist.",
+            "invalid_request_error",
+            code="config_file_missing",
+        )
+    if name is None:
+        backups = promotion_core.list_config_backups(config_path)
+        if not backups:
+            raise GatewayError(
+                404,
+                "No promotion backups exist yet — a backup is written by "
+                "POST /admin/migration/promote (and by rollback itself).",
+                "invalid_request_error",
+                code="backup_not_found",
+            )
+        target = backups[0]
+    else:
+        if not name or set(name) - promotion_core.BACKUP_NAME_CHARS:
+            raise GatewayError(
+                400,
+                "Invalid backup name — expected a flat "
+                f"'{config_path.name}.bak-<stamp>' file name.",
+                "invalid_request_error",
+                code="invalid_backup_name",
+            )
+        if not name.startswith(f"{config_path.name}.bak-"):
+            raise GatewayError(
+                400,
+                f"'{name}' is not a promotion backup of {config_path.name} "
+                f"— expected a '{config_path.name}.bak-<stamp>' file name.",
+                "invalid_request_error",
+                code="invalid_backup_name",
+            )
+        target = config_path.with_name(name)
+    if not target.is_file():
+        raise GatewayError(
+            404,
+            f"Backup '{target.name}' does not exist.",
+            "invalid_request_error",
+            code="backup_not_found",
+        )
+    return config_path, target
+
+
+def _backup_row(
+    config_path: Path, target: Path, live_text: str, live_config: GatewayConfig
+) -> dict:
+    """One backup's listing row: identity (name, stamp, size), honesty
+    (does it still parse), and the explanation of what restoring it
+    would do (``changes`` from the parsed comparison)."""
+    try:
+        backup_config = GatewayConfig.load(target)
+        parses = True
+        changes = promotion_core.compare_configs(live_config, backup_config)
+    except Exception:
+        parses = False
+        changes = None
+    stamp = promotion_core.parse_backup_stamp(target.name)
+    return {
+        "name": target.name,
+        "created_at": stamp.isoformat() if stamp is not None else None,
+        "size_bytes": target.stat().st_size,
+        "parses": parses,
+        "is_current": promotion_core.read_config_text(target) == live_text,
+        "changes": changes,
+    }
+
+
+@router.get("/admin/migration/backups")
+async def migration_backup_list(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """The promotion backups carried next to config.yaml
+    (``config.yaml.bak-<utc stamp>`` — written by promote, and by
+    rollback itself), newest first. Pure read: the file is never
+    written, nothing is audited.
+
+    Each row explains the backup: ``created_at`` (the stamp in the
+    name), ``size_bytes``, whether it still ``parses`` (an old backup
+    can predate schema changes — honestly labeled, refused at apply
+    time), ``is_current`` (byte-identical to the live file — a
+    rollback to it is the no-op the rollback endpoint refuses), and
+    the ``changes`` restoring it would apply (parsed configs
+    compared: ``shadow``/``unshadow`` flags re-set, ``set_weight``/
+    ``set_priority`` knob edits, ``add_deployment``/
+    ``remove_deployment`` — the cross-model insert, undone). The
+    line-level diff lives on the per-backup detail endpoint."""
+    config_path = Path(raw_request.app.state.settings.config_path)
+    if not config_path.exists():
+        raise GatewayError(
+            409,
+            f"Config file not found at {config_path} — rollback reads the "
+            "backups the gateway's own applies wrote next to it.",
+            "invalid_request_error",
+            code="config_file_missing",
+        )
+    live_text = promotion_core.read_config_text(config_path)
+    live_config = raw_request.app.state.config
+    rows = [
+        _backup_row(config_path, target, live_text, live_config)
+        for target in promotion_core.list_config_backups(config_path)
+    ]
+    return {"object": "list", "data": rows}
+
+
+@router.get("/admin/migration/backups/{name}")
+async def migration_backup_detail(
+    name: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """One backup in full: the listing row plus the line-level
+    ``diff`` of the live file → the backup's text — the human preview
+    of what rolling back to it applies. Pure read, like the list."""
+    config_path, target = _resolve_config_backup(raw_request.app, name)
+    live_text = promotion_core.read_config_text(config_path)
+    row = _backup_row(
+        config_path, target, live_text, raw_request.app.state.config
+    )
+    backup_text = promotion_core.read_config_text(target)
+    row["diff"] = (
+        ""
+        if row["is_current"]
+        else promotion_core.unified_diff(
+            live_text, backup_text, f"config.yaml (backup {target.name})"
+        )
+    )
+    return row
+
+
+@router.post("/admin/migration/rollback")
+async def migration_rollback(
+    raw_request: Request,
+    body: RollbackRequest,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Restore config.yaml from a promotion backup — the deliberate
+    undo of a promotion (or a ladder of them), applied with the same
+    discipline promote applies, in reverse:
+
+    the chosen backup (``backup`` names it; None = the latest —
+    "undo the last promotion") must exist AND still parse (never
+    start an edit that cannot land); the live file is backed up FIRST
+    (the rollback's own undo point — a rollback is one rollback away
+    from undone); the backup's text is written; the same hot-reload
+    path POST /admin/reload takes applies (source="rollback"); on
+    reload refusal the undo point is restored and the running config
+    never moved. The act is audited as ``promotion.rolled_back`` with
+    the structured ``changes`` the restore applied. A backup
+    byte-identical to the live file is refused with 409
+    ``rollback_noop`` — rolling back nothing is not an act worth
+    auditing."""
+    config_path, target = _resolve_config_backup(raw_request.app, body.backup)
+    backup_text = promotion_core.read_config_text(target)
+    try:
+        backup_config = GatewayConfig.load(target)
+    except Exception as exc:
+        raise GatewayError(
+            409,
+            f"Backup '{target.name}' does not parse as a gateway config "
+            f"({exc}) — it predates or diverges from the current schema. "
+            "Restoring it could not land; edit it by hand if you truly "
+            "need its contents.",
+            "invalid_request_error",
+            code="backup_invalid",
+        ) from exc
+    live_text = promotion_core.read_config_text(config_path)
+    if backup_text == live_text:
+        raise GatewayError(
+            409,
+            f"Nothing to roll back — '{target.name}' is byte-identical to "
+            f"the live {config_path.name}. Pick another backup.",
+            "invalid_request_error",
+            code="rollback_noop",
+        )
+    changes = promotion_core.compare_configs(raw_request.app.state.config, backup_config)
+    undo_point = promotion_core.write_with_backup(config_path, backup_text)
+
+    from ..main import reload_gateway  # same import stance as promote
+
+    try:
+        reload_summary = await reload_gateway(raw_request.app, source="rollback")
+    except Exception as exc:  # noqa: BLE001 — any load/validate failure
+        promotion_core.restore_backup(undo_point, config_path)
+        raise GatewayError(
+            400,
+            f"Rollback failed: the restored config did not reload (running "
+            f"config unchanged, file restored from {undo_point.name}): {exc}",
+            "invalid_request_error",
+            code="config_invalid",
+        ) from exc
+
+    raw_request.app.state.audit.record(
+        "promotion.rolled_back",
+        actor=admin,
+        backup=target.name,
+        undo_point=undo_point.name,
+        changes=changes,
+    )
+    return {
+        "backup": target.name,
+        "undo_point": undo_point.name,
+        "changes": changes,
+        "diff": promotion_core.unified_diff(
+            live_text, backup_text, f"config.yaml (backup {target.name})"
+        ),
         "reload": reload_summary,
     }
 

@@ -8,6 +8,57 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Promotion rollback (tier 39) — promotion's undo, the same
+  discipline in reverse. Tier 38 left an operator staring at a
+  promoted canary with a timestamped backup file and no API that
+  knew about it: rolling back meant stopping the gateway, swapping
+  files by hand, hoping the operator picked the right `.bak`. Now
+  the backups promote (and rollback) writes ARE the undo surface:
+  - **`GET /admin/migration/backups`** — list, newest first (the
+    UTC stamp in the name sorts chronologically — name order IS
+    time order, no filesystem clock), a pure read. Each row
+    *explains* its backup: `created_at` (the stamp), `size_bytes`,
+    whether it still `parses` (an old backup can predate schema
+    changes — honestly labeled, refused at apply time),
+    `is_current` (byte-identical to the live file), and the
+    structured `changes` restoring it would apply, computed by
+    `core/promotion.compare_configs` over the parsed pair:
+    `shadow`/`unshadow` (a promotion's flip, undone — the candidate
+    goes back to mirroring), `set_weight`/`set_priority` with
+    `from`/`to`, `add_deployment`/`remove_deployment` (a
+    cross-model insert, undone).
+  - **`GET /admin/migration/backups/{name}`** — the row plus the
+    line-level `diff` of the live file → the backup's text: the
+    human preview. Flat names only — the charset bars path
+    separators, so neither endpoint can ever reach outside the
+    config file's directory.
+  - **`POST /admin/migration/rollback`** — apply, the same
+    discipline in reverse. `backup` names the file; omitted = the
+    latest, the common "undo the last promotion". The chosen backup
+    **must parse** (409 `backup_invalid` — never start an edit that
+    cannot land); a byte-identical one is refused as the no-op it
+    is (409 `rollback_noop`); the live file is backed up **first**
+    (the rollback's own undo point), then the backup's text is
+    written, the same hot-reload path `POST /admin/reload` takes
+    applies (source `rollback`), and the act is audited as
+    `promotion.rolled_back` with the structured changes. On reload
+    refusal the undo point is restored and the running config never
+    moved — the same safety net promote has.
+  - **A rollback is one rollback away from undone, in both
+    directions.** After a rollback, the latest backup is the
+    rollback's own undo point — the promoted state — so rolling
+    back again with no body *redoes* the promotion (pinned by a
+    test). No evidence gate, no force flag: rollback IS the escape
+    hatch — but a deliberate, audited one, never automatic.
+  The admin dashboard's Routing tab gains a Backups button beside
+  the shadow-diff table: one row per backup with its changes story
+  (does-not-parse and no-op rows carry honest badges instead of a
+  rollback button), a Preview of the line-level diff, and a
+  confirm-guarded Rollback-to-this that toasts the undo point and
+  refreshes the routing tables. All three endpoints are
+  platform-admin-only. 9 tests + a UI-surface pin
+  (`tests/test_rollback.py`, `tests/test_admin_ui.py`); the suite
+  stands at 1142.
 - Migration promotion (tier 38) — the deliberate act that turns a go
   verdict into serving traffic, through config.yaml itself. Tier 37
   ended at the recommendation; the operator reading "go" still had to

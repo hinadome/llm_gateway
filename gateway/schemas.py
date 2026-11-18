@@ -557,3 +557,18 @@ class PromotionRequest(BaseModel):
     deployment: str = Field(min_length=1, max_length=128)
     weight: int = Field(default=10, ge=1, le=100)
     force: bool = False
+
+
+class RollbackRequest(BaseModel):
+    """POST /admin/migration/rollback (tier 39) — restore config.yaml
+    from a promotion backup: the deliberate undo of a promotion (or a
+    ladder of them). ``backup`` names the ``config.yaml.bak-<utc
+    stamp>`` file promote wrote (flat name — a path separator never
+    passes validation); None rolls back to the LATEST backup, the
+    common "undo the last promotion" case. The chosen backup must
+    parse, the live file is backed up first (the rollback's own undo
+    point), and the apply runs the same discipline promote does: on
+    reload refusal the file is restored and the running config never
+    moved."""
+
+    backup: str | None = Field(default=None, max_length=128)
