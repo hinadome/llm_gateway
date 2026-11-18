@@ -740,6 +740,21 @@ function fmtWhen(iso) {
   const d = new Date(iso);
   return isNaN(d) ? esc(iso) : d.toLocaleString();
 }
+// Relative time for the key last-used column (tier 55): "just now"
+// under a minute, then the largest whole unit up to days; past a
+// month the calendar date says more than "47d ago". The exact ISO
+// timestamp rides the cell's title tooltip.
+function fmtAgo(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return esc(iso);
+  const s = (Date.now() - d.getTime()) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  if (s < 30 * 86400) return Math.floor(s / 86400) + "d ago";
+  return d.toLocaleDateString();
+}
 function toast(msg, isError) {
   const el = document.createElement("div");
   el.className = "toast" + (isError ? " error" : "");
@@ -1100,6 +1115,12 @@ async function loadKeys() {
     const adminBadge = k.is_admin
       ? ` <span class="b b-amber" title="${k.tenant_id ? "Tenant administrator — manages this tenant's keys, logs and usage; still subject to the tenant's policy" : "Platform administrator — the operator's full power"}">admin</span>`
       : "";
+    // Last-used telemetry (tier 55): relative time, exact ISO in the
+    // tooltip. "never" is scannable on purpose — a key no traffic ever
+    // rode (or that predates tracking) is a rotation candidate.
+    const lastUsedCell = k.last_used_at
+      ? `<span title="${esc(k.last_used_at)}">${fmtAgo(k.last_used_at)}</span>`
+      : '<span class="b b-gray" title="Never used — a rotation candidate (may also predate tracking)">never</span>';
     return `<tr>
       <td><b>${esc(k.name)}</b>${adminBadge}${tenantBadge}${k.is_active ? "" : ' <span class="b b-red">revoked</span>'}${expired ? ' <span class="b b-amber">expired</span>' : ""}${expiringBadge}${graceBadge}</td>
       <td class="mono muted">${esc(k.key_prefix)}…</td>
@@ -1108,14 +1129,15 @@ async function loadKeys() {
       <td class="num">${k.rpm_limit == null ? "—" : fmtInt(k.rpm_limit)} / ${k.tpm_limit == null ? "—" : fmtInt(k.tpm_limit)}</td>
       <td>${budgetCell}</td>
       <td class="muted" style="font-size:12px">${k.expires_at ? fmtWhen(k.expires_at) : "never"}</td>
+      <td class="muted" style="font-size:12px">${lastUsedCell}</td>
       <td style="white-space:nowrap">
         <button class="small ghost" data-edit="${esc(k.id)}">Edit</button>
         ${k.is_active ? `<button class="small ghost" data-rotate="${esc(k.id)}" data-name="${esc(k.name)}">Rotate</button>` : ""}
         ${k.is_active ? `<button class="small danger" data-revoke="${esc(k.id)}" data-name="${esc(k.name)}">Revoke</button>` : ""}
       </td></tr>`;
   }).join("");
-  $("#keys-table").innerHTML = "<thead><tr><th>Key</th><th>Prefix</th><th>State</th><th>Models / Guardrails</th><th class=num>RPM / TPM</th><th>Budget</th><th>Expires</th><th></th></tr></thead><tbody>" +
-    (rows || '<tr><td colspan="8" class="empty">No keys — create one</td></tr>') + "</tbody>";
+  $("#keys-table").innerHTML = "<thead><tr><th>Key</th><th>Prefix</th><th>State</th><th>Models / Guardrails</th><th class=num>RPM / TPM</th><th>Budget</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="9" class="empty">No keys — create one</td></tr>') + "</tbody>";
 }
 
 $("#keys-table").addEventListener("click", async e => {

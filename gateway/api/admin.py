@@ -27,6 +27,7 @@ from ..core.auth import (  # noqa: F401 — _is_expired re-exported for the play
     auth_context_from_key,
     get_key_by_name,
     load_tenant_for_key,
+    record_key_use,
 )
 from ..core.context import AuthContext
 from ..config import GatewayConfig
@@ -245,14 +246,44 @@ async def create_key(
 
 
 @router.get("/admin/keys")
-async def list_keys(admin: Annotated[AuthContext, Depends(require_admin)]) -> dict:
+async def list_keys(
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    idle_days: float | None = None,
+) -> dict:
+    """List keys, optionally narrowed to idle ones (tier 55).
+
+    ``idle_days=N`` keeps keys whose last recorded use is N days ago
+    or more — plus keys never used at all (NULL last_used_at: a
+    rotation candidate, not proof of death — the key may predate
+    tracking). The stale-key surface for rotation/revocation sweeps.
+    Filtering happens on the loaded rows, not in SQL, on purpose:
+    the endpoint returns every matching row anyway (no pagination),
+    and SQLite hands datetimes back naive while Postgres keeps them
+    aware — a Python comparison after the one normalization the
+    codebase already uses (_is_expired) is correct on both.
+    """
+    if idle_days is not None and idle_days < 0:
+        raise GatewayError(400, "idle_days must be >= 0.", "invalid_request_error")
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         stmt = select(VirtualKey).order_by(VirtualKey.created_at)
         if admin.tenant_id is not None:  # tenant admin: own tenant only
             stmt = stmt.where(VirtualKey.tenant_id == admin.tenant_id)
         result = await session.execute(stmt)
-        keys = [v.to_public_dict() for v in result.scalars()]
+        rows = list(result.scalars())
+    if idle_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=idle_days)
+
+        def _is_idle(vkey: VirtualKey) -> bool:
+            last = vkey.last_used_at
+            if last is None:
+                return True  # never used — a rotation candidate
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            return last <= cutoff
+
+        rows = [vkey for vkey in rows if _is_idle(vkey)]
+    keys = [vkey.to_public_dict() for vkey in rows]
     return {"object": "list", "data": keys}
 
 
@@ -2951,6 +2982,11 @@ async def playground_chat(
         effective_auth = auth_context_from_key(
             vkey, tenant=tenant, auth_method="playground"
         )
+        # Last-used telemetry (tier 55): the impersonated key's policy
+        # is about to serve this request exactly as a live one's would
+        # — the playground counts as use. (No key named → the admin's
+        # own context → no row to stamp.)
+        await record_key_use(vkey)
 
     request_id = (
         getattr(raw_request.state, "request_id", None) or f"req_{uuid.uuid4().hex}"

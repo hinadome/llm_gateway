@@ -8,6 +8,42 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Key last-used tracking (tier 55) — the key row answers "which keys
+  are actually alive?". Rotation and revocation were blind: the row
+  said when a key was created and what it may do, never when it was
+  last used. New nullable `VirtualKey.last_used_at`, stamped at auth
+  by `record_key_use` (core/auth.py) when a valid credential names
+  the key and traffic is about to ride its policy:
+  - **The four recording sites**: both chain steps (raw credential
+    and any JWT naming the key — the grace-window previous
+    credential stamps the same row, it is the same identity),
+    playground impersonation, and the batch worker's per-wave auth.
+    Auth runs first, so cache hits and post-auth refusals still
+    count — possession was proven either way.
+  - **The deliberate gap**: the replay harness never stamps. A
+    replay re-runs recorded traffic without proving anything about
+    the present — marking a key alive would be a lie, and the gap is
+    what makes the stamp trustworthy as an alive signal.
+  - **Telemetry, never policy**: throttled to one write per ~60s per
+    key (a fixed write-amplification guard, deliberately not a
+    config knob), best-effort (a stamping failure never fails the
+    request it observes), written via a Core UPDATE touching only
+    `last_used_at` (so `updated_at` stays an edit marker), with the
+    in-memory row refreshed via `set_committed_value` (the batch
+    worker's row is still attached to its wave session).
+  - **The stale-key surface**: `GET /admin/keys?idle_days=N` narrows
+    the listing to keys idle ≥ N days **plus never-used ones** (NULL
+    is a rotation candidate, not proof of death — the key may
+    predate tracking). Filtered on the loaded rows rather than in
+    SQL on purpose: the endpoint returns every matching row anyway,
+    and SQLite/Postgres disagree about timezone awareness — one
+    normalized Python comparison is correct on both. Negative values
+    400; tenant scoping unchanged. The dashboard's keys table gains a
+    **Last used** column: relative time (just now / Nm / Nh / Nd,
+    calendar date past a month), the exact ISO timestamp in the
+    tooltip, and a gray **never** badge. 12 new e2e tests
+    (`tests/test_key_last_used.py`), all time-travel-pinned via
+    direct row updates — no sleeps.
 - Per-key cache policy (tier 54) — the response caches stop being
   global. One `cache.enabled` and one `cache.ttl_seconds` for every
   caller meant a team wanting no caching (a support bot that must

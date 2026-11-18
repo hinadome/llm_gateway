@@ -48,7 +48,8 @@ from datetime import datetime, timezone
 from typing import Callable
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..config import AuthConfig, JWTAuthConfig
 from ..db import get_sessionmaker
@@ -171,6 +172,68 @@ def auth_context_from_key(
     )
 
 
+# Tier 55: how often one key's last_used_at may be written while traffic
+# keeps flowing. A write-amplification guard, deliberately not a config
+# knob: it has no policy meaning (the timestamp is telemetry — "when was
+# this key last seen", not "when did its budget change"), and 60s is
+# finer than any decision (rotation, revocation, the idle filter) ever
+# needs. Purely in-memory against the already-loaded row, so a burst of
+# concurrent first-uses may all write — harmless, they stamp ~now.
+_LAST_USED_INTERVAL_SECONDS = 60.0
+
+
+async def record_key_use(vkey: VirtualKey) -> None:
+    """Stamp last_used_at on a key traffic is about to ride.
+
+    "Use" = a valid credential named this key and its policy is about
+    to serve the request — recorded at the four sites where that
+    happens (the virtual_key and jwt chain steps, playground
+    impersonation, the batch worker's per-wave auth). auth runs first
+    in the pipeline, so cache hits, guardrail blocks and rate-limit
+    refusals still count: the caller proved possession either way. The
+    replay harness deliberately never calls this — a replay must not
+    mark a key alive.
+
+    Throttled to one write per interval per key (checked against the
+    loaded row — no extra read), best-effort (a failure here must
+    never fail the request it observes). The Core UPDATE touches only
+    last_used_at, so updated_at stays what it means: an edit marker.
+    """
+    now = datetime.now(timezone.utc)
+    last = vkey.last_used_at
+    if last is not None:
+        if last.tzinfo is None:
+            # SQLite hands stored datetimes back naive; the codebase
+            # normalizes the same way (_is_expired) before comparing.
+            last = last.replace(tzinfo=timezone.utc)
+        if (now - last).total_seconds() < _LAST_USED_INTERVAL_SECONDS:
+            return
+    try:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            await session.execute(
+                update(VirtualKey)
+                .where(VirtualKey.id == vkey.id)
+                .values(last_used_at=now)
+            )
+            await session.commit()
+        # Keep the in-memory row honest too: it throttles the next
+        # request's check without a DB read, and anything else holding
+        # this row (same request, same process) sees the fresh value.
+        # set_committed_value (not a plain assignment): the batch
+        # worker calls this with a row still attached to its wave
+        # session, where a dirty attribute would re-write the column
+        # — and bump updated_at — on that session's flush. Committed
+        # state = "the DB already says this; nothing to flush".
+        set_committed_value(vkey, "last_used_at", now)
+    except Exception:
+        logger.warning(
+            "last_used_at update failed for key %s — continuing without it",
+            vkey.id,
+            exc_info=True,
+        )
+
+
 async def get_key_by_name(name: str) -> VirtualKey | None:
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -262,6 +325,11 @@ class VirtualKeyAuthenticator(Authenticator):
                     "has ended. Use the key's current credential."
                 )
         tenant = await load_tenant_for_key(vkey)
+        # Last-used telemetry (tier 55): this credential — the row's
+        # current one OR the previous one inside its grace window, both
+        # reach here — just proved possession and the request is about
+        # to ride this row's policy. Throttled + best-effort.
+        await record_key_use(vkey)
         return auth_context_from_key(
             vkey, tenant=tenant, auth_method=self.name
         )
@@ -338,6 +406,10 @@ class JWTAuthenticator(Authenticator):
         if _is_expired(vkey.expires_at):
             raise AuthError("This API key has expired.")
         tenant = await load_tenant_for_key(vkey)
+        # Last-used telemetry rides the token path too: the caller
+        # proved possession of a credential naming this key, and its
+        # policy is about to serve the request (tier 55).
+        await record_key_use(vkey)
         return auth_context_from_key(vkey, tenant=tenant, auth_method=self.name)
 
     # -- verification ---------------------------------------------------------

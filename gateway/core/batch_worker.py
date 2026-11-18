@@ -47,7 +47,7 @@ from ..errors import BudgetExceededError, GatewayError, RateLimitError
 from ..models import Batch, BatchResult, StoredFile, Tenant, VirtualKey
 from ..observability import metrics
 from ..schemas import ChatCompletionRequest
-from .auth import auth_context_from_key
+from .auth import auth_context_from_key, record_key_use
 from .context import AuthContext
 
 if TYPE_CHECKING:  # pragma: no cover — import for typing only
@@ -180,6 +180,11 @@ class BatchWorker:
         tenant = None
         if vkey.tenant_id:
             tenant = await session.get(Tenant, vkey.tenant_id)
+        # Last-used telemetry (tier 55): the batch's lines are about to
+        # ride this key's policy, so the wave counts as use — same as a
+        # live request would. Per-wave, not per-line: the ~60s throttle
+        # makes the distinction moot for any real batch.
+        await record_key_use(vkey)
         return auth_context_from_key(vkey, tenant, auth_method="batch")
 
     async def _execute_wave(self, session, batch: Batch) -> None:

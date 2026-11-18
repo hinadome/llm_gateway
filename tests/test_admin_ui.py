@@ -450,3 +450,25 @@ async def test_admin_ui_key_cache_policy_surface(env):
         "bypass",
     ):
         assert marker in body, marker
+
+
+async def test_admin_ui_key_last_used_surface(env):
+    # Tier 55: the keys table gains the last-used column — the fmtAgo
+    # relative-time renderer (just now / Nm / Nh / Nd, calendar date
+    # past a month), the "Last used" header, the never-used badge with
+    # its rotation-candidate tooltip, the ISO tooltip on real values,
+    # and the widened colspan. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        "function fmtAgo(",
+        'return "just now"',
+        '"m ago"',
+        '"h ago"',
+        '"d ago"',
+        "<th>Last used</th>",
+        "lastUsedCell",
+        "Never used — a rotation candidate (may also predate tracking)",
+        'title="${esc(k.last_used_at)}"',
+        'colspan="9"',
+    ):
+        assert marker in body, marker

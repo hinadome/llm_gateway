@@ -177,6 +177,18 @@ class VirtualKey(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+    # Tier 55: when traffic last rode this key's policy — the "which
+    # keys are actually alive?" answer for rotation and revocation
+    # decisions. Stamped by record_key_use (core/auth.py) at the four
+    # use-defining sites: both chain steps (raw credential and any JWT
+    # naming the key — the grace-window previous credential included,
+    # it is the same identity), playground impersonation and the batch
+    # worker. The replay harness deliberately never stamps: a replayed
+    # request must not mark a key alive. NULL = never used — itself a
+    # rotation candidate. Telemetry, not policy: best-effort,
+    # throttled (~60s per key), and written without touching the
+    # row's other columns (updated_at stays an edit marker).
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_public_dict(self) -> dict:
         return {
@@ -218,6 +230,7 @@ class VirtualKey(Base):
             "grace_until": self.grace_until.isoformat() if self.grace_until else None,
             "previous_key_prefix": self.previous_key_prefix,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
         }
 
 

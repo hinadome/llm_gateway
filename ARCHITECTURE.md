@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 92 Python files, ~35,100 lines, 1332 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 92 Python files, ~35,200 lines, 1344 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -330,7 +330,23 @@ gateway/
 │                           the state); key create/PATCH carry the
 │                           per-key cache policy (tier 54:
 │                           cache_enabled / cache_ttl_seconds, explicit
-│                           null on PATCH resets to inherit); tenancy —
+│                           null on PATCH resets to inherit);
+│                           GET /admin/keys?idle_days=N (tier 55)
+│                           narrows the listing to stale keys —
+│                           last used ≥ N days ago or never used
+│                           (NULL last_used_at, a rotation
+│                           candidate — never-used is not proof of
+│                           death, the key may predate tracking);
+│                           filtered on the loaded rows, not in
+│                           SQL, on purpose: the endpoint returns
+│                           every matching row anyway and SQLite
+│                           hands datetimes back naive while
+│                           Postgres keeps them aware — one Python
+│                           comparison after the codebase's
+│                           existing normalization is correct on
+│                           both; negative values 400; tenant
+│                           scoping unchanged (a tenant admin
+│                           sweeps their own); tenancy —
 │                           tenant admins are forced into their own tenant on
 │                           create (mismatch 400), refused re-homing (403),
 │                           and see 404s for other tenants' keys/logs),
@@ -484,7 +500,11 @@ gateway/
 │                           residency, guardrail scopes and rate
 │                           limits bind and its spend accrues
 │                           (omitted = the calling admin's own,
-│                           unrestricted context); auth_method
+│                           unrestricted context); impersonating
+│                           also stamps the key's last_used_at
+│                           (tier 55 — the run is its traffic,
+│                           exactly what a live request would
+│                           count as); auth_method
 │                           "playground" labels every row and event;
 │                           route="chat" keeps guardrail route-scopes
 │                           identical; stream:true is an explicit
@@ -1236,6 +1256,22 @@ gateway/
 │   │                       so JWT/playground/batch callers get their key's
 │   │                       policy automatically — and auth_method for logs)
 │   │                       and
+│   │                       record_key_use (tier 55) stamps last_used_at when
+│   │                       a valid credential names a key and traffic is
+│   │                       about to ride its policy — called at both chain
+│   │                       steps (grace-window previous credential included,
+│   │                       same row), playground impersonation and the batch
+│   │                       worker; replay deliberately never does (a replay
+│   │                       must not mark a key alive). Throttled one write
+│   │                       per ~60s per key (in-memory check against the
+│   │                       loaded row — no extra read, no config knob),
+│   │                       best-effort (never fails the request), Core
+│   │                       UPDATE touching only last_used_at so updated_at
+│   │                       stays an edit marker, in-memory refresh via
+│   │                       set_committed_value (the batch worker's row is
+│   │                       still attached to its wave session — a dirty
+│   │                       attribute would re-write on flush)
+│   │                       and
 │   │                       load_tenant_for_key loads the key's tenant row
 │   │                       into the same snapshot — the ceiling fields
 │   │                       plus pricing_markup_pct (cost-plus billing)
@@ -1329,7 +1365,11 @@ gateway/
 │   │                       one wave (batch.wave_size lines) of the oldest
 │   │                       runnable batch — each line a full interactive
 │   │                       request via handle_chat (fresh auth snapshot per
-│   │                       wave; request_id '<batch id>-L<line>',
+│   │                       wave, which also stamps the owning key's
+│   │                       last_used_at — tier 55: background execution
+│   │                       is still the key's traffic, and per-wave is
+│   │                       per-use at the ~60s throttle's resolution;
+│   │                       request_id '<batch id>-L<line>',
 │   │                       auth_method 'batch'). Line failures are exactly
 │   │                       what the interactive request would return (error
 │   │                       envelope in the batch's error file); rate limits
@@ -1814,7 +1854,11 @@ gateway/
 │   │                       keys surface as would-now-401 findings;
 │   │                       bare/admin-key entries replay as the
 │   │                       calling admin; tenant admins skip other
-│   │                       tenants' traffic). ctx.dry_run suppresses
+│   │                       tenants' traffic; the re-loaded row is
+│   │                       deliberately never stamped last_used_at —
+│   │                       tier 55, a replay proves nothing about
+│   │                       the present, so it must not mark a key
+│   │                       alive). ctx.dry_run suppresses
 │   │                       guardrail counter increments in the
 │   │                       manager's _record, so a harness run can
 │   │                       never trip block alerts. The per-line diff
@@ -2241,7 +2285,13 @@ gateway/
                             management (create/edit/revoke, raw key shown once,
                             tenant placement + admin-key grants for platform
                             admins; badges for tenant membership and admin
-                            keys), tenant management (create/edit/delete,
+                            keys; tier 55 adds the Last used column —
+                            relative time via fmtAgo ("just now"/Nm/Nh/
+                            Nd, the calendar date past a month), the
+                            exact ISO timestamp in the tooltip, and a
+                            gray "never" badge for never-used keys
+                            whose tooltip says what they are: rotation
+                            candidates), tenant management (create/edit/delete,
                             pooled budget bars, kill switch — platform admins
                             only; a tenant admin lands on a scoped note),
                             vault (tier 34: honest status + the per-tenant
@@ -2635,7 +2685,7 @@ sequenceDiagram
     participant DB as Database
 
     C->>A: POST /v1/chat/completions (Bearer sk-gw-... / token)
-    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ jwt → custom steps, first match wins<br/>(a key with a tenant loads its row —<br/>dangling tenant_id or disabled tenant<br/>fails closed, 401 — and a rotated key<br/>accepts its previous credential inside<br/>the grace window as the same identity,<br/>past it an explicit rotated 401)
+    A->>A: auth chain (app.state): admin_key → virtual_key<br/>→ jwt → custom steps, first match wins<br/>(a key with a tenant loads its row —<br/>dangling tenant_id or disabled tenant<br/>fails closed, 401 — and a rotated key<br/>accepts its previous credential inside<br/>the grace window as the same identity,<br/>past it an explicit rotated 401.<br/>Each virtual-key use stamps the row's<br/>last_used_at — tier 55, throttled<br/>~60s, best-effort)
     A-->>A: token scoping (allowed_endpoints / allowed_ips)
     A->>P: handle_chat(request, auth)
 
@@ -2850,6 +2900,7 @@ erDiagram
         str previous_key_prefix "display-only: which credential is in its grace window"
         datetime grace_until "until it, the previous credential authenticates as this same key"
         json metadata_json
+        datetime last_used_at "tier 55: when traffic last rode this key's policy (stamped at auth by record_key_use — throttled ~60s, best-effort, replay never); NULL = never used, a rotation candidate"
     }
     REQUEST_LOG {
         int id PK
@@ -3237,6 +3288,24 @@ tests/
 │                        PATCH toggles (opt-out stops serving the
 │                        existing entry — reset-to-inherit serves it
 │                        again; window shrink/reset likewise)
+├── test_key_last_used.py  Key last-used tracking (tier 55): first use
+│                        stamps None -> ~now (create echo says never),
+│                        the ~60s throttle pinned by direct-row
+│                        time-travel (10s ago -> request -> UNCHANGED;
+│                        100s ago -> request -> re-stamped — no
+│                        sleeps, no knob), the "use" definition (cache
+│                        HIT and post-auth-refused requests still
+│                        stamp — possession was proven; JWT callers
+│                        stamp the NAMED key; playground impersonation
+│                        stamps while the admin's own context has
+│                        nothing to stamp and must not crash; a batch
+│                        wave stamps the owning key; the grace-window
+│                        OLD credential stamps the same row), the
+│                        deliberate gap (a replay re-runs traffic but
+│                        leaves a stale stamp untouched), and the
+│                        stale-key surface (idle_days filter: idle
+│                        keys + never-used ones, 0 = everything,
+│                        negative 400; tenant admins sweep their own)
 ├── test_key_rotation.py  Tier 51: rotate issues a new raw key once (old prefix
 │                        kept for display, hashes never exposed), both
 │                        credentials inside grace, honest post-grace 401
@@ -3266,7 +3335,11 @@ tests/
 │                        key-dialog tenancy) markers, key-dialog per-key cache
 │                        policy markers (tier 54: k-cache select, k-cache-ttl
 │                        window, submit wiring + create-mode null-deletion,
-│                        row badge), /admin/logs/{id} full row incl.
+│                        row badge), keys-table last-used markers (tier 55:
+│                        fmtAgo renderer units — just now/m/h/d + calendar
+│                        fallback, the Last used header, the never badge
+│                        tooltip, the ISO tooltip, colspan 9),
+│                        /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,
 │                        tool_result, images, stop reasons, error chunks) + e2e through
