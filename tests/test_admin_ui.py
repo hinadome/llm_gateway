@@ -258,6 +258,26 @@ async def test_admin_ui_slo_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_slo_budget_surface(env):
+    # Tier 43: the SLO panel's error-budget column — the bar restated
+    # as a budget: remaining % colored by state (on_track green,
+    # at_risk amber, exhausted red, insufficient gray), each burn
+    # rule's pace verdict in the tooltip and a red badge for a rule
+    # that is firing. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        "budgetCell",
+        "BUDGET_COLOR",
+        "at_risk",
+        "burning",
+        "remaining_pct",
+        "on_track",
+        "exhausted",
+        "burn_rate",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

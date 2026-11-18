@@ -895,7 +895,24 @@ async function loadSLOs() {
   const targets = r.data || [];
   panel.style.display = targets.length ? "" : "none";
   if (!targets.length) return;
-  box.innerHTML = "<thead><tr><th>Objective</th><th>Scope</th><th>Metric</th><th class=num>Bar</th><th class=num>Measured</th><th class=num>Requests</th><th>Verdict</th><th>Window</th></tr></thead><tbody>" +
+  // Tier 43: the error-budget cell — remaining colored by state
+  // (at_risk amber, exhausted red, insufficient gray), with every
+  // burn rule's pace verdict in the tooltip.
+  const BUDGET_COLOR = { on_track: "b-green", at_risk: "b-amber", exhausted: "b-red", insufficient_evidence: "b-gray" };
+  function budgetCell(t) {
+    const b = t.budget || {};
+    if (b.state === "insufficient_evidence")
+      return `<span class="muted" title="${esc(b.reason || "")}">unproven</span>`;
+    const lines = (t.burn || []).map(r =>
+      `${r.name}: ${r.verdict === "burning" ? "burning " + r.long.burn_rate.toFixed(1) + "x over " + r.long.minutes + "m, confirmed " + r.short.burn_rate.toFixed(1) + "x over " + r.short.minutes + "m (bar " + r.rate + "x)" : r.verdict.replace(/_/g, " ") + (r.reason ? " — " + r.reason : "")}`
+    ).join("\n");
+    const tip = (b.reason ? b.reason + "\n" : "") + lines;
+    const burning = (t.burn || []).filter(r => r.verdict === "burning")
+      .map(r => ` <span class="b b-red">${esc(r.name)}</span>`).join("");
+    const pct = b.remaining_pct == null ? "—" : Math.round(b.remaining_pct) + "% left";
+    return `<span class="b ${BUDGET_COLOR[b.state] || "b-gray"}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(pct)}</span>${burning}`;
+  }
+  box.innerHTML = "<thead><tr><th>Objective</th><th>Scope</th><th>Metric</th><th class=num>Bar</th><th class=num>Measured</th><th class=num>Requests</th><th>Budget</th><th>Verdict</th><th>Window</th></tr></thead><tbody>" +
     targets.map(t => {
       const scope = esc(t.model) + (t.deployment ? ` · <span class="mono" style="font-size:12px">${esc(t.deployment)}</span>` : "");
       const badge = `<span class="b ${SLO_BADGE[t.verdict] || "b-gray"}"${t.reason ? ` title="${esc(t.reason)}"` : ""}>${esc(t.verdict.replace(/_/g, " "))}</span>`;
@@ -909,6 +926,7 @@ async function loadSLOs() {
         <td class="num">${fmtSloValue(t.metric, t.target)}</td>
         <td class="num">${measured}</td>
         <td class="num">${fmtInt((t.measured || {}).requests)} <span class="muted" style="font-size:12px">of ${t.min_requests} min</span></td>
+        <td>${budgetCell(t)}</td>
         <td>${badge}</td>
         <td style="white-space:nowrap">last ${t.window_minutes}m</td>
       </tr>`;

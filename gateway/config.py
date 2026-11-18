@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -669,6 +669,44 @@ class SLOTargetConfig(BaseModel):
     min_requests: int = 20  # sufficiency gate — thin volume is not a verdict
 
 
+class SLOBurnRule(BaseModel):
+    """One burn-rate rule (tier 43): the Google-SRE multiwindow
+    alerting recipe, verdicted on demand beside the bar verdict.
+
+    A burn rate is the *pace* a target consumes its error budget —
+    observed bad-event fraction over the bad-event allowance
+    (``1% errors`` allows 1%; ``p95 under 800ms`` implies 5% of
+    requests may exceed the bar). Burn 1.0 = spending the budget
+    exactly as fast as the promise allows; burn 14.4 = 14.4x. Rate
+    thresholds alert on the PACE rather than the raw bar, so a burst
+    that would take days to move a rolling average still pages in
+    minutes — and the two-window AND is the anti-flap: ``long_minutes``
+    establishes the pace is real (not one unlucky request),
+    ``short_minutes`` confirms it is STILL burning now (a burst that
+    ended refuses to page). Defaults are the SRE workbook's canonical
+    pairs: page on 14.4x over 1h confirmed by 5m (2% of a 30-day
+    budget in an hour), ticket on 3x over 1d confirmed by 2h.
+    """
+
+    name: str
+    rate: float = Field(gt=0)  # burn-rate bar (observed / allowed)
+    long_minutes: int = Field(gt=0)  # the pace-establishing window
+    short_minutes: int = Field(gt=0)  # the still-burning confirmation window
+
+    @model_validator(mode="after")
+    def _short_within_long(self) -> "SLOBurnRule":
+        # The confirmation window must sit inside the pace window —
+        # a short window wider than the long one is not a
+        # confirmation of anything.
+        if self.short_minutes > self.long_minutes:
+            raise ValueError(
+                f"burn rule '{self.name}': short_minutes ({self.short_minutes}) "
+                f"must not exceed long_minutes ({self.long_minutes}) — the "
+                "confirmation window is a subset of the pace window"
+            )
+        return self
+
+
 class SLOsConfig(BaseModel):
     """Service level objectives (tier 42): named, deliberate promises
     about the client experience — ``p95 latency under 800ms``, ``error
@@ -680,9 +718,29 @@ class SLOsConfig(BaseModel):
     re-verdicts. Alert delivery on breach (webhook + re-arm semantics)
     is the next tier; this surface is the measurement and the honest
     answer, never a pager.
+
+    Tier 43 adds the error-budget lens: every metric restated as a
+    bad-event fraction against its allowance (``error_rate``'s bad
+    events are failed+blocked rows and the allowance is the bar
+    itself; a latency/TTFT percentile bar implies the allowance
+    ``1 - p`` of requests may exceed it), burn rate = observed /
+    allowed, budget remaining, and the ``burn`` rules — multiwindow
+    pace verdicts over the same rows. ``burn: []`` disables the
+    pace verdicts (the budget math stands on its own).
     """
 
     targets: list[SLOTargetConfig] = Field(default_factory=list)
+    # The SRE workbook's canonical pairs: page-fast, ticket-slow.
+    burn: list[SLOBurnRule] = Field(
+        default_factory=lambda: [
+            SLOBurnRule(
+                name="fast-burn", rate=14.4, long_minutes=60, short_minutes=5
+            ),
+            SLOBurnRule(
+                name="slow-burn", rate=3.0, long_minutes=1440, short_minutes=120
+            ),
+        ]
+    )
 
 
 class PIIScanConfig(BaseModel):

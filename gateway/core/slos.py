@@ -26,6 +26,22 @@ loop, no persistence, no notifications — a tightened bar re-verdicts
 on the next read because there is no cached verdict to go stale.
 Alert delivery on breach is the next tier; this module is the
 measurement and the honest answer, never a pager.
+
+Tier 43 adds the ERROR-BUDGET lens, same query+pure split: every
+metric restated as a bad-event fraction against its allowance
+(``measure_bad`` — failed+blocked rows for ``error_rate``, where the
+bar IS the allowance; rows over the bar for the latency/TTFT
+percentiles, where a pXX bar implies ``1 - p`` of requests may
+exceed it), burn rate = observed / allowed (``budget_state`` —
+on_track / at_risk / exhausted / insufficient_evidence), and the
+multiwindow pace verdicts (``burn_rule_verdict`` — the SRE
+recipe: a long window establishes the pace, a short one confirms
+it is still burning, so a burst that already ended never fires).
+A zero-tolerance bar (allowance 0) has no rate to compute: any
+bad event exhausts the budget, and burn stays None rather than
+inventing an infinity. Windows carry their own sufficiency gates,
+scaled from the target's ``min_requests`` by the window's share of
+the target's own window, floored at 1.
 """
 
 from __future__ import annotations
@@ -36,7 +52,7 @@ from typing import Any
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import SLOTargetConfig
+from ..config import SLOBurnRule, SLOTargetConfig
 from ..models import RequestLog
 
 # Client experience, defined once: the rows a client could feel.
@@ -184,6 +200,261 @@ def evaluate(
     }
 
 
+# -- error budgets & burn rate (tier 43) --------------------------------------
+# The same promise, restated as a budget: how many bad events does the
+# bar allow, how many happened, and how FAST is the allowance being
+# spent. A percentile bar and a bad-event allowance are two lenses on
+# one promise — "p95 under 800ms" means at most ~5% of requests may
+# exceed 800ms — so the budget ships BESIDE the tier-42 verdict, never
+# replacing it.
+
+# The allowance implied by each percentile metric: the fraction of
+# requests the bar permits to be "bad" (over the bar). error_rate's
+# allowance is the bar itself (handled separately — not in this table).
+_METRIC_BAD_ALLOWED = {
+    "latency_p50_ms": 0.50,
+    "latency_p95_ms": 0.05,
+    "latency_p99_ms": 0.01,
+    "ttft_p95_ms": 0.05,
+}
+
+
+def allowed_bad_fraction(slo: SLOTargetConfig) -> float:
+    """The bad-event allowance the bar implies: ``error_rate`` 0.01
+    allows 1% failed+blocked rows; ``latency_p95_ms`` 800 allows 5% of
+    requests over 800ms (the nearest-rank p95 and the 5% tail are the
+    same promise seen from two sides)."""
+    if slo.metric == "error_rate":
+        return slo.target
+    return _METRIC_BAD_ALLOWED[slo.metric]
+
+
+async def measure_bad(
+    session: AsyncSession,
+    slo: SLOTargetConfig,
+    window_minutes: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """One window's bad-event accounting for one target: the
+    denominator (the rows the metric can measure — every row for
+    ``error_rate``, latency-bearing rows for the latency percentiles,
+    streamed rows for TTFT) and the bad count (failed+blocked for
+    ``error_rate``; rows OVER the bar for the percentile metrics —
+    the same rows their percentile was computed over, so the budget
+    and the verdict can never disagree about what counts).``now``
+    is injectable so tests can pin window boundaries."""
+    now = now or datetime.now(timezone.utc)
+    since = now - timedelta(minutes=window_minutes)
+    conds = [
+        RequestLog.model == slo.model,
+        RequestLog.created_at >= since,
+        *_CLIENT_ROW,
+    ]
+    if slo.deployment is not None:
+        conds.append(RequestLog.deployment == slo.deployment)
+    if slo.metric == "error_rate":
+        denominator: tuple[Any, ...] = ()
+        bad_extra: tuple[Any, ...] = (RequestLog.status.in_(("error", "blocked")),)
+    elif slo.metric == "ttft_p95_ms":
+        denominator = (RequestLog.ttft_ms.isnot(None),)
+        # NULL > bar is NULL in SQL, so the bad count needs no extra
+        # non-null guard of its own.
+        bad_extra = (RequestLog.ttft_ms > slo.target,)
+    else:  # the latency percentiles
+        denominator = (RequestLog.latency_ms.isnot(None),)
+        bad_extra = (RequestLog.latency_ms > slo.target,)
+    measured = (
+        await session.scalar(
+            select(func.count()).where(*conds, *denominator)
+        )
+        or 0
+    )
+    bad = (
+        await session.scalar(
+            select(func.count()).where(*conds, *bad_extra)
+        )
+        or 0
+    )
+    return {
+        "minutes": window_minutes,
+        "measured": measured,
+        "bad": bad,
+        "bad_fraction": (bad / measured) if measured else None,
+    }
+
+
+def _window_gate(slo: SLOTargetConfig, window_minutes: int) -> int:
+    """The sufficiency floor for one measurement window: the target's
+    ``min_requests`` scaled by the window's share of the target's own
+    window (20-of-an-hour is 20 in the hour, 2 in five minutes, 480
+    in a day), floored at 1 — a window that carried nothing measures
+    nothing, regardless of the pace arithmetic."""
+    return max(1, round(slo.min_requests * window_minutes / max(slo.window_minutes, 1)))
+
+
+def _window_view(window: dict[str, Any], slo: SLOTargetConfig, gate: int) -> dict[str, Any]:
+    """One measured window, verdict-ready: the burn rate (observed
+    fraction over the allowance) and its sufficiency against the
+    scaled gate. Zero-tolerance bars have no rate to compute."""
+    allowed = allowed_bad_fraction(slo)
+    fraction = window.get("bad_fraction")
+    burn = (fraction / allowed) if (fraction is not None and allowed > 0) else None
+    measured = window.get("measured") or 0
+    return {
+        "minutes": window["minutes"],
+        "measured": measured,
+        "bad": window.get("bad") or 0,
+        "bad_fraction": fraction,
+        "burn_rate": burn,
+        "gate": gate,
+        "sufficient": measured >= gate,
+    }
+
+
+def budget_state(
+    window: dict[str, Any], slo: SLOTargetConfig, any_burning: bool
+) -> dict[str, Any]:
+    """The pure budget verdict over the target's OWN window: burn rate
+    (observed bad fraction over the allowance), remaining fraction
+    (1 - burn, negative when the window overspent), and the state —
+    ``on_track`` (burn <= 1), ``at_risk`` (within allowance overall
+    but a burn rule is firing — fine on average, burning fast NOW),
+    ``exhausted`` (the window overspent its allowance), or
+    ``insufficient_evidence`` (fewer measurable rows than
+    ``min_requests`` — the same honesty the bar verdict has). A
+    zero-tolerance bar (allowance 0) has no rate: any bad event
+    exhausts it, and burn/remaining stay None rather than inventing
+    an infinity."""
+    allowed = allowed_bad_fraction(slo)
+    measured = window.get("measured") or 0
+    bad = window.get("bad") or 0
+    fraction = window.get("bad_fraction")
+    burn = (fraction / allowed) if (fraction is not None and allowed > 0) else None
+    remaining = (1 - burn) if burn is not None else None
+    out: dict[str, Any] = {
+        "allowed_fraction": allowed,
+        "window_minutes": slo.window_minutes,
+        "measured": measured,
+        "bad": bad,
+        "bad_fraction": fraction,
+        "burn_rate": burn,
+        "remaining_fraction": remaining,
+        "remaining_pct": (remaining * 100) if remaining is not None else None,
+    }
+    if measured < slo.min_requests:
+        out.update(
+            state="insufficient_evidence",
+            reason=(
+                f"only {measured} measurable request(s) in the last "
+                f"{slo.window_minutes}m — the minimum is {slo.min_requests}; "
+                "a quiet window has no budget to read"
+            ),
+        )
+    elif allowed <= 0:
+        if bad > 0:
+            out.update(
+                state="exhausted",
+                reason=(
+                    f"zero-tolerance budget: {bad} bad event(s) against a "
+                    "0 allowance"
+                ),
+            )
+        else:
+            out.update(
+                state="on_track",
+                reason="zero-tolerance budget intact: no bad events",
+            )
+    elif burn is None:
+        out.update(
+            state="insufficient_evidence",
+            reason="no measurable requests in the window",
+        )
+    elif burn > 1:
+        out.update(
+            state="exhausted",
+            reason=f"burn rate {burn:.1f}x — the window overspent its allowance",
+        )
+    elif any_burning:
+        out.update(
+            state="at_risk",
+            reason=(
+                f"burn rate {burn:.1f}x is within allowance, but a burn "
+                "rule is firing — spending fast right now"
+            ),
+        )
+    else:
+        out.update(state="on_track", reason=None)
+    return out
+
+
+def burn_rule_verdict(
+    long_window: dict[str, Any],
+    short_window: dict[str, Any],
+    rule: SLOBurnRule,
+    slo: SLOTargetConfig,
+) -> dict[str, Any]:
+    """The pure multiwindow pace verdict for one burn rule: the SRE
+    anti-flap AND — the long window establishes the pace is real
+    (burn over the rule's rate), the short window confirms it is
+    STILL burning now. Both windows must clear their own scaled
+    sufficiency gates, or the verdict is honestly insufficient. A
+    zero-tolerance bar has no rate to compare (allowance 0), so its
+    rules are insufficient with the reason saying so — never a
+    fabricated infinity."""
+    long_view = _window_view(long_window, slo, _window_gate(slo, rule.long_minutes))
+    short_view = _window_view(short_window, slo, _window_gate(slo, rule.short_minutes))
+    out: dict[str, Any] = {
+        "name": rule.name,
+        "rate": rule.rate,
+        "long": long_view,
+        "short": short_view,
+    }
+    if allowed_bad_fraction(slo) <= 0:
+        out.update(
+            verdict="insufficient_evidence",
+            reason="zero-tolerance SLO — burn rate is undefined (allowance 0)",
+        )
+        return out
+    if not long_view["sufficient"]:
+        out.update(
+            verdict="insufficient_evidence",
+            reason=(
+                f"only {long_view['measured']} request(s) in the "
+                f"{rule.long_minutes}m pace window — the scaled gate is "
+                f"{long_view['gate']}"
+            ),
+        )
+    elif not short_view["sufficient"]:
+        out.update(
+            verdict="insufficient_evidence",
+            reason=(
+                f"only {short_view['measured']} request(s) in the "
+                f"{rule.short_minutes}m confirmation window — the scaled "
+                f"gate is {short_view['gate']}"
+            ),
+        )
+    elif (
+        long_view["burn_rate"] is not None
+        and short_view["burn_rate"] is not None
+        and long_view["burn_rate"] >= rule.rate
+        and short_view["burn_rate"] >= rule.rate
+    ):
+        out.update(
+            verdict="burning",
+            reason=(
+                f"burning {long_view['burn_rate']:.1f}x over "
+                f"{rule.long_minutes}m, confirmed {short_view['burn_rate']:.1f}x "
+                f"over the last {rule.short_minutes}m (bar {rule.rate}x)"
+            ),
+        )
+    else:
+        # Steady includes "the pace window is over the bar but the
+        # confirmation window is not" — the burst already ended, and
+        # the two-window AND refuses to page on it.
+        out.update(verdict="steady", reason=None)
+    return out
+
+
 async def status(
     session: AsyncSession,
     config: Any,
@@ -193,14 +464,33 @@ async def status(
     SLO with the definition echoed, the window's ``since`` bound, the
     full measurement (so the volume and the other metrics are
     inspectable beside the verdict), the target metric's ``value``,
-    and the verdict with its check and human reason. Ordered by name
-    — the list is the operator's own config, and a stable order keeps
-    dashboards calm across reloads."""
+    and the verdict with its check and human reason — plus, tier 43,
+    the ``budget`` (bad-event allowance, bad count, burn rate,
+    remaining, state) and the ``burn`` rules (each rule's long/short
+    window numbers and burning/steady/insufficient verdict). Ordered
+    by name — the list is the operator's own config, and a stable
+    order keeps dashboards calm across reloads."""
     now = now or datetime.now(timezone.utc)
     rows: list[dict[str, Any]] = []
     for slo in sorted(config.slos.targets, key=lambda s: s.name):
         measured = await measure(session, slo, now=now)
         verdict = evaluate(measured, slo)
+        # Tier 43: the error-budget lens over the same rows — the
+        # target's own window for the budget, each burn rule's
+        # long/short windows for the pace verdicts. The rules verdict
+        # first so at_risk can see them (fine on average, burning
+        # fast now).
+        burn_rules: list[dict[str, Any]] = []
+        for rule in config.slos.burn:
+            long_window = await measure_bad(session, slo, rule.long_minutes, now=now)
+            short_window = await measure_bad(session, slo, rule.short_minutes, now=now)
+            burn_rules.append(burn_rule_verdict(long_window, short_window, rule, slo))
+        any_burning = any(r["verdict"] == "burning" for r in burn_rules)
+        budget = budget_state(
+            await measure_bad(session, slo, slo.window_minutes, now=now),
+            slo,
+            any_burning,
+        )
         rows.append(
             {
                 "name": slo.name,
@@ -214,6 +504,8 @@ async def status(
                 "measured": measured,
                 "value": measured.get(slo.metric),
                 **verdict,
+                "budget": budget,
+                "burn": burn_rules,
             }
         )
     return rows

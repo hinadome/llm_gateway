@@ -2672,7 +2672,17 @@ async def slo_status(
     rows, exactly like the post-promotion watch.
 
     The numbers always ship beside the verdict, so the call is
-    auditable and re-bucketable, never taken on faith. This surface is
+    auditable and re-bucketable, never taken on faith. Tier 43 adds
+    the error-budget lens to every row: ``budget`` (the bar's
+    bad-event allowance — the bar itself for ``error_rate``, the
+    implied 1−p tail for the percentile metrics — beside the bad
+    count, the burn rate = observed/allowed, remaining, and the
+    on_track / at_risk / exhausted / insufficient_evidence state)
+    and ``burn`` (each ``slos.burn`` rule's multiwindow pace
+    verdict: the long window establishes the burn is real, the
+    short one confirms it is still burning — a burst that already
+    ended never fires; zero-tolerance bars have no rate to compute
+    and say so). This surface is
     the measurement and the honest answer — never a pager; alert
     delivery on breach is a later tier."""
     config = raw_request.app.state.config

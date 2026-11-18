@@ -8,6 +8,41 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Error budgets & burn rate (tier 43) — the tier-42 SLO model gains
+  its second lens. A bar says whether the promise held; a budget
+  says how fast it is being spent. Every metric is restated as a
+  bad-event fraction against its allowance: `error_rate` 0.01
+  allows 1% failed+blocked rows (the bar IS the allowance), and
+  `latency_p95_ms` 800 implies 5% of requests may exceed 800ms —
+  the percentile and the tail allowance are one promise seen from
+  two sides, computed over the same rows so the budget and the
+  verdict can never disagree about what counts.
+  - **Burn rate & remaining.** burn = observed / allowed, budget
+    remaining = 1 − burn (negative when the window overspent).
+    States: `on_track` (burn ≤ 1), `at_risk` (within allowance
+    overall but a burn rule is firing — fine on average, spending
+    fast NOW), `exhausted` (overspent), `insufficient_evidence`
+    (thin window — the same honesty the bar verdict has).
+  - **Multiwindow burn rules (the SRE recipe).** `slos.burn` —
+    defaults are the workbook's canonical pairs: 14.4× over 1h
+    confirmed by 5m (page), 3× over 1d confirmed by 2h (ticket).
+    The long window establishes the pace is real; the short one
+    confirms it is STILL burning — the two-window AND is the
+    anti-flap, so a burst that already ended reads `steady` and
+    never pages. Every window carries its own sufficiency gate,
+    `min_requests` scaled by the window's share of the target's
+    own window and floored at 1. `burn: []` disables the pace
+    verdicts.
+  - **Zero-tolerance bars never invent an infinity.** A `target: 0`
+    allowance has no rate to compute: any bad event reads
+    `exhausted`, the burn rules are `insufficient_evidence` with
+    the reason saying so, and burn/remaining stay `null`.
+  The `GET /admin/slos` rows grow a `budget` and a `burn` block
+  beside the tier-42 verdict (numbers still beside every verdict,
+  still read-at-request-time), and the Overview panel grows a
+  Budget column: remaining % colored by state, every burn rule's
+  pace verdict in its tooltip, red badges for rules that are
+  firing. 13 tests + a UI-surface pin; the suite stands at 1189.
 - Service level objectives (tier 42) — named promises about the
   client experience, measured and verdicted honestly. A latency bar
   in a design doc is a hope; the same bar verdicted against the

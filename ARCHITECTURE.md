@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 85 Python files, ~30,750 lines, 1175 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 85 Python files, ~31,100 lines, 1189 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -491,7 +491,22 @@ gateway/
 │                           latency p50/p95/p99, ttft p95), the
 │                           metric value and the check with its
 │                           human reason — the numbers always beside
-│                           the verdict; the config echoes as
+│                           the verdict; tier 43 adds the
+│                           error-budget lens to every row: budget
+│                           (the bar's bad-event allowance — the
+│                           bar itself for error_rate, the implied
+│                           1-p tail for the percentile metrics —
+│                           beside the bad count, the burn rate =
+│                           observed/allowed, remaining, and the
+│                           on_track / at_risk / exhausted /
+│                           insufficient_evidence state) and burn
+│                           (each slos.burn rule's multiwindow pace
+│                           verdict: the long window establishes the
+│                           burn is real, the short one confirms it
+│                           is still burning — a burst that already
+│                           ended never fires; zero-tolerance bars
+│                           have no rate to compute and say so); the
+│                           config echoes as
 │                           model_dump(); read-at-request-time means
 │                           hot-reload re-verdicts on the next call;
 │                           breach delivery is a later tier;
@@ -1134,7 +1149,39 @@ gateway/
 │   │                       re-verdicts on the next read (hot-reload
 │   │                       applies instantly); breach delivery is a
 │   │                       later tier — this surface is the
-│   │                       measurement, never a pager
+│   │                       measurement, never a pager. Tier 43 adds
+│   │                       the error-budget lens, same query+pure
+│   │                       split: measure_bad is one window's
+│   │                       bad-event accounting (denominator = the
+│   │                       rows the metric can measure — all rows for
+│   │                       error_rate, latency-bearing rows for the
+│   │                       percentiles, streamed rows for ttft;
+│   │                       bad = failed+blocked, or rows OVER the
+│   │                       bar for the percentile metrics — the same
+│   │                       rows their percentile was computed over,
+│   │                       so budget and verdict can never disagree
+│   │                       about what counts), allowed_bad_fraction
+│   │                       maps each bar to its implied allowance
+│   │                       (the bar itself for error_rate, the 1-p
+│   │                       tail for percentiles), budget_state is
+│   │                       the pure verdict over the target's own
+│   │                       window (burn rate = observed/allowed,
+│   │                       remaining = 1 - burn, states on_track /
+│   │                       at_risk — within allowance but a rule is
+│   │                       burning / exhausted — overspent /
+│   │                       insufficient_evidence on thin volume;
+│   │                       zero-tolerance bars: no rate, any bad
+│   │                       event exhausts, burn stays None — never
+│   │                       an invented infinity), and
+│   │                       burn_rule_verdict is the multiwindow SRE
+│   │                       AND (long window establishes the pace,
+│   │                       short window confirms it is STILL burning
+│   │                       — a burst that ended reads steady) with
+│   │                       per-window sufficiency gates scaled from
+│   │                       min_requests by the window's share of
+│   │                       the target's own window, floored at 1;
+│   │                       status computes burn rules first so
+│   │                       at_risk can see them
 │   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
 │   │                       that answers "did secrets land in the request
 │   │                       log?"): detectors mirror the pii_redaction
@@ -1656,7 +1703,13 @@ gateway/
                             the min_requests sufficiency gate, the
                             met/breached/insufficient_evidence badge with
                             the failed reason in its tooltip and the
-                            target's own rolling window — the panel hides
+                            target's own rolling window — tier 43 adds
+                            the Budget column: remaining % colored by
+                            state (on_track green, at_risk amber,
+                            exhausted red, insufficient gray), every
+                            burn rule's multiwindow pace verdict in
+                            its tooltip and red badges for rules that
+                            are firing — the panel hides
                             itself when no targets are configured, and a
                             tenant admin who cannot read SLOs loses the
                             panel, not the tab), key
@@ -2967,7 +3020,46 @@ tests/
 │                        definitions are platform health config) and
 │                        the empty config (empty data, config echoed
 │                        — no targets means no promises, not an
-│                        error)
+│                        error); tier 43 — error budgets & burn:
+│                        pure units (the allowance mapping — every
+│                        metric restated as its bad-event allowance;
+│                        the budget state machine — on_track within
+│                        allowance, exhausted overspent with negative
+│                        remaining, at_risk when a rule fires under a
+│                        holding average, thin windows insufficient,
+│                        zero-tolerance bars undefined-not-infinite;
+│                        the two-window AND — burning needs both
+│                        windows over the bar, the ended burst reads
+│                        steady, thin confirmation windows carry the
+│                        scaled gate in the reason; bad config — a
+│                        short window wider than the long one
+│                        rejected at parse time) and seeded e2e —
+│                        at_risk (bar MET at 0.61x burn while
+│                        fast-burn fires 15.2x confirmed 16x — fine
+│                        on average, burning fast now, slow rule
+│                        honestly steady), the antiflap (a 15.8x
+│                        hour that ended 20 minutes ago reads
+│                        steady: pace hot, confirmation window
+│                        clean and judged), the slow grind (uniform
+│                        20% errors all day: slow rule burns ~4x
+│                        confirmed ~3.75x while fast stays steady,
+│                        budget exhausted at -300% remaining, bar
+│                        breached in agreement), thin windows (a
+│                        scary 50% rate on 100 rows is insufficient,
+│                        the reason names the scaled gate), latency
+│                        bad events (6 of 100 rows over the bar
+│                        spends 1.2x the 5% tail — measured over
+│                        latency-bearing rows only, p95 breached in
+│                        agreement), ttft over streamed rows (the
+│                        30 non-streamed rows change neither side),
+│                        zero tolerance (clean on_track with no bad
+│                        events, one failure exhausted, burn rules
+│                        insufficient with the reason — never an
+│                        invented infinity), the canonical-rules
+│                        config echo and burn: [] disabling the
+│                        pace verdicts while the budget stands. A
+│                        second UI-surface pin covers the Budget
+│                        column (tests/test_admin_ui.py)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app
 ├── test_ops.py           Operations tier: /healthz vs /readyz semantics (503 while
