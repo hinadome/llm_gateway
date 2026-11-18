@@ -131,6 +131,45 @@ class BudgetExceededError(GatewayError):
         )
 
 
+class BudgetProjectionError(GatewayError):
+    """The tier-50 trending denial: the caller is NOT over its budget
+    — it is trending over. The month-end run-rate projection exceeds
+    the monthly budget, so the request is denied before the money is
+    spent. Same 429 / insufficient_quota semantics as
+    BudgetExceededError — a caller cannot and should not distinguish
+    the shapes — but the message says it is the PROJECTION, with the
+    numbers (projected month-end, spent so far, day of month), and
+    the denial self-heals: spend over elapsed days is a ratio, so a
+    caller that genuinely stops spending watches its projection decay
+    toward the actual as the month elapses and traffic resumes — the
+    hard cap stays the wall it always was."""
+
+    def __init__(
+        self,
+        key_name: str,
+        *,
+        budget: float,
+        spent: float,
+        projected_usd: float,
+        elapsed_days: float,
+        days_in_month: float,
+        kind: str = "key",
+    ) -> None:
+        what = "tenant" if kind == "tenant" else "virtual key"
+        message = (
+            f"{what.capitalize()} '{key_name}' is projected to spend "
+            f"${projected_usd:.2f} by month end (day {elapsed_days:.1f} of "
+            f"{days_in_month:.0f}), over its ${budget:.2f} monthly budget "
+            f"(${spent:.4f} spent so far)."
+        )
+        super().__init__(
+            status_code=429,
+            message=message,
+            error_type="insufficient_quota",
+            code="insufficient_quota",
+        )
+
+
 class ModelNotAllowedError(GatewayError):
     def __init__(self, model: str) -> None:
         super().__init__(

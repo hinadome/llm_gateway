@@ -47,6 +47,7 @@ from gateway.config import (
     SLOTargetConfig,
     SLOsConfig,
     ForecastAlertsConfig,
+    BudgetEnforcementConfig,
     VaultConfig,
 )
 from gateway.db import dispose_engine, init_engine, reset_engine_for_tests
@@ -123,6 +124,9 @@ def make_config(**cache_overrides) -> GatewayConfig:
     forecast_alerts = cache_overrides.pop(
         "forecast_alerts", None
     ) or ForecastAlertsConfig()
+    budget_enforcement = cache_overrides.pop(
+        "budget_enforcement", None
+    ) or BudgetEnforcementConfig()
     runaway = cache_overrides.pop("runaway", None) or RunawayConfig()
     concurrency = cache_overrides.pop("concurrency", None) or ConcurrencyConfig()
     mcp = cache_overrides.pop("mcp", None) or MCPConfig()
@@ -195,6 +199,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         concurrency=concurrency,
         slos=slos,
         forecast_alerts=forecast_alerts,
+        budget_enforcement=budget_enforcement,
         events=events,
         mcp=mcp,
         vault=vault,

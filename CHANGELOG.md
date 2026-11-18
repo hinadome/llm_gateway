@@ -8,6 +8,60 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Projected budget enforcement (tier 50) — `budget_enforcement:` gives
+  the request-time budget gate the leg its hard caps lack. The caps
+  (`max_budget_usd`, the daily/monthly windows, key and tenant) are
+  enforced always — they are the floor. The new stance is the trend:
+  with `enabled: true`, a key or tenant whose month-end **run-rate
+  projection** exceeds its `monthly_budget_usd` is denied the same
+  `429 insufficient_quota`, the message saying it is the projection
+  with the numbers ("projected to spend $10.29 by month end (day
+  17.5 of 30), over its $10.00 monthly budget ($6.0000 spent so
+  far)") — a key at $8 of a $10 budget on day 2, burning at a
+  month-end pace of $120, is told *now*, not two days later with the
+  money already gone.
+  - **The rules, in order**: the hard cap fires first (a projection
+    denial only ever happens with spend still under budget — the two
+    messages can never lie about each other); zero spend projects
+    zero and passes; a stale bucket is last month's spend and counts
+    as 0 (the stance composes with the window rollover);
+    `min_elapsed_days` (default 2.0 — the forecast family's honesty
+    gate from tiers 47/48) keeps a day-one straight line from denying;
+    no budget means no bar, at either level.
+  - **It self-heals**: spend over elapsed days is a ratio, so a
+    caller that genuinely stops spending watches its projection decay
+    toward the actual as the month elapses, falls back under its
+    budget, and traffic resumes — no operator action. The hard cap
+    stays the wall it always was; the stance is a trend, and trends
+    end.
+  - **The counter lens, not the billing lens**: the projection reads
+    the auth-time `monthly_spend_usd` snapshot the hard cap just read
+    (never tier 47's RequestLog measure), so the gate and the cap can
+    never disagree about what "spent" means — and the check costs no
+    extra query on the hot path (also why it's the straight-line
+    run-rate rather than the recent-pace correction: the recent
+    window would need a per-request query, and the tier-48
+    evaluator's cached verdicts are alert transitions — fire-once
+    semantics, the wrong shape for a gate).
+  - **One rulebook, two levels**: key and tenant legs share
+    `_check_projected_budget`; `_check_budget` gained an injectable
+    `now` (the utils' house pattern) so tests pin the month clock;
+    the pure math lives in `forecasts.run_rate_month_end` beside its
+    billing-lens siblings. Applies on every surface the gate already
+    runs — chat (all four inbound formats), realtime (per create),
+    embeddings, images, audio; hot-reloads live; **off by default** —
+    today's hard-cap-only behavior is exactly preserved until the
+    operator opts in.
+  - 16 tests in `tests/test_budget_windows.py` (10 → 26): pure units
+    (month shapes 28/30/31, the first instant, zero spend, error
+    wording at both levels), the gate against a pinned month clock
+    (trending key and tenant denied with the numbers, within-budget
+    passing, the honesty gate holding a would-be $120 projection,
+    stale bucket zero, hard-cap-first, the self-heal decay), and the
+    traffic paths (off-by-default at the gate and through HTTP, an
+    adaptive HTTP denial computed from the test's own clock that
+    holds on any day of any month, the honesty gate through HTTP, no
+    budget, stale bucket, hard-cap precedence).
 - MCP guardrail coverage (tier 49) — the three audit gaps closed: the
   proxy's guardrails now cover every content-bearing method instead of
   `tools/call` alone.

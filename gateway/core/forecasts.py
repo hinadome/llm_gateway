@@ -57,6 +57,7 @@ contract (same calendar months in UTC, same 400s).
 
 from __future__ import annotations
 
+import calendar
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -205,6 +206,35 @@ def _effective_projection(block: dict[str, Any]) -> float:
     if block["recent_pace"]["daily_usd"] is not None:
         return block["recent_pace"]["projected_month_usd"]
     return block["run_rate"]["projected_month_usd"]
+
+
+def run_rate_month_end(now: datetime, spend_usd: float) -> dict[str, float] | None:
+    """Pure: the month-end run-rate projection of a *snapshot* spend —
+    the tier-50 budget gate's math, factored here so the month
+    arithmetic lives in one module. (spend / elapsed days) scaled to
+    the whole month, UTC calendar months like every window in the
+    billing epic. None only at the month's first instant (elapsed 0 —
+    nothing to divide by); the caller's honesty gate
+    (``min_elapsed_days``) handles "too young to mean anything".
+
+    The COUNTER lens, not the billing lens: this judges the
+    auth-snapshot monthly spend the hard caps read (the denormalized
+    ``monthly_spend_usd`` bucket on the key/tenant row), so the gate
+    and the cap can never disagree about what "spent" means.
+    ``measure_between`` / ``project`` above stay the invoice and
+    dashboard pair (RequestLog rows, recent pace, trend ratios) and
+    are deliberately NOT reused here: the gate runs on every request
+    and must cost no query."""
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elapsed_days = (now - month_start).total_seconds() / 86400.0
+    if elapsed_days <= 0:
+        return None
+    days_in_month = float(calendar.monthrange(now.year, now.month)[1])
+    return {
+        "projected_usd": spend_usd * days_in_month / elapsed_days,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+    }
 
 
 def _key_view(

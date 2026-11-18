@@ -39,6 +39,7 @@ from opentelemetry.trace import SpanKind, Status, StatusCode, use_span
 from ..config import DeploymentConfig, GatewayConfig, MCPConfig
 from ..errors import (
     BudgetExceededError,
+    BudgetProjectionError,
     GatewayError,
     GuardrailBlocked,
     MCPDisabledError,
@@ -70,6 +71,7 @@ from .idempotency import IdempotencyStore
 from .semantic_cache import SemanticCache
 from .context import AuthContext, RequestContext
 from .shadow_diff import extract_content_text, score_pair
+from .forecasts import run_rate_month_end
 from .cost import CostCalculator, cached_tokens_from_usage
 from .mcp import (
     GUARDRAIL_BLOCKED,
@@ -3421,7 +3423,22 @@ class GatewayPipeline:
                 )
             await self.rate_limiter.record_request(tenant_key)
 
-    def _check_budget(self, ctx: RequestContext) -> None:
+    def _check_budget(
+        self, ctx: RequestContext, *, now: datetime | None = None
+    ) -> None:
+        """The request-time budget gate, both legs. The floor: the
+        three hard caps per level (total / daily / monthly windows)
+        against the auth-time spend snapshot — enforced ALWAYS, key
+        and tenant. The stance (tier 50): when
+        ``budget_enforcement.enabled``, a monthly window whose
+        month-end RUN-RATE PROJECTION exceeds its budget is denied
+        the same 429 — the trending tooth, before the money is spent;
+        the hard cap raised first when actual spend has already
+        crossed, so the two messages can never lie about each other.
+        ``now`` is injectable so the month clock is pinnable in
+        tests; every caller passes nothing and gets the real one."""
+        if now is None:
+            now = datetime.now(timezone.utc)
         if ctx.auth.key_id is not None:
             if ctx.auth.max_budget_usd is not None:
                 if ctx.auth.spend_usd >= ctx.auth.max_budget_usd:
@@ -3433,7 +3450,6 @@ class GatewayPipeline:
             # Daily / monthly windows: like the total, evaluated against the
             # auth-time snapshot. A stored bucket that differs from the current
             # one means the window has rolled — that spend counts as 0.
-            now = datetime.now(timezone.utc)
             if ctx.auth.daily_budget_usd is not None:
                 today = daily_bucket(now)
                 spent = (
@@ -3462,12 +3478,22 @@ class GatewayPipeline:
                         spent,
                         period="monthly",
                     )
+                # Tier 50: the projected leg — the trending tooth. Only
+                # reached with 0 <= spent < budget (the hard cap above
+                # raised otherwise), so a denial here is honestly a
+                # projection, never an over-budget spend wearing a
+                # trend's clothes.
+                self._check_projected_budget(
+                    ctx.auth.key_name or ctx.auth.key_id,
+                    budget=ctx.auth.monthly_budget_usd,
+                    spent=spent,
+                    now=now,
+                )
         # Tenant budgets: the same three windows against the pooled tenant
         # spend (auth-time snapshot). Like the tenant rate limit, this has
         # no admin bypass — a tenant admin is still a member of the tenant.
         if ctx.auth.tenant_id is not None:
             tenant_label = ctx.auth.tenant_name or ctx.auth.tenant_id
-            now = datetime.now(timezone.utc)
             if ctx.auth.tenant_max_budget_usd is not None:
                 if ctx.auth.tenant_spend_usd >= ctx.auth.tenant_max_budget_usd:
                     raise BudgetExceededError(
@@ -3506,6 +3532,56 @@ class GatewayPipeline:
                         period="monthly",
                         kind="tenant",
                     )
+                # Tier 50: the tenant leg of the projected stance — the
+                # same projection over the pooled spend, so a tenant's
+                # shared ceiling trends as honestly as any member's.
+                self._check_projected_budget(
+                    tenant_label,
+                    budget=ctx.auth.tenant_monthly_budget_usd,
+                    spent=spent,
+                    now=now,
+                    kind="tenant",
+                )
+
+    def _check_projected_budget(
+        self,
+        label: str,
+        *,
+        budget: float,
+        spent: float,
+        now: datetime,
+        kind: str = "key",
+    ) -> None:
+        """The tier-50 projected leg, key and tenant legs shared (one
+        rulebook, like every two-level check in the gate). Straight-
+        line run-rate over the auth snapshot — the same counter lens
+        the hard cap just read, no extra query — denied at
+        ``projected > budget``. The rules, in order: the stance is
+        off → nothing; nothing spent → nothing to project (zero spend
+        projects zero, honestly); the month's first instant → nothing
+        to divide by; the honesty gate (``min_elapsed_days``) → hours
+        of evidence never deny; and the projection self-heals — spend
+        over elapsed is a ratio, so a caller that stops spending
+        watches its projection decay under the budget as the month
+        elapses and traffic resumes without any operator action."""
+        cfg = self.config.budget_enforcement
+        if not cfg.enabled or spent <= 0:
+            return
+        projection = run_rate_month_end(now, spent)
+        if projection is None:
+            return  # elapsed 0 — the month's first instant
+        if projection["elapsed_days"] < cfg.min_elapsed_days:
+            return  # the honesty gate: too young a month to mean anything
+        if projection["projected_usd"] > budget:
+            raise BudgetProjectionError(
+                label,
+                budget=budget,
+                spent=spent,
+                projected_usd=projection["projected_usd"],
+                elapsed_days=projection["elapsed_days"],
+                days_in_month=projection["days_in_month"],
+                kind=kind,
+            )
 
     # ------------------------------------------------------------------
     # Accounting helpers

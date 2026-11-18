@@ -846,6 +846,41 @@ class ForecastAlertsConfig(BaseModel):
         return self.webhook_url
 
 
+class BudgetEnforcementConfig(BaseModel):
+    """Budget enforcement stance (tier 50): the projected leg of the
+    request-time budget gate. The hard caps — ``max_budget_usd`` and
+    the daily/monthly windows, key and tenant — are enforced ALWAYS;
+    they are the floor, not a stance. This config adds the trending
+    tooth the floor lacks: a key at $8 of a $10 monthly budget on
+    day 2, burning at a month-end pace of $120, sails under the hard
+    cap until actual spend crosses $10 — then 429s with the money
+    already gone. With ``enabled: true``, a key or tenant whose
+    month-end RUN-RATE PROJECTION exceeds its ``monthly_budget_usd``
+    is denied with the same 429 ``insufficient_quota``, the message
+    saying it is the projection, with the numbers.
+
+    The projection is straight-line: auth-snapshot monthly spend over
+    elapsed days, scaled to the month — the same COUNTER lens the
+    hard cap reads (never the billing lens), so the two legs can
+    never disagree about what "spent" means, and it costs no extra
+    query on the hot path. It self-heals: spend over elapsed days is
+    a ratio, so a caller that genuinely stops spending watches its
+    projection decay toward the actual as the month elapses and
+    traffic resumes — the hard cap stays the wall. ``min_elapsed_days``
+    is the forecast family's early-month honesty gate (tiers 47/48):
+    before it, a day-one straight-line extrapolation is hours of
+    evidence dressed as a trend and never denies a request.
+
+    Off by default: today's behavior (hard caps only) is exactly
+    preserved until the operator opts in."""
+
+    enabled: bool = False
+    # The early-month gate (default: the forecast family's trend
+    # threshold — under two days of month there is no honest trend
+    # to enforce on).
+    min_elapsed_days: float = Field(default=2.0, ge=0)
+
+
 class PIIScanConfig(BaseModel):
     """PII/secret scan over *stored* request/response bodies — the
     audit that answers "did secrets or PII land in the request log?".
@@ -1243,6 +1278,9 @@ class GatewayConfig(BaseModel):
     slos: SLOsConfig = Field(default_factory=SLOsConfig)
     finops: FinopsConfig = Field(default_factory=FinopsConfig)
     forecast_alerts: ForecastAlertsConfig = Field(default_factory=ForecastAlertsConfig)
+    budget_enforcement: BudgetEnforcementConfig = Field(
+        default_factory=BudgetEnforcementConfig
+    )
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)

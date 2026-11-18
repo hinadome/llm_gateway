@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 90 Python files, ~33,700 lines, 1259 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 90 Python files, ~33,900 lines, 1275 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -115,7 +115,9 @@ gateway/
 │                           so refusing it is an explicit explained 400
 │                           instead of an ignored extra
 ├── errors.py               OpenAI-style error envelope + typed errors (ProviderError, GuardrailBlocked,
-│                           RateLimitError, BudgetExceededError, ...)
+│                           RateLimitError, BudgetExceededError, BudgetProjectionError — the tier-50
+│                           trending denial: same 429/insufficient_quota, message says it is the
+│                           projection with the numbers, ...)
 ├── models.py / db.py       SQLAlchemy ORM (Tenant, VirtualKey, RequestLog, Prompt,
 │                           SettingKV, Trial) + async engine management incl. get_engine (readiness
 │                           checks, VACUUM INTO backups); RequestLog's
@@ -1461,7 +1463,17 @@ gateway/
 │   │                       forecast composing them. No config: the
 │   │                       window is a module constant and
 │   │                       parse_month the invoice's own contract
-│   │                       (same months, same 400s)
+│   │                       (same months, same 400s). Tier 50 adds
+│   │                       run_rate_month_end — the budget gate's
+│   │                       pure twin: the COUNTER-lens run-rate (a
+│   │                       snapshot spend over elapsed days,
+│   │                       scaled to the month; None at the
+│   │                       month's first instant) that the
+│   │                       request-time projected stance reads.
+│   │                       Deliberately not the billing pair above:
+│   │                       the gate runs per request (zero
+│   │                       queries) and must judge the same
+│   │                       numbers the hard cap enforces
 │   ├── forecast_alerts.py  Budget forecast alert delivery (tier 48):
 │   │                       the tier-47 projections get teeth.
 │   │                       alert_condition is the pure (firing,
@@ -2458,7 +2470,7 @@ sequenceDiagram
         P->>L: write log (cache_hit, zero cost)
         P-->>C: 200 stored response (X-Gateway-Cache: IDEMPOTENT)
     end
-    Note over P: 3. budget check (total + daily/monthly windows<br/>vs auth-time spend snapshot) — then the tenant<br/>budget windows (same three, pooled spend)
+    Note over P: 3. budget check (total + daily/monthly windows<br/>vs auth-time spend snapshot) — then the tenant<br/>budget windows (same three, pooled spend).<br/>Tier 50's projected stance rides the monthly legs<br/>(budget_enforcement.enabled: the month-end run-rate<br/>projection over budget → 429 insufficient_quota,<br/>message says the projection — off by default,<br/>min_elapsed_days honesty gate, self-healing)
 
     P->>G: run_request_phase(request, ctx)
     alt a guardrail blocks
@@ -3113,7 +3125,20 @@ tests/
 ├── test_budget_windows.py  Daily/monthly budget windows: bucket helpers, 429 wording per
 │                        period, e2e enforcement (daily/monthly), stale bucket counts as
 │                        zero + lazy atomic reset, accumulation across requests, cache hits
-│                        add no window spend, admin API fields (create/patch)
+│                        add no window spend, admin API fields (create/patch); tier 50 —
+│                        the projected stance: run_rate_month_end pure units (28/30/31-day
+│                        months, the first instant, zero spend), BudgetProjectionError
+│                        wording at both levels, the gate against a pinned month clock
+│                        (trending key + tenant denied with the numbers, within-budget
+│                        passing, the honesty gate holding a would-be $120 projection,
+│                        stale bucket counting zero, the hard cap firing first, the
+│                        self-heal decay — same spend denied at day 17.5, resumed at
+│                        24.5), off-by-default at the gate and through HTTP, an adaptive
+│                        HTTP denial that holds on any day of any month (seed computed
+│                        from the test's own clock, midpoint of the denial band), the
+│                        honesty gate through HTTP (min_elapsed_days 40 — no month
+│                        reaches it), no-budget, stale-bucket and hard-cap-precedence
+│                        through HTTP
 ├── test_tenants.py       Multi-tenancy: tenant CRUD (slug validation, duplicate 409,
 │                        delete refused while keys exist, budget re-arm on PATCH),
 │                        tenant-admin scoping (own-tenant keys/logs/stats/usage,
