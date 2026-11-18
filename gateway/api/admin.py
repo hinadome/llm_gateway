@@ -822,6 +822,58 @@ async def feedback_stats(
 
 
 # ----------------------------------------------------------------------
+# Canaries
+# ----------------------------------------------------------------------
+
+
+@router.get("/admin/canaries")
+async def canary_status(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Last synthetic-probe result per deployment, newest fleet view.
+    Deployment health is platform-wide configuration (not tenant
+    data) — the same rule as /admin/routing, so platform admins only.
+    ``outcome`` is ok / timeout / error, or "unknown" before the first
+    probe (a wave has not run yet — canary is disabled by default;
+    POST /admin/canaries/probe runs one now)."""
+    prober = raw_request.app.state.canary
+    config = raw_request.app.state.config.canary
+    return {
+        "object": "canary_status",
+        "enabled": config.enabled,
+        "interval_seconds": config.interval_seconds,
+        "timeout_seconds": config.timeout_seconds,
+        "deployments_filter": config.deployments,
+        "data": prober.snapshot(),
+    }
+
+
+@router.post("/admin/canaries/probe")
+async def canary_probe_now(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Run one probe wave now (regardless of canary.enabled) and
+    return the fresh results — "probe now" for ops, the same wave the
+    background loop runs on its interval. Each probe is a direct
+    provider call (no pipeline: no log rows, no spend, no breaker
+    accounting) bounded by the canary timeout, so a wave costs
+    max_tokens of provider quota per deployment."""
+    prober = raw_request.app.state.canary
+    # Hot-reload parity: a manual wave uses the *current* config, even
+    # if the background loop has not woken up to pick it up yet.
+    prober.config = raw_request.app.state.config.canary
+    results = await prober.probe_once()
+    return {
+        "object": "canary_probe",
+        "probed": len(results),
+        "healthy": sum(1 for r in results if r["healthy"]),
+        "data": results,
+    }
+
+
+# ----------------------------------------------------------------------
 # Stats
 # ----------------------------------------------------------------------
 

@@ -43,6 +43,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Batch API** | OpenAI-style `/v1/files` + `/v1/batches`: upload a JSONL of chat requests, execute them in the background — each line through the *full* pipeline (guardrails, cache, routing, spend, request logs) — then fetch per-line results as output/error JSONL. Rate limits and budgets defer a batch instead of failing lines; the 24h completion window bounds retries (see [Batch API](#batch-api)) |
 | **Lifecycle events** | Subscribe your own handlers to the request-stage boundaries (`request.received` / `routed` / `cache_hit` / `rejected` / `failed`, `response.completed`, `stream.started` / `completed`, `auth.rejected`, `key.*`, `budget.threshold`, `batch.*`) — **observers** are fire-and-forget on a background queue (a slow or crashing handler can never affect a request), **interceptors** run in-band with veto power at the two pre-irreversible events; with no handlers the bus is inert (see [Lifecycle events](#lifecycle-events)) |
 | **Feedback capture** | `POST /v1/feedback` lets clients rate any logged request (by `X-Request-Id`, rating 1–5) — the missing half of the quality story: shadow mirroring and prompt A/B compare *outputs*, feedback says which one was good. Admin list + per-model/per-key quality aggregates; counted on `gateway_feedback_total`; `feedback.recorded` event (see [Feedback](#feedback)) |
+| **Synthetic canary probes** | A background loop sends a tiny chat request straight to every configured deployment's provider on a schedule (`canary:` config, disabled by default) — upstream health is *measured*, not inferred from traffic. Direct adapter calls: no pipeline, no log rows, no spend, no breaker accounting. `GET /admin/canaries` fleet view, `POST /admin/canaries/probe` for on-demand waves; `canary.failed` / `canary.recovered` events; `gateway_canary_probes_total{deployment,provider,outcome}` (see [Canary probes](#canary-probes)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model |
@@ -210,6 +211,8 @@ Things to know when pointing a framework at the gateway:
 | `GET /admin/logs` | Paginated request logs with filters (bodies omitted for size), rows carry `tenant_id` (`?tenant_id=` filter; forced to the admin's own tenant for tenant admins); shadow-mirror rows are included and flagged `shadow`, prompt A/B mirrors also carry `prompt_variant` |
 | `GET /admin/feedback` | Feedback rows, newest first — `key_name`/`model`/`request_id`/`min_rating`/`max_rating` filters; the same forced tenant scoping as logs |
 | `GET /admin/feedback/stats` | Quality aggregates from client feedback: overall + by-model + by-key buckets (`count`, `avg_rating`, `pct_negative` [1–2], `pct_positive` [4–5]); `model`/`key_name`/`tenant_id` filters |
+| `GET /admin/canaries` | Last synthetic-probe result per deployment (`outcome` ok/timeout/error, latency, last checked; `unknown` before the first wave) + the canary config echo — platform admin only (deployment health is platform configuration) |
+| `POST /admin/canaries/probe` | Run one probe wave now, regardless of `canary.enabled` — "probe now" for ops; returns fresh per-deployment results |
 | `GET /admin/logs/{id}` | One log row in full, including the stored request/response bodies (cross-tenant ids 404 for tenant admins) |
 | `GET /admin/stats` | Requests, error rate, tokens, cost, latency + TTFT percentiles (client traffic only — shadow mirrors are excluded); tenant admins see their own tenant's traffic, platform admins additionally get a `by_tenant` breakdown |
 | `GET /admin/usage/export` | Billing / chargeback export: `format=csv\|json`, `since`/`until` (ISO-8601, default last 30 days), `key_name`/`model`/`status`/`tenant_id` filters, `include_shadow`; JSON adds totals + per-key/model/status aggregates (+ per-tenant for platform admins); tenant admins export their own tenant only |
@@ -345,6 +348,8 @@ Event catalog:
 | `key.created` / `key.updated` / `key.revoked`, `tenant.*`, `breaker.reset` | admin actions — the audit choke point, same names and payload as the audit webhook | `event`, `actor`, `details` |
 | `budget.threshold` | budget alert fired (per crossed level) | `key`, `key_name`, `level`, `spend_usd`, `budget_usd` |
 | `feedback.recorded` | client rated a request | `request_id`, `model`, `rating`, `key_name` |
+| `canary.failed` | a synthetic probe failed (per failed probe — count or dedupe on your side) | `deployment`, `provider`, `model`, `outcome` (`error`/`timeout`), `error` |
+| `canary.recovered` | a deployment's probe returned to ok after a failure | `deployment`, `provider`, `model`, `latency_ms` |
 | `batch.created` / `cancelled` / `completed` / `failed` / `deferred` / `expired` | batch lifecycle | `batch_id`, `key_id`, line counts, output/error file ids |
 
 Per-chunk stream events are deliberately absent — the hot path only ever carries the two coarse stream events. Deliveries count on `gateway_events_total{handler,event,outcome}` (delivered / dropped / error / aborted). The `events:` config is hot-reloadable (handlers swap live; `queue_size` applies at restart). 20 tests pin the contract (`tests/test_events.py`).
@@ -368,6 +373,28 @@ curl -X POST http://localhost:8000/v1/feedback \
 - **Admin views**: `GET /admin/feedback` (filterable list) and `GET /admin/feedback/stats` (overall / by-model / by-key buckets; positive = rating 4–5, negative = 1–2; tenant admins see their own tenant only). Ratings count on `gateway_feedback_total{rating}` and surface as `feedback.recorded` lifecycle events.
 
 11 tests pin the contract (`tests/test_feedback.py`).
+
+## Canary probes
+
+The gateway only knows a deployment is healthy when real traffic succeeds through it — a dead fallback that never receives traffic reads as "fine" until the moment it's needed, and a shadow deployment only ever sees mirrored traffic. Synthetic canary probes close that gap: a background loop sends a tiny chat request straight to each deployment's provider on a schedule, so upstream health is *measured*, not inferred.
+
+```yaml
+canary:
+  enabled: true            # off by default — probes spend real quota
+  interval_seconds: 300    # one wave per interval
+  timeout_seconds: 10      # each probe carries its own clock
+  max_tokens: 1            # the entire cost of a probe
+  prompt: "ping"
+  # deployments: ["openai/*"]   # fnmatch allowlist; unset = all (shadows included)
+```
+
+- **Direct adapter calls** — probes use the same wire the router would (`adapter.complete`), but none of the request machinery: no pipeline, no guardrails, no cache, no request-log rows, no spend accounting, no circuit-breaker accounting. They can neither affect client traffic nor be mistaken for it in logs/stats, and they never half-open a breaker.
+- **Every configured deployment is probed** — primary, fallback and shadow deployments alike; the deployments real traffic rarely reaches are exactly the ones whose health traffic can't measure. An `fnmatch` allowlist (`deployments:`) trims the fleet if some deployments are too expensive to ping.
+- **Outcomes**: `ok` / `timeout` (provider never answered within `timeout_seconds`) / `error` (answered badly — HTTP error, bad JSON) / `unknown` (never probed). Counted on `gateway_canary_probes_total{deployment,provider,outcome}`.
+- **Transitions, not spam**: every failed probe emits a `canary.failed` event; a deployment returning to ok emits `canary.recovered` — the two signals an on-call actually needs (subscribers count or dedupe as they like).
+- **Admin**: `GET /admin/canaries` (fleet view: outcome, latency, last check, plus config echo) and `POST /admin/canaries/probe` (run a wave now, regardless of `enabled`). Both platform-admin-only — deployment health is platform configuration, like `/admin/routing`. Hot-reloadable: `enabled` / interval / timeout / allowlist apply from the next loop iteration (the loop always runs, idling at a 30s re-check when disabled, so enabling takes effect immediately).
+
+8 tests pin the contract (`tests/test_canary.py`).
 
 ## Architecture
 

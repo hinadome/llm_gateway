@@ -73,6 +73,12 @@ FEEDBACK = Counter(
     ["rating"],
 )
 
+CANARY_PROBES = Counter(
+    "gateway_canary_probes_total",
+    "Synthetic canary probes per deployment (ok / timeout / error).",
+    ["deployment", "provider", "outcome"],
+)
+
 TTFT = Histogram(
     "gateway_stream_ttft_seconds",
     "Time from request start to the first streamed chunk delivered to the client.",

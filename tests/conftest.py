@@ -21,6 +21,7 @@ from gateway.config import (
     AuthConfig,
     BatchConfig,
     CacheConfig,
+    CanaryConfig,
     DeploymentConfig,
     EventsConfig,
     GatewayConfig,
@@ -98,6 +99,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     metrics_cfg = cache_overrides.pop("metrics", None) or MetricsConfig()
     prompts = cache_overrides.pop("prompts", None) or PromptsConfig()
     batch = cache_overrides.pop("batch", None) or BatchConfig()
+    canary = cache_overrides.pop("canary", None) or CanaryConfig()
     events = cache_overrides.pop("events", None) or EventsConfig()
     guardrails = cache_overrides.pop("guardrails", None) or [
         GuardrailConfig(
@@ -154,6 +156,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         semantic_cache=semantic_cache,
         pricing=pricing,
         batch=batch,
+        canary=canary,
         events=events,
     )
     if redis_backends:

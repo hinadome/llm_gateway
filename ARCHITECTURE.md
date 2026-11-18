@@ -247,7 +247,13 @@ gateway/
 │                           filters + GET /admin/feedback/stats — overall /
 │                           by-model / by-key quality buckets, positive =
 │                           rating 4-5, negative = 1-2; the same forced
-│                           tenant scoping), stats
+│                           tenant scoping), canaries (GET /admin/canaries
+│                           fleet view — last probe outcome/latency per
+│                           deployment, "unknown" before the first wave +
+│                           POST /admin/canaries/probe to run a wave on
+│                           demand; platform-admin-only, like /admin/routing
+│                           — deployment health is platform configuration),
+│                           stats
 │                           (by_tenant breakdown for platform admins),
 │                           usage export (CSV/JSON billing
 │                           extract, tenant filter + per-tenant aggregates),
@@ -464,6 +470,33 @@ gateway/
 │   │                       with batch.poll_interval_seconds and re-reads
 │   │                       app.state.config each iteration so hot reloads
 │   │                       apply live
+│   ├── canary.py           Synthetic deployment health probes: one wave =
+│   │                       a tiny chat request (canary.prompt,
+│   │                       canary.max_tokens) sent straight to every
+│   │                       configured deployment's provider via
+│   │                       adapter.complete — direct calls, no pipeline:
+│   │                       no guardrails, no cache, no request-log rows,
+│   │                       no spend, no circuit-breaker accounting, so
+│   │                       probes can neither affect nor be mistaken for
+│   │                       client traffic and never half-open a breaker.
+│   │                       Timeout is the probe's own clock
+│   │                       (canary.timeout_seconds, not the routing
+│   │                       timeout): finding slow/dead deployments is
+│   │                       the job. Outcomes ok / timeout (httpx
+│   │                       timeout in the ProviderError cause chain) /
+│   │                       error; results live in memory on
+│   │                       app.state.canary (deployment -> last result),
+│   │                       dropped when the config drops the deployment.
+│   │                       Failed probes emit canary.failed; a return to
+│   │                       ok after a failure emits canary.recovered —
+│   │                       first waves have no transitions. Optional
+│   │                       fnmatch allowlist (canary.deployments); the
+│   │                       lifespan loop (always running; 30s re-check
+│   │                       idle when disabled, so hot-enabling is
+│   │                       immediate) paces waves with canary.
+│   │                       interval_seconds and re-reads
+│   │                       app.state.config.canary each iteration;
+│   │                       under pytest tests drive probe_once() directly
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -978,7 +1011,7 @@ Every stage boundary below is also an event emission (the full catalog with payl
 - **`request.routed`** — after deployment selection, on both the stream and non-stream paths (observer-only: the router's retry machinery has the provider call in flight — an in-band veto there would be unsafe, so routing is notification, not a checkpoint).
 - **`response.completed`** — the final non-streaming response, post-guardrails, pre-client, with usage and cost (and `surface` for the non-chat modalities). *Interceptable* — the last in-band veto point; an interceptor raising here fails the request instead of returning the body.
 - **`stream.started` / `stream.completed`** — first chunk / end of the streamed body, emitted from the stream wrapper's iteration and `finally` (any outcome; `ctx.status` says which). Coarse by design; never per-chunk.
-- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request).
+- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure).
 
 Emits enqueue observers *before* an interceptor's abort propagates — subscribers always see the event that was vetoed.
 
@@ -1233,7 +1266,7 @@ Shutdown is the mirror image of composition, in reverse dependency order: `/read
 | **Storage** | Async SQLAlchemy engine URL | SQLite → Postgres by env var. |
 | **Observability** | Metrics are centralized in `observability/`; OTel spans come from the API (no-op until a provider is installed); logs are structured rows | Add a Prometheus series, a span attribute or a log consumer without touching phases. |
 | **Error surface** | One `GatewayError` type → OpenAI envelope, everywhere | New error categories inherit the format for free. |
-| **Operations** | Config hot-reload (`apply_config` on pipeline+router; one path for `/admin/reload` and SIGHUP), readiness/liveness split, online backups (`VACUUM INTO`), tracked background work with drain-on-shutdown | Policy changes ship without a restart; new policy knobs ride the same swap. |
+| **Operations** | Config hot-reload (`apply_config` on pipeline+router; one path for `/admin/reload` and SIGHUP), readiness/liveness split, online backups (`VACUUM INTO`), tracked background work with drain-on-shutdown, scheduled canary probes (on-demand waves via the admin API) | Policy changes ship without a restart; new policy knobs ride the same swap. |
 
 ### 8.2 Where it is rigid today ⚠️
 
@@ -1602,7 +1635,7 @@ A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, 
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 

@@ -8,6 +8,31 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Synthetic canary probes: a background loop sends a tiny chat request
+  straight to every configured deployment's provider on a schedule
+  (`canary:` config — enabled / interval_seconds / timeout_seconds /
+  max_tokens / prompt / deployments fnmatch allowlist; disabled by
+  default, probes spend real provider quota), so upstream health is
+  measured, not inferred from traffic — a dead fallback that never
+  receives traffic otherwise reads as "healthy" until the moment it's
+  needed; shadow deployments only ever see mirrored traffic. Probes
+  are direct adapter calls: no pipeline, no guardrails, no cache, no
+  request-log rows, no spend, no circuit-breaker accounting — they can
+  neither affect nor be mistaken for client traffic, and never
+  half-open a breaker. Every configured deployment is probed
+  (primary/fallback/shadow alike); an optional fnmatch allowlist
+  trims the fleet. Outcomes ok / timeout (provider never answered
+  within the probe's own clock) / error. Failed probes emit
+  canary.failed events; a deployment returning to ok after a failure
+  emits canary.recovered (first waves have no transitions). Admin:
+  GET /admin/canaries (fleet view, config echo; platform-admin-only
+  like /admin/routing) and POST /admin/canaries/probe (wave on
+  demand). Counted on
+  gateway_canary_probes_total{deployment,provider,outcome}. The
+  lifespan loop always runs — idling at a 30s re-check when disabled
+  — so hot-enabling takes effect immediately; enabled / interval /
+  timeout / allowlist re-read each iteration. 8 new tests
+  (tests/test_canary.py).
 - Feedback capture: `POST /v1/feedback` — clients rate any logged
   request by its `X-Request-Id` (rating 1..5, optional comment),
   turning request logs into quality data. The missing half of the
@@ -167,6 +192,13 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Fixed
 
+- `tests/test_batch.py::test_batch_defers_on_budget_and_resumes` was
+  load-flaky: line 0's spend is a fire-and-forget task, and the test
+  relied on it landing between two back-to-back worker ticks — under
+  a loaded event loop it could land after the wave, letting line 1
+  complete instead of deferring. The test now awaits
+  `pipeline.drain_background_tasks()` between the waves, making the
+  deferral deterministic (test-only change).
 - Admin dashboard (Logs tab): an expanded request's detail (request/response
   bodies, guardrail actions) collapsed back to a "loading…" placeholder and
   never recovered — the 5-second auto-refresh re-renders the table, which

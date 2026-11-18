@@ -429,6 +429,30 @@ batch:
   wave_size: 16
   poll_interval_seconds: 2.0
 
+# Synthetic canary probes: a background loop sends a tiny chat request
+# (max_tokens) straight to every configured deployment's provider on a
+# schedule, so upstream health is measured, not inferred from traffic —
+# a dead fallback that never receives traffic otherwise reads as
+# "healthy" until the moment it's needed and fails. Probes are direct
+# provider calls: no pipeline, no guardrails, no request-log rows, no
+# spend accounting, no circuit-breaker accounting — they cannot affect
+# (or be mistaken for) client traffic, and cost max_tokens of provider
+# quota per deployment per wave. Results surface at GET /admin/canaries;
+# POST /admin/canaries/probe (platform admin) runs a wave on demand.
+# deployments: optional fnmatch allowlist of deployment names
+# ("openai/*"); unset = all deployments, shadows included. Hot-reloadable
+# (enabled / interval / timeout / allowlist apply from the next loop
+# iteration). Failed probes emit canary.failed events; a deployment
+# returning to ok emits canary.recovered. Disabled by default: probes
+# spend real provider quota.
+canary:
+  enabled: false
+  interval_seconds: 300
+  timeout_seconds: 10
+  max_tokens: 1
+  prompt: "ping"
+  # deployments: ["openai/*"]
+
 # Lifecycle events: subscribe handlers to the request-stage boundaries
 # (request.received / request.routed / response.completed / stream.* /
 # auth.rejected / key.* / budget.threshold / batch.* ...). Two kinds:

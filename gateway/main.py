@@ -46,6 +46,7 @@ from .core.alerts import BudgetAlertManager
 from .core.auth import AuthChain
 from .core.audit import AuditLogger
 from .core.batch_worker import BatchWorker
+from .core.canary import CanaryProber
 from .core.cache import ResponseCache
 from .core.events import EventBus
 from .core.cost import CostCalculator
@@ -305,6 +306,11 @@ def create_app(
     # tests can tick it manually; the lifespan loop is the only driver
     # in production).
     batch_worker = BatchWorker(pipeline, config.batch)
+    # Canary prober: synthetic deployment health checks. Built here,
+    # attached to app.state after the app exists (tests and
+    # POST /admin/canaries/probe drive waves directly; the lifespan
+    # loop below is the only *scheduled* driver).
+    canary_prober = CanaryProber(router, config.canary, events=events_bus)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -350,6 +356,30 @@ def create_app(
                     await asyncio.sleep(app.state.config.batch.poll_interval_seconds)
 
             batch_task = asyncio.create_task(_batch_loop())
+
+        # Canary probes: one wave of synthetic deployment health checks
+        # per interval. Always started (not gated on canary.enabled)
+        # so enabling via hot reload takes effect; when disabled the
+        # loop idles at a short re-check instead of the probe interval.
+        # Re-reads app.state.config.canary each iteration — enabled /
+        # interval / timeout / allowlist apply from the next iteration.
+        # Under pytest (ASGITransport skips the lifespan) this loop
+        # never starts — tests call probe_once() or the admin endpoint.
+
+        async def _canary_loop() -> None:
+            while True:
+                current = app.state.config.canary
+                if current.enabled:
+                    canary_prober.config = current
+                    try:
+                        await canary_prober.probe_once()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("canary probe wave failed")
+                await asyncio.sleep(
+                    current.interval_seconds if current.enabled else 30.0
+                )
+
+        canary_task = asyncio.create_task(_canary_loop())
         logger.info("LLM Gateway %s ready (models: %s)", __version__, config.public_models())
 
         # SIGHUP = reload config.yaml without dropping traffic (the same
@@ -387,6 +417,7 @@ def create_app(
             prune_task.cancel()
         if batch_task is not None:
             batch_task.cancel()
+        canary_task.cancel()
         # In-flight background work (spend accounting, shadow mirrors,
         # prompt A/B) is drained before the resources it depends on go
         # away — bounded, so a wedged upstream cannot hang shutdown.
@@ -438,6 +469,9 @@ def create_app(
     app.state.events = events_bus
     # Batch worker (tick() driven by the lifespan loop; tests call it).
     app.state.batch_worker = batch_worker
+    # Canary prober (probe_once() driven by the lifespan loop, the
+    # probe-now endpoint, or tests directly).
+    app.state.canary = canary_prober
     # Prompt library (admin-plane CRUD routes live in api/admin.py).
     app.state.prompt_library = pipeline.prompt_library
     app.state.config = config

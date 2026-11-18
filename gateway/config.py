@@ -463,6 +463,36 @@ class BatchConfig(BaseModel):
     poll_interval_seconds: float = 2.0
 
 
+class CanaryConfig(BaseModel):
+    """Synthetic canary probes: a background loop sends a tiny chat
+    request straight to every configured deployment's provider on a
+    schedule, so upstream health is *measured* rather than inferred
+    from traffic (a dead fallback that receives no traffic otherwise
+    looks healthy until the moment it's needed; a shadow deployment
+    only ever sees mirrored traffic).
+
+    Probes are direct adapter calls — no pipeline, no guardrails, no
+    cache, no request-log rows, no spend accounting, no
+    circuit-breaker accounting — so they can neither affect nor be
+    mistaken for client traffic, and cost ``max_tokens`` of provider
+    quota per deployment per wave. Disabled by default (probes spend
+    real quota); ``POST /admin/canaries/probe`` runs a wave on demand
+    regardless.
+
+    ``deployments`` is an optional fnmatch allowlist of deployment
+    names ("openai/*"); None = every deployment under every model,
+    shadows included. Hot-reloadable: enabled / interval / timeout /
+    allowlist apply from the next loop iteration.
+    """
+
+    enabled: bool = False
+    interval_seconds: float = 300.0
+    timeout_seconds: float = 10.0
+    max_tokens: int = 1
+    prompt: str = "ping"
+    deployments: list[str] | None = None  # fnmatch patterns; None = all
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -550,6 +580,7 @@ class GatewayConfig(BaseModel):
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     uploads: UploadsConfig = Field(default_factory=UploadsConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
+    canary: CanaryConfig = Field(default_factory=CanaryConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 

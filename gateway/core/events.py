@@ -62,6 +62,9 @@ Event                            Fired / payload
 ``budget.threshold``             budget alert fired [key, level, spend]
 ``feedback.recorded``            client rated a request [request_id,
                                  model, rating]
+``canary.failed`` / ``canary.recovered``  deployment health-probe result
+                                 and transition [deployment, provider,
+                                 model, outcome, error | latency_ms]
 ``batch.created`` / ``batch.cancelled`` / ``batch.completed`` /
 ``batch.failed`` / ``batch.expired`` / ``batch.deferred``
                                  batch lifecycle [batch_id, ...]

@@ -470,6 +470,11 @@ async def test_batch_defers_on_budget_and_resumes(tmp_path):
         batch_id = batch["id"]
 
         await ns.app.state.batch_worker.tick()  # line 0 runs
+        # Line 0's spend is a fire-and-forget task — settle it before the
+        # next wave so line 1 deterministically sees the budget exceeded
+        # (under a loaded event loop the task can otherwise land after the
+        # wave and both lines complete).
+        await ns.app.state.pipeline.drain_background_tasks()
         await ns.app.state.batch_worker.tick()  # line 1 defers
         deferred = await _get_batch(ns.client, key, batch_id)
         assert deferred["status"] == "in_progress"
