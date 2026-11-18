@@ -60,7 +60,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Idempotency keys** | Retry-safe chat completions: send an `Idempotency-Key` header on any chat-family surface (OpenAI chat, `/v1/responses`, native Anthropic/Gemini) and retried POSTs replay the stored successful response instead of re-executing — no double generation, no double billing (replays are zero-cost `cache_hit` log rows, `X-Gateway-Cache: IDEMPOTENT`). Only successes are stored; key reuse with different parameters is a 400; in-flight duplicates wait for the original. Same backend selection as the response cache, namespaced apart (see [Idempotency](#idempotency)) |
 | **Capture-replay harness** | Config-change safety net built on the request log: `GET /admin/logs/export` captures real traffic as JSONL (bodies + the recorded baseline: caller, route, model, status, deployment, guardrail verdicts), `POST /admin/replay` re-executes those requests through the request-policy phases ONLY — resolution, prompt policy, permissions, guardrails, routing selection — with no upstream calls, no counters, no spend, no log rows, then **diffs** each line against the record. Replays run as the recorded caller's *current* key (edited/revoked keys replay under what they are *now* — a revoked key shows up as would-now-401), guardrail counters are suppressed so a harness run can never trip block alerts, and tenant admins replay only their own tenant's traffic (see [Capture-replay harness](#capture-replay-harness)) |
 | **Runaway-agent protection** | Identical-request loop detection with an escalating cooldown jail: an agent stuck in a retry/tool loop sends the *same* request over and over — every one individually legal, so RPM/TPM can't see it. The fingerprint (the cache's normalized request identity — stable across chat/Responses/native routes, stream or not) repeated `threshold` times inside the window trips, and the *key* answers 429 + `Retry-After` for everything until the cooldown expires — would-be cache hits and idempotent replays included. Re-trips escalate (30s → 60s → ... capped), a quiet period decays the offense count, `GET /admin/runaway` shows the jail and `POST /admin/runaway/{key_id}/release` is the escape hatch; `runaway.trip` event + `gateway_runaway_trips_total{key}` (see [Runaway-agent protection](#runaway-agent-protection)) |
-| **Concurrency admission control & QoS** | Per-key and pooled per-tenant `max_concurrency` caps bound how many requests may be **in-flight against the upstream at once** — RPM/TPM bound the rate, this bounds the parallelism (protects a provider quota or a small deployment fleet). The slot wraps the upstream call: cache hits and idempotent replays never hold one, a streamed response holds it until its body completes, and every error path releases it. At the cap, requests **queue** (no extra upstream pressure) admitted **highest-`priority`-first** (the key's QoS class, FIFO within a class; a waiter on one key never blocks behind an unrelated saturated one); a wait past `concurrency.wait_seconds` answers 429 + `Retry-After` (`0` = fail fast). `GET /admin/concurrency` shows live in-flight/queued counts; `gateway_concurrency_inflight{key}` / `gateway_concurrency_queued{key}` / `gateway_concurrency_rejected_total{key}` + a `concurrency.timeout` event (see [Concurrency admission control](#concurrency-admission-control)) |
+| **Concurrency admission control & QoS** | Per-key and pooled per-tenant `max_concurrency` caps bound how many requests may be **in-flight against the upstream at once** — RPM/TPM bound the rate, this bounds the parallelism (protects a provider quota or a small deployment fleet). The slot wraps the upstream call: cache hits and idempotent replays never hold one, a streamed response holds it until its body completes, and every error path releases it. At the cap, requests **queue** (no extra upstream pressure) admitted **highest-`priority`-first** (the key's QoS class, FIFO within a class; a waiter on one key never blocks behind an unrelated saturated one); a wait past `concurrency.wait_seconds` answers 429 + `Retry-After` (`0` = fail fast). `GET /admin/concurrency` shows live in-flight/queued counts (fleet truth with the Redis backend); slots are in-process per replica, or **fleet-shared via Redis** (`concurrency.backend: redis` — one expiring lease per admitted call, caps that bind the whole deployment, a crashed replica's slots self-healing within `lease_ttl_seconds`); `gateway_concurrency_inflight{key}` / `gateway_concurrency_queued{key}` / `gateway_concurrency_rejected_total{key}` + a `concurrency.timeout` event (see [Concurrency admission control](#concurrency-admission-control)) |
 | **Data-residency routing** | Deployment-tag-constrained routing, fail closed: each deployment carries an operator-asserted `residency` tag (lowercase slug, e.g. `eu`), and keys/tenants carry `required_residencies` — a caller's traffic (chat, native formats, embeddings, images, audio, *and shadow mirrors*) may only be served by deployments whose tag is in the caller's **effective set** (key ∩ tenant; the tenant can only narrow). The filter runs inside the router **before** the priority ladder, retries and fallbacks, so a constrained request can never escape to a non-compliant deployment mid-failover; an untagged deployment satisfies **no** requirement (no claim, no compliance), and a model with nothing compliant answers 404 `residency_not_satisfied` naming the model and the tags. Cache entries never cross residency classes (the requirement salts the chat response-policy token and the embeddings cache key — unrestricted callers keep their exact pre-existing keys); the semantic cache degrades away rather than embed a restricted prompt non-compliantly (see [Data-residency routing](#data-residency-routing)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold); **per-key cache policy** (tier 54) lets a key opt out of both caches or set its own window — `X-Gateway-Cache: BYPASS` for opted-out traffic. Memory or **Redis backends** for exact, semantic, and idempotency stores — Redis shares entries across every worker/replica (`cache.backend` / `semantic_cache.backend` / `idempotency.backend: redis`) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
@@ -270,7 +270,7 @@ Things to know when pointing a framework at the gateway:
 | `POST /admin/routing/breakers/{deployment}/reset` | Force-close a deployment's circuit (next request probes it again) |
 | `GET /admin/runaway` | Runaway-agent protection view: keys currently in the loop-detection cooldown jail (remaining cooldown, offense count, key name), the live `runaway:` config echo and the `enabled` flag. In-process state — a multi-replica fleet reports its own jail here (platform admin) |
 | `POST /admin/runaway/{key_id}/release` | Release a key from the runaway jail (escape hatch): clears the jail, the offense history and the loop windows — the key serves again immediately, and a still-looping agent re-trips from a *first-offense* cooldown. Audited as `runaway.released` |
-| `GET /admin/concurrency` | Concurrency admission control view: keys/tenants currently holding in-flight slots or queueing for one (with key/tenant name joins), the live `concurrency:` config echo and the queue total. Read-only — slots free themselves as responses complete; the caps live on the key/tenant rows. In-process state, so a multi-replica fleet reports its own share (platform admin) |
+| `GET /admin/concurrency` | Concurrency admission control view: keys/tenants currently holding in-flight slots or queueing for one (with key/tenant name joins), the live `concurrency:` config echo and the queue total. Read-only — slots free themselves as responses complete; the caps live on the key/tenant rows. Held slots are fleet truth under `concurrency.backend: redis`, this replica's share otherwise (the wait queue is per-replica either way, so queued counts are this process's waiters) (platform admin) |
 | `GET /admin/guardrails` | Registered guardrails, their params, mode (enforce/observe) and scope (key/tenant/model/route fnmatch globs) |
 | `POST /admin/reload` | **Hot-reload config.yaml** without a restart (same as SIGHUP): guardrails, models/deployments, routing policy, pricing and prompt knobs swap in place; an invalid config is a 400 with the running one untouched; fields that cannot be hot-swapped (provider credentials, auth chain, cache backends, telemetry) are listed in `restart_required` |
 | `POST /admin/backup` | Snapshot the SQLite database (online `VACUUM INTO` — consistent copy of the live DB, no downtime) into `GATEWAY_BACKUP_DIR`; returns name + size. SQLite-only: with a PostgreSQL `GATEWAY_DATABASE_URL` the call is refused with a 400 (`backup_not_supported`) — use `pg_dump` |
@@ -1248,15 +1248,22 @@ When every slot is taken, a request does not fail — it **queues**, and admissi
 
 Observability: `gateway_concurrency_inflight{key}` / `gateway_concurrency_queued{key}` gauges, `gateway_concurrency_rejected_total{key}` counter, and `GET /admin/concurrency` (platform admin): live in-flight/queued counts per key and tenant with name joins, plus the config echo.
 
-Honest boundaries: chat-family surfaces only (embeddings/images/audio run through `_serve_simple` and never acquire a slot — same boundary as runaway detection); callers with neither a key cap nor a tenant cap skip admission entirely (no queueing, no metrics); admin/env-key traffic is exempt like every key-layer ceiling; batch lines go through the chat pipeline and are capped like any other request. State is in-process (like the idempotency in-flight map and runaway detection): a multi-replica fleet enforces its per-replica share — run N replicas behind a load balancer with cap/N, or accept the approximation.
+Honest boundaries: chat-family surfaces only (embeddings/images/audio run through `_serve_simple` and never acquire a slot — same boundary as runaway detection); callers with neither a key cap nor a tenant cap skip admission entirely (no queueing, no metrics); admin/env-key traffic is exempt like every key-layer ceiling; batch lines go through the chat pipeline and are capped like any other request. State is in-process by default (like the idempotency in-flight map and runaway detection): a multi-replica fleet enforces its per-replica share — run N replicas behind a load balancer with cap/N, or accept the approximation. Or set `concurrency.backend: redis` and the slot count moves into the shared store: one expiring lease per admitted call, every admission a WATCH/MULTI check-and-take so two replicas can never both take the last slot, caps that bind the whole fleet. A lease that stops renewing — a crashed replica — expires at `lease_ttl_seconds` and the next admission prunes it, so ghost slots self-heal; a Redis outage fails admission **open** (requests run, counted in-process, release symmetric). The wait queue stays per-replica either way (bounded by `wait_seconds`); a poller re-checks the fleet so another replica's release admits this replica's waiter.
 
 ```yaml
 concurrency:
   enabled: true
   wait_seconds: 10        # queue wait before 429; 0 = fail fast
+  backend: memory         # memory | redis: fleet-shared slots — one expiring
+                          # lease per admitted call; caps bind the whole
+                          # deployment; a crashed replica's leases
+                          # self-heal within lease_ttl_seconds
+  #lease_ttl_seconds: 60  # redis only: lease lifetime (renewed every
+                          # ttl/2 while the call lives; applies from the
+                          # next restart — caps/wait_seconds hot-reload)
 ```
 
-15 tests pin the contract (`tests/test_concurrency.py`).
+25 tests pin the contract (`tests/test_concurrency.py`).
 
 ## Data-residency routing
 
@@ -1316,7 +1323,7 @@ gateway/
 │   ├── router.py        # deployment selection, retries, fallbacks
 │   ├── breaker.py       # per-deployment circuit breakers
 │   ├── ratelimit.py     # sliding-window RPM/TPM
-│   ├── redis_backends.py # Redis rate-limit / cache / semantic-cache backends, shared breaker state
+│   ├── redis_backends.py # Redis rate-limit / cache / semantic-cache / concurrency backends, shared breaker state
 │   ├── cache.py         # exact-match response cache
 │   ├── semantic_cache.py # similarity (semantic) response cache (memory store)
 │   ├── cost.py          # pricing + cost calculation
@@ -1681,12 +1688,14 @@ cache:   {enabled: true, ttl_seconds: 300, max_entries: 256, backend: memory}
 #  max_entries: 256
 #  backend: memory                 # memory | redis (shared across replicas)
 # Multi-worker/multi-replica: share rate-limit windows, cache entries
-# (exact + semantic), idempotency replays and circuit-breaker state via
-# Redis (url also overridable with the REDIS_URL env var below)
+# (exact + semantic), idempotency replays, concurrency slots and
+# circuit-breaker state via Redis (url also overridable with the
+# REDIS_URL env var below)
 #redis:  {url: redis://localhost:6379/0, url_env: REDIS_URL, prefix: llm-gateway}
 #rate_limit: {backend: redis}
 #cache:  {backend: redis}
 #semantic_cache: {backend: redis}  # near-duplicates hit fleet-wide
+#concurrency: {backend: redis}     # in-flight caps bind the whole fleet
 #routing:
 #  breaker: {backend: redis}   # one replica's trip opens the circuit fleet-wide
 routing:

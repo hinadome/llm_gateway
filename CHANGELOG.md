@@ -8,6 +8,47 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Redis-backed concurrency limiter (tier 62) —
+  `concurrency.backend: redis` closes §8.2 item 7's last deliberate
+  in-process exception ("concurrency admission: per-replica slot
+  counts"): the slot count moves into Redis, so in-flight caps bind
+  the whole deployment, not one process.
+  - **`RedisConcurrencyLimiter`** (`core/redis_backends.py`): one
+    sorted set per key (`{prefix}:conc:key:{id}`) and one per tenant
+    (`{prefix}:conc:tnt:{id}`) — members are lease tokens, scores are
+    expiry epochs (wall clock: comparable across processes); emptied
+    zsets vanish by themselves, so idle keys leave no registry
+    behind.
+  - **Admission** = prune-expired-leases then the breaker registry's
+    WATCH/MULTI optimistic transaction over both zsets (5 bounded
+    WatchError retries): two replicas can never both take the last
+    slot. The prune runs before the watch, so a full-looking zset
+    never hides ghosts behind a genuinely free slot.
+  - **Leases renew**: one sweeper task per limiter refreshes held
+    leases every `lease_ttl_seconds / 2` (new knob, read at
+    construction — caps and wait_seconds hot-reload as before), so a
+    slow stream never ages out of its slot; a crashed replica's
+    leases expire at the TTL and the next admission prunes them —
+    ghost slots self-heal.
+  - **The wait queue stays per-replica** (a waiter's future is an
+    in-process object; same `(-priority, seq)` ordering via the
+    shared `_Waiter` — one definition of the priority ordering), with
+    a poller that retries fleet admission so another replica's
+    release admits this replica's waiter; drains serialize on a lock
+    so the pop → admission round trip → re-push cycle cannot
+    interleave (priority inversion). Release stays sync (the
+    response path's contract): the fleet ZREM is fire-and-forget,
+    the lease TTL the backstop.
+  - **A Redis outage fails admission open** — requests run, counted
+    in-process (`slot.local`) so release stays symmetric; waiters
+    queued before the outage stay queued, bounded by their own
+    `wait_seconds`.
+  - **`GET /admin/concurrency`** now awaits the snapshot either way
+    (the in-memory `snapshot()` went async — the breaker registries'
+    trade): held slots are fleet truth under Redis (SCAN + prune +
+    ZCARD, never `KEYS`), queued counts are this replica's waiters; a
+    Redis outage surfaces as an error in the view instead of lying —
+    the breaker-snapshot precedent.
 - Role-aware admin dashboard (tier 61) — `GET /admin/whoami` +
   the per-tenant keys lens close the §8.2 item-10 honest gap: "the
   admin UI has no tenant views (per-endpoint 403s degrade in-page

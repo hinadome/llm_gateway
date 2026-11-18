@@ -9,9 +9,18 @@ non-stream tail, the stream wrapper's finally and every error path, so
 a slow upstream call holds the slot for exactly as long as it runs and
 an error never leaks one. At the cap, requests QUEUE for up to
 concurrency.wait_seconds, admitted highest-priority-first (FIFO
-within a priority); an expired wait answers 429 + Retry-After. All
-state is in-process, like the idempotency in-flight map: per-replica
-shares.
+within a priority); an expired wait answers 429 + Retry-After. State
+is in-process by default (the idempotency in-flight map's stance):
+per-replica shares.
+
+The Redis backend (tier 62, ``concurrency.backend: redis`` →
+``RedisConcurrencyLimiter``) is tested here too. The unit tests drive
+two limiter instances over one fakeredis — the multi-replica scenario
+the backend exists for: fleet-shared caps, ghost-lease self-healing,
+lease renewal, fail-open outages, the fleet snapshot. The e2e tests
+build real apps on it, one of them TWO apps over one shared database
++ one Redis, so a single capped key row binds both "replicas" (the
+trick test_two_apps_share_backends uses for the other backends).
 
 Holding a slot from the outside: ``env.mock.delay_seconds`` makes the
 upstream call itself slow (the slot is held for exactly the duration
@@ -21,12 +30,19 @@ of the call it wraps — the honest way to simulate a busy upstream).
 from __future__ import annotations
 
 import asyncio
+import time
 
+import httpx
+from fakeredis import FakeAsyncRedis
 from prometheus_client.registry import REGISTRY
+from redis.exceptions import RedisError
 
-from gateway.config import ConcurrencyConfig
+from gateway.config import ConcurrencyConfig, Settings
+from gateway.core.redis_backends import RedisConcurrencyLimiter
+from gateway.db import dispose_engine, init_engine, reset_engine_for_tests
+from gateway.main import create_app
 
-from .conftest import ADMIN_KEY, _make_env, auth, chat_body, create_key, make_config
+from .conftest import ADMIN_KEY, MockUpstream, _make_env, auth, chat_body, create_key, make_config
 
 
 def _sample(name: str, labels: dict | None = None) -> float:
@@ -483,3 +499,466 @@ async def test_api_surface_and_validation(tmp_path):
         )
         assert patched_tenant.status_code == 200
         assert patched_tenant.json()["max_concurrency"] is None
+
+
+# ----------------------------------------------------------------------
+# The Redis backend: fleet-shared slots (tier 62)
+# ----------------------------------------------------------------------
+#
+# Unit tests drive TWO limiter instances over one fakeredis — the
+# multi-replica scenario the backend exists for. A controllable clock
+# makes lease expiries deterministic; tiny poll/renew intervals keep
+# the tests fast; aclose() at the end stops the sweeper/poller tasks.
+
+
+class _FakeClock:
+    """Controllable epoch clock: lease expiries become deterministic."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _BrokenRedis:
+    """A client that is down: every pipeline() raises (Redis outage)."""
+
+    def pipeline(self, transaction: bool = True):
+        raise RedisError("redis is down")
+
+
+class _FlakyRedis:
+    """A working client that can go down mid-test."""
+
+    def __init__(self, inner: FakeAsyncRedis) -> None:
+        self.inner = inner
+        self.broken = False
+
+    def pipeline(self, transaction: bool = True):
+        if self.broken:
+            raise RedisError("redis went down")
+        return self.inner.pipeline(transaction=transaction)
+
+
+def _key_zset(key_id: str) -> str:
+    return f"llm-gateway:conc:key:{key_id}"
+
+
+async def _try_acquire(
+    limiter,
+    key_id: str,
+    key_label: str,
+    *,
+    tenant_id: str | None = None,
+    key_cap: int | None = 1,
+    tenant_cap: int | None = None,
+    priority: int = 0,
+    wait_seconds: float = 0.0,
+):
+    return await limiter.acquire(
+        key_id=key_id,
+        tenant_id=tenant_id,
+        key_label=key_label,
+        key_cap=key_cap,
+        tenant_cap=tenant_cap,
+        priority=priority,
+        wait_seconds=wait_seconds,
+    )
+
+
+async def test_redis_fleet_cap_shares_slots_across_limiters():
+    """Two limiters over one Redis = one cap: A's held slot is B's
+    refusal, exactly what a multi-replica fleet needs."""
+    redis = FakeAsyncRedis()
+    clock = _FakeClock()
+    limiter_a = RedisConcurrencyLimiter(
+        redis, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    limiter_b = RedisConcurrencyLimiter(
+        redis, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    try:
+        slot_a = await _try_acquire(limiter_a, "k1", "fa")
+        assert slot_a is not None
+        assert await redis.zcard(_key_zset("k1")) == 1  # the lease is fleet-visible
+
+        # Replica B is refused: the cap binds the fleet, not the process.
+        assert await _try_acquire(limiter_b, "k1", "fb") is None
+        assert _sample("gateway_concurrency_rejected_total", {"key": "fb"}) == 1.0
+
+        limiter_a.release(slot_a)
+        await asyncio.sleep(0.05)  # the fire-and-forget lease removal lands
+        assert await redis.zcard(_key_zset("k1")) == 0  # lease gone, zset gone
+
+        slot_b = await _try_acquire(limiter_b, "k1", "fb2")
+        assert slot_b is not None  # the freed slot is B's now
+        limiter_b.release(slot_b)
+    finally:
+        await limiter_a.aclose()
+        await limiter_b.aclose()
+
+
+async def test_redis_queue_admits_on_other_replicas_release():
+    """A waiter on replica B is admitted when replica A releases — the
+    poller noticing a cross-replica free, the whole point of keeping
+    the queue per-replica with a fleet re-check."""
+    redis = FakeAsyncRedis()
+    clock = _FakeClock()
+    limiter_a = RedisConcurrencyLimiter(
+        redis, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    limiter_b = RedisConcurrencyLimiter(
+        redis, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    try:
+        slot_a = await _try_acquire(limiter_a, "k1", "qa")
+        assert slot_a is not None
+
+        started = time.monotonic()
+        waiter = asyncio.create_task(_try_acquire(limiter_b, "k1", "qb", wait_seconds=2.0))
+        await asyncio.sleep(0.08)  # refused, now queued on B
+        assert _sample("gateway_concurrency_queued", {"key": "qb"}) == 1.0
+
+        limiter_a.release(slot_a)  # A's ZREM lands; B's poller retries
+        slot_b = await waiter
+        elapsed = time.monotonic() - started
+        assert slot_b is not None  # admitted by the poller, not the timeout
+        assert elapsed < 1.5
+        limiter_b.release(slot_b)
+    finally:
+        await limiter_a.aclose()
+        await limiter_b.aclose()
+
+
+async def test_redis_ghost_leases_self_heal():
+    """A crashed replica's leases (expiry passed, never released) are
+    pruned by the next admission — a full-looking store must never be
+    hiding ghosts. LIVE leases are never pruned."""
+    redis = FakeAsyncRedis()
+    clock = _FakeClock()
+    limiter = RedisConcurrencyLimiter(
+        redis, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    try:
+        # A ghost on the key zset: expiry already passed.
+        await redis.zadd(_key_zset("k1"), {"ghost": clock.now - 1.0})
+        slot = await _try_acquire(limiter, "k1", "ga")  # cap 1, store looks full
+        assert slot is not None  # the ghost was pruned, not counted
+        members = await redis.zrange(_key_zset("k1"), 0, -1)
+        decoded = {m.decode() if isinstance(m, bytes) else m for m in members}
+        assert decoded == {slot.token}  # the ghost is gone
+
+        # A LIVE lease is never pruned — it keeps refusing.
+        await redis.zadd(_key_zset("k2"), {"live": clock.now + 60.0})
+        assert await _try_acquire(limiter, "k2", "ga2") is None
+
+        # Tenant zsets heal the same way.
+        await redis.zadd("llm-gateway:conc:tnt:t1", {"stale-tenant": clock.now - 1.0})
+        tslot = await _try_acquire(
+            limiter, "k3", "ga3", tenant_id="t1", key_cap=None, tenant_cap=1
+        )
+        assert tslot is not None
+        limiter.release(slot)
+        limiter.release(tslot)
+    finally:
+        await limiter.aclose()
+
+
+async def test_redis_renewal_extends_lease_expiry():
+    """The renewal sweeper refreshes held leases, so a live call never
+    ages out of its own slot: after the original expiry passes, the
+    lease still holds the cap."""
+    redis = FakeAsyncRedis()
+    clock = _FakeClock()
+    limiter = RedisConcurrencyLimiter(
+        redis,
+        ConcurrencyConfig(lease_ttl_seconds=2.0),
+        clock=clock,
+        poll_interval=0.02,
+        renew_interval=0.02,
+    )
+    try:
+        slot = await _try_acquire(limiter, "k1", "ra")
+        assert slot is not None
+        zset = _key_zset("k1")
+        assert await redis.zscore(zset, slot.token) == 1002.0  # now + ttl
+
+        clock.advance(1.0)  # halfway: renewal fires while the lease is live
+        await asyncio.sleep(0.06)  # ≥ 2 sweeps, all with the clock at 1001.0
+        assert await redis.zscore(zset, slot.token) == 1003.0  # 1001.0 + ttl
+
+        clock.advance(1.5)  # 1002.5: past the ORIGINAL expiry
+        # The renewed lease still refuses — it did not age out.
+        assert await _try_acquire(limiter, "k1", "ra2") is None
+        limiter.release(slot)
+    finally:
+        await limiter.aclose()
+
+
+async def test_redis_tenant_cap_is_fleet_wide():
+    """The pooled tenant cap binds across replicas: a member key on
+    replica B is refused while replica A's key holds the tenant's
+    only slot."""
+    redis = FakeAsyncRedis()
+    clock = _FakeClock()
+    limiter_a = RedisConcurrencyLimiter(
+        redis, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    limiter_b = RedisConcurrencyLimiter(
+        redis, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    try:
+        slot_a = await _try_acquire(
+            limiter_a, "k1", "ta", tenant_id="t1", key_cap=5, tenant_cap=1
+        )
+        assert slot_a is not None
+        # A different key, same tenant, other replica: the tenant pool is full.
+        assert (
+            await _try_acquire(limiter_b, "k2", "tb", tenant_id="t1", key_cap=5, tenant_cap=1)
+            is None
+        )
+        # A different tenant is unaffected.
+        other = await _try_acquire(
+            limiter_b, "k2", "tb2", tenant_id="t2", key_cap=5, tenant_cap=1
+        )
+        assert other is not None
+
+        limiter_a.release(slot_a)
+        await asyncio.sleep(0.05)  # A's lease removal lands
+        after = await _try_acquire(
+            limiter_b, "k2", "tb3", tenant_id="t1", key_cap=5, tenant_cap=1
+        )
+        assert after is not None  # the tenant pool freed, fleet-wide
+        limiter_b.release(other)
+        limiter_b.release(after)
+    finally:
+        await limiter_a.aclose()
+        await limiter_b.aclose()
+
+
+async def test_redis_outage_fails_open_with_symmetric_release():
+    """A Redis outage admits anyway (fail open — the breaker's stance),
+    counted in-process so release stays symmetric: the fleet is never
+    asked about a slot it never saw."""
+    limiter = RedisConcurrencyLimiter(
+        _BrokenRedis(), ConcurrencyConfig(), poll_interval=0.02, renew_interval=0.05
+    )
+    try:
+        slot = await _try_acquire(
+            limiter, "k1", "oa", tenant_id="t1", key_cap=1, tenant_cap=1, wait_seconds=5.0
+        )
+        assert slot is not None  # admitted despite the outage
+        assert slot.local is True  # counted in-process, not in Redis
+        assert _sample("gateway_concurrency_inflight", {"key": "oa"}) == 1.0
+        assert _sample("gateway_concurrency_rejected_total", {"key": "oa"}) == 0.0
+
+        limiter.release(slot)
+        assert _sample("gateway_concurrency_inflight", {"key": "oa"}) == 0.0
+        assert limiter._outage == {} and limiter._outage_tenants == {}
+    finally:
+        await limiter.aclose()
+
+
+async def test_redis_waiter_outage_bounded_by_wait_seconds():
+    """A waiter queued BEFORE an outage stays queued — the poller keeps
+    retrying and admission does not fail open from the queue — until
+    its own wait_seconds expires, exactly the documented stance."""
+    inner = FakeAsyncRedis()
+    client = _FlakyRedis(inner)
+    clock = _FakeClock()
+    limiter = RedisConcurrencyLimiter(
+        client, ConcurrencyConfig(), clock=clock, poll_interval=0.02, renew_interval=0.05
+    )
+    try:
+        # A live lease (held directly — another replica's call) makes
+        # the first admission queue.
+        await inner.zadd(_key_zset("k1"), {"held": clock.now + 60.0})
+        waiter = asyncio.create_task(_try_acquire(limiter, "k1", "wa", wait_seconds=0.4))
+        await asyncio.sleep(0.08)  # refused, queued
+        assert _sample("gateway_concurrency_queued", {"key": "wa"}) == 1.0
+
+        client.broken = True  # the outage hits while the waiter waits
+        slot = await waiter
+        assert slot is None  # the wait expired: bounded, no fail-open from the queue
+        assert _sample("gateway_concurrency_rejected_total", {"key": "wa"}) == 1.0
+        assert _sample("gateway_concurrency_queued", {"key": "wa"}) == 0.0
+        assert limiter._waiters == []  # left the queue cleanly
+    finally:
+        client.broken = False
+        await limiter.aclose()
+
+
+async def test_redis_snapshot_is_fleet_view():
+    """snapshot() reads the fleet (SCAN + ZCARD over the lease zsets),
+    with this replica's queued waiters and outage admissions riding
+    along — the queue and the outage counts are per-replica by
+    design."""
+    redis = FakeAsyncRedis()
+    clock = _FakeClock()
+    common = {"clock": clock, "poll_interval": 0.02, "renew_interval": 0.05}
+    limiter_a = RedisConcurrencyLimiter(redis, ConcurrencyConfig(), **common)
+    limiter_b = RedisConcurrencyLimiter(redis, ConcurrencyConfig(), **common)
+    try:
+        slot_a = await _try_acquire(
+            limiter_a, "k1", "sa", tenant_id="t1", key_cap=2, tenant_cap=5
+        )
+        slot_b = await _try_acquire(
+            limiter_b, "k2", "sb", tenant_id="t1", key_cap=2, tenant_cap=5
+        )
+        assert slot_a is not None and slot_b is not None
+
+        # A live lease on k3 (held directly — another replica's call)
+        # makes B's next request queue behind it.
+        await redis.zadd(_key_zset("k3"), {"held": clock.now + 60.0})
+        queued = asyncio.create_task(_try_acquire(limiter_b, "k3", "sq", wait_seconds=10.0))
+        await asyncio.sleep(0.08)  # refused, queued on B only
+
+        # An outage admission on A: fail open, counted locally — so it
+        # rides along in A's snapshot only.
+        limiter_a._client = _BrokenRedis()
+        outage_slot = await _try_acquire(limiter_a, "k9", "so", key_cap=1, wait_seconds=5.0)
+        limiter_a._client = redis
+        assert outage_slot is not None and outage_slot.local is True
+
+        assert await limiter_a.snapshot() == {
+            "keys": [
+                {"key_id": "k1", "inflight": 1, "queued": 0},
+                {"key_id": "k2", "inflight": 1, "queued": 0},
+                {"key_id": "k3", "inflight": 1, "queued": 0},
+                {"key_id": "k9", "inflight": 1, "queued": 0},  # outage, A's only
+            ],
+            "tenants": [{"tenant_id": "t1", "inflight": 2}],
+            "queued_total": 0,
+        }
+        assert await limiter_b.snapshot() == {
+            "keys": [
+                {"key_id": "k1", "inflight": 1, "queued": 0},
+                {"key_id": "k2", "inflight": 1, "queued": 0},
+                {"key_id": "k3", "inflight": 1, "queued": 1},  # B's waiter
+            ],
+            "tenants": [{"tenant_id": "t1", "inflight": 2}],
+            "queued_total": 1,  # per-replica, like the queued column
+        }
+
+        queued.cancel()
+        await asyncio.gather(queued, return_exceptions=True)
+        limiter_a.release(slot_a)
+        limiter_b.release(slot_b)
+        limiter_a.release(outage_slot)
+    finally:
+        await limiter_a.aclose()
+        await limiter_b.aclose()
+
+
+async def test_redis_backend_e2e_app_leases_and_admin_view(tmp_path):
+    """Through a real app: the slot is a live lease in the shared
+    store, the admin view reads the fleet, and completion hands the
+    lease back."""
+    redis = FakeAsyncRedis()
+    config = make_config(
+        redis_backends=True, concurrency=ConcurrencyConfig(wait_seconds=5.0)
+    )
+    async for env in _make_env(tmp_path, redis_client=redis, config=config):
+        info = await create_key(env.client, "held", max_concurrency=1)
+        key = info["key"]
+
+        env.mock.delay_seconds = 0.6
+        holder = asyncio.create_task(_post_chat(env, key, "slow upstream"))
+        await asyncio.sleep(0.15)
+
+        # Mid-hold: the lease is fleet-visible (raw store) and the
+        # admin view reads it with the id -> name join.
+        assert await redis.zcard(_key_zset(info["id"])) == 1
+        view = (
+            await env.client.get("/admin/concurrency", headers=auth(ADMIN_KEY))
+        ).json()
+        assert view["enabled"] is True
+        assert view["wait_seconds"] == 5.0
+        entry = next(e for e in view["keys"] if e["key_id"] == info["id"])
+        assert entry["key_name"] == "held"
+        assert entry["inflight"] == 1
+        assert entry["queued"] == 0
+
+        assert (await holder).status_code == 200
+        env.mock.delay_seconds = 0.0
+        await asyncio.sleep(0.05)  # the fire-and-forget lease removal lands
+        assert await redis.zcard(_key_zset(info["id"])) == 0
+        view = (
+            await env.client.get("/admin/concurrency", headers=auth(ADMIN_KEY))
+        ).json()
+        assert view["keys"] == []
+        assert view["queued_total"] == 0
+
+
+async def test_two_apps_share_one_concurrency_cap(tmp_path):
+    """The multi-replica guarantee end to end: replica A's held slot is
+    replica B's 429 — one capped key row over one shared database, one
+    shared lease store (the trick test_two_apps_share_backends uses
+    for the other backends)."""
+    redis = FakeAsyncRedis()
+    reset_engine_for_tests()
+    db_url = f"sqlite+aiosqlite:///{tmp_path}/replicas.db"
+    await init_engine(db_url)
+
+    def build() -> tuple:
+        mock = MockUpstream()
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock.handler))
+        app = create_app(
+            settings=Settings(admin_key=ADMIN_KEY, database_url=db_url),
+            config=make_config(
+                redis_backends=True, concurrency=ConcurrencyConfig(wait_seconds=0.0)
+            ),
+            http_client=http_client,
+            redis_client=redis,
+        )
+        app.state.admin_key = ADMIN_KEY  # ASGITransport does not run the lifespan
+        return app, mock, http_client
+
+    app_a, mock_a, http_a = build()
+    app_b, mock_b, http_b = build()
+    try:
+        client_a = httpx.AsyncClient(transport=httpx.ASGITransport(app=app_a), base_url="http://a.test")
+        client_b = httpx.AsyncClient(transport=httpx.ASGITransport(app=app_b), base_url="http://b.test")
+
+        key = (await create_key(client_a, "replica", max_concurrency=1))["key"]
+
+        mock_a.delay_seconds = 0.6  # replica A holds the only slot
+        holder = asyncio.create_task(
+            client_a.post(
+                "/v1/chat/completions",
+                json=chat_body(content="held by replica a"),
+                headers=auth(key),
+            )
+        )
+        await asyncio.sleep(0.15)
+
+        # Replica B sees the fleet slot count and fails fast.
+        refused = await client_b.post(
+            "/v1/chat/completions",
+            json=chat_body(content="replica b wants in"),
+            headers=auth(key),
+        )
+        assert refused.status_code == 429
+        assert refused.json()["error"]["code"] == "rate_limit_exceeded"
+        assert "max 1 in-flight request" in refused.json()["error"]["message"]
+
+        # Once A completes, the lease is gone and B is admitted.
+        assert (await holder).status_code == 200
+        await asyncio.sleep(0.05)  # the fire-and-forget ZREM lands
+        allowed = await client_b.post(
+            "/v1/chat/completions",
+            json=chat_body(content="replica b wants in"),
+            headers=auth(key),
+        )
+        assert allowed.status_code == 200
+        assert len(mock_b.requests) == 1  # B reached upstream exactly once
+        await client_a.aclose()
+        await client_b.aclose()
+    finally:
+        await http_a.aclose()
+        await http_b.aclose()
+        await dispose_engine()

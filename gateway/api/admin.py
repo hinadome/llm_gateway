@@ -3562,14 +3562,17 @@ async def concurrency_view(
 ) -> dict:
     """Concurrency admission control: keys/tenants currently holding
     in-flight slots or queueing for one, plus the live config echo and
-    the per-key gauges' ground truth. In-process state — a
-    multi-replica fleet reports its own share here. Read-only: slots
-    free themselves as responses complete; the caps live on the
+    the per-key gauges' ground truth. Held slots are fleet truth under
+    the Redis backend (concurrency.backend: redis — a SCAN + ZCARD
+    read, so a Redis outage surfaces as an error here instead of lying,
+    the breaker-snapshot precedent) and this process's share
+    in-process; the wait queue is per-replica either way. Read-only:
+    slots free themselves as responses complete; the caps live on the
     key/tenant rows."""
     pipeline = raw_request.app.state.pipeline
     limiter = pipeline.concurrency
     cfg = pipeline.config.concurrency
-    snapshot = limiter.snapshot() if limiter is not None else {"keys": [], "tenants": [], "queued_total": 0}
+    snapshot = await limiter.snapshot() if limiter is not None else {"keys": [], "tenants": [], "queued_total": 0}
     # Join display names — the limiter tracks ids only.
     names: dict[str, str] = {}
     tenant_names: dict[str, str] = {}

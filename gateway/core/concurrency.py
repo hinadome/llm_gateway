@@ -25,11 +25,15 @@ expires answers 429 ``rate_limit_exceeded`` + ``Retry-After`` — the
 pipeline raises, emits a ``concurrency.timeout`` observer event and
 counts ``gateway_concurrency_rejected_total{key}``.
 
-All state is in-process (like the idempotency in-flight map and
+All state is in-process here (like the idempotency in-flight map and
 runaway detection): a multi-replica fleet enforces its per-replica
-share — run N replicas behind a load balancer with cap/N, or accept
-the approximation. No locks anywhere: everything runs on the event
-loop, so each acquire/release/drain is atomic by construction.
+share — run N replicas behind a load balancer with cap/N, accept the
+approximation, or move the slot count into Redis with
+``concurrency.backend: redis`` (``RedisConcurrencyLimiter``,
+redis_backends.py — same acquire/release/snapshot contract, same
+metrics, fleet-shared caps; tier 62). No locks anywhere: everything
+runs on the event loop, so each acquire/release/drain is atomic by
+construction.
 """
 
 from __future__ import annotations
@@ -242,10 +246,12 @@ class ConcurrencyLimiter:
         metrics.CONCURRENCY_INFLIGHT.labels(key=slot.key_label).dec()
         self._drain()
 
-    def snapshot(self) -> dict:
+    async def snapshot(self) -> dict:
         """Admin view: every key/tenant with slots held or waiters
         queued right now, plus totals. In-process state — a
-        multi-replica fleet reports its own share here."""
+        multi-replica fleet reports its own share here. (Async so the
+        Redis backend's fleet read carries the same signature — the
+        same trade the breaker registries' ``snapshots`` made.)"""
         keys: dict[str, dict] = {}
         for key_id, inflight in self._inflight.items():
             keys[key_id] = {"inflight": inflight, "queued": 0}

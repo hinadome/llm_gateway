@@ -29,7 +29,7 @@ import time
 import uuid
 from contextlib import nullcontext, suppress
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -97,6 +97,12 @@ from .vault import VaultService
 from .events import EventBus
 from .logging_svc import LoggingService
 from .router import Router
+
+if TYPE_CHECKING:
+    # Annotation-only (tier 62): the Redis limiter carries the same
+    # acquire/release contract as the in-memory one, so the pipeline
+    # stays backend-agnostic — and free of a runtime redis import.
+    from .redis_backends import RedisConcurrencyLimiter
 
 logger = logging.getLogger("gateway.pipeline")
 
@@ -204,7 +210,7 @@ class GatewayPipeline:
         events: EventBus | None = None,
         idempotency: IdempotencyStore | None = None,
         runaway: RunawayProtector | None = None,
-        concurrency: ConcurrencyLimiter | None = None,
+        concurrency: ConcurrencyLimiter | RedisConcurrencyLimiter | None = None,
         vault: "VaultService | None" = None,
         # The app's shared HTTP client (create_app always passes one) —
         # the MCP proxy's only transport, so the pipeline for the first
@@ -249,7 +255,10 @@ class GatewayPipeline:
         self.runaway = runaway
         # Concurrency admission control (None = disabled — standalone
         # constructions): per-key/tenant in-flight caps with priority
-        # queueing — see core/concurrency.py.
+        # queueing — see core/concurrency.py. Either backend carries
+        # the same acquire/release contract; the Redis one
+        # (RedisConcurrencyLimiter) counts slots fleet-shared via
+        # expiring leases instead of per-process.
         self.concurrency = concurrency
         # BYOK vault (tier 31). None = standalone constructions get a
         # DISABLED service (lookups no-op, platform credentials); the

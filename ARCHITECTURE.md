@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 95 Python files, ~36,600 lines, 1406 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 95 Python files, ~37,200 lines, 1416 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -1078,9 +1078,14 @@ gateway/
 │   │                       joins. No locks — everything runs on the
 │   │                       event loop, atomic by construction; state
 │   │                       is in-process (like the idempotency
-│   │                       in-flight map and runaway detection):
+│   │                       in-flight map and runaway detection)
+│   │                       unless concurrency.backend: redis —
+│   │                       RedisConcurrencyLimiter
+│   │                       (redis_backends.py) shares the slot
+│   │                       count fleet-wide under the same
+│   │                       acquire/release/snapshot contract;
 │   │                       multi-replica fleets enforce per-replica
-│   │                       shares. Chat-family only — embeddings /
+│   │                       shares in memory. Chat-family only — embeddings /
 │   │                       images / audio run through _serve_simple
 │   │                       and never acquire a slot (same honest
 │   │                       boundary as runaway)
@@ -1179,8 +1184,10 @@ gateway/
 │   │                       is the interchangeable shared-state backend
 │   ├── ratelimit.py        Sliding-window RPM/TPM, in-memory (async interface)
 │   ├── redis_backends.py   RedisRateLimiter + RedisResponseCache + RedisCircuitBreaker
-│   │                       Registry — shared windows, cache entries and circuit-breaker
-│   │                       state across workers/replicas, semantics preserved;
+│   │                       Registry + RedisConcurrencyLimiter — shared windows, cache
+│   │                       entries, circuit-breaker state and in-flight
+│   │                       concurrency slots across workers/replicas, semantics
+│   │                       preserved;
 │   │                       RedisVaultInvalidator (tier 34) fans BYOK cache
 │   │                       invalidations across the same fleet (see vault.py);
 │   │                       RedisSemanticCache (tier 59) shares the
@@ -1209,7 +1216,42 @@ gateway/
 │   │                       clear() delete companions with their
 │   │                       entries (bytes-safe derivation — the LRU
 │   │                       index speaks bytes under decode_responses
-│   │                       =False)
+│   │                       =False). Tier 62 RedisConcurrencyLimiter
+│   │                       (concurrency.backend: redis): lease
+│   │                       zsets {prefix}:conc:key:{id} /
+│   │                       {prefix}:conc:tnt:{id}, members are lease
+│   │                       tokens scored by expiry epoch (wall clock
+│   │                       — comparable across processes), emptied
+│   │                       zsets vanish so idle keys leave no
+│   │                       registry; admission = prune-expired then
+│   │                       the breaker's WATCH/MULTI optimistic
+│   │                       transaction over both zsets (retry on
+│   │                       WatchError — two replicas can never both
+│   │                       take the last slot); one renewal sweeper
+│   │                       per limiter refreshes held leases every
+│   │                       ttl/2 and stops with the last release;
+│   │                       the wait queue reuses _Waiter from
+│   │                       concurrency.py (one definition of the
+│   │                       priority ordering) with a poller retrying
+│   │                       fleet admission so another replica's
+│   │                       release admits this replica's waiter;
+│   │                       release is sync (the response path's
+│   │                       contract) so the fleet ZREM is
+│   │                       fire-and-forget with the lease TTL as
+│   │                       backstop; drains serialize on a lock (a
+│   │                       pop → admission round trip → re-push
+│   │                       cycle must not interleave or priority
+│   │                       inverts); timeout/cancel handshakes mark
+│   │                       the waiter's future so a mid-flight
+│   │                       admission hands the lease straight back;
+│   │                       a Redis outage fails admission OPEN,
+│   │                       counted in-process (slot.local) so
+│   │                       release stays symmetric; snapshot() is
+│   │                       SCAN + prune + ZCARD fleet truth plus this
+│   │                       replica's queued waiters and outage
+│   │                       admissions — RedisError propagates to the
+│   │                       admin view, the breaker-snapshot
+│   │                       precedent (never KEYS)
 │   ├── cache.py            Exact-match response cache + stream replay (async
 │   │                       interface); cache_key_for salts the normalized
 │   │                       request with the caller's response-policy token.
@@ -3336,7 +3378,7 @@ Being honest about the seams — these are the current trade-offs (all are local
 4. ~~Stream guardrails are block-only~~ **Solved:** guardrails can opt into mid-stream rewriting (`supports_stream_rewrite` + `rewrite_stream_text`) — held-back text flushes before the finish chunk, so PII masked as it streams never reaches the client, no matter how the provider chunked it. Block checks (`check_stream_delta`) still see the source text. Remaining caveat: rewriting is reserve-based, not clairvoyant — a match that can grow longer than the rewriter's hold-back window can be split (see `stream_reserve_chars`).
 5. **Service selection beyond the built-ins is code.** The rate limiter, response cache and circuit-breaker registry have two built-in backends each (in-memory, Redis) selectable from `config.yaml`, but swapping in something else (e.g., a DynamoDB cache) still means calling `create_app` differently — the selection switch covers the shipped implementations only.
 6. ~~Auth is a fixed strategy~~ **Solved for the gateway's own scale:** authentication is now a pluggable chain (`auth.chain`, `core/auth.py`) with built-in `admin_key` / `virtual_key` / `jwt` steps and `"pkg.module:ClassName"` custom steps — the same dynamic-loading story guardrails have. The JWT step delegates *policy* to the key row its token names (a deliberate single-source-of-truth choice), which also means there is no standalone "user" concept: every principal is a virtual key, and revoking that key revokes every token naming it. The same choice is why rotation never touches tokens: a JWT names the *key*, not its credential, so every token naming a key keeps working across its rotations (tier 51) — only raw-credential holders need the new secret. Tier 60 adds the one deliberate exception, the `sso_session` step (auto-inserted before `jwt` when `auth.sso.enabled`): the dashboard's OIDC login mints short-lived gateway sessions whose principal is the *signed-in human* as a platform admin — the one principal that names no key row, because the dashboard is an operator's surface and its audit records must say *who* (`auth_method` sso, the email) where the shared raw key could not. The session is stateless HS256 (the TTL is the revocation bound — logout drops the cookie, refresh is one click, replicas sharing the session secret verify each other's sessions), and the step claims only tokens whose unverified `iss` says ours — a foreign JWT still falls through to `jwt` untouched. ~~Per-key cache overrides don't exist~~ **Solved (tier 54):** the key row now carries `cache_enabled` (NULL = inherit; `false` = bypass both response caches, exact + semantic, chat and embeddings, lookup and store — narrowing only, global-off stays off) and `cache_ttl_seconds` (NULL = the global window; otherwise the key's own, honored read-side as a freshness bound and write-side as the entry's lifetime), snapshotted at auth like every other key ceiling. Not covered: mTLS client certificates.
-7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching (exact *and* semantic — `semantic_cache.backend: redis`, tier 59: a near-duplicate one replica embedded and stored is a hit for every replica, `RedisSemanticCache` keeping the same cosine/threshold/TTL/LRU semantics over shared entries) and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
+7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching (exact *and* semantic — `semantic_cache.backend: redis`, tier 59: a near-duplicate one replica embedded and stored is a hit for every replica, `RedisSemanticCache` keeping the same cosine/threshold/TTL/LRU semantics over shared entries), circuit-breaker state **and concurrency admission** all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`, `concurrency.backend: redis`) that share windows, entries, circuits and in-flight slots across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Concurrency admission (tier 62, `RedisConcurrencyLimiter`): one sorted set per key and per tenant, members are lease tokens scored by expiry epoch; admission is prune-then-WATCH/MULTI check-and-take, so two replicas can never both take the last slot; a renewal sweeper (one task per limiter, ttl/2 cadence) keeps live leases fresh so a slow stream never ages out of its slot; a crashed replica's leases expire at `lease_ttl_seconds` and the next admission prunes them — ghost slots self-heal; a Redis outage fails admission open too (requests run, counted in-process so release stays symmetric). The wait queue stays per-replica either way (a waiter's future is an in-process object; a poller re-checks the fleet so another replica's release admits this replica's waiter). Two deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only) and runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too).
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
 9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
 10. ~~No tenant concept~~ **Solved:** tenants (`models.Tenant`) group virtual keys under a narrowing policy ceiling — allowlist, RPM/TPM, the three budget windows — with no admin bypass at the tenant layer; tenant admins are scoped (own keys/logs/stats/usage, 404 on cross-tenant ids, 403 on platform endpoints) and auth fails closed on dangling/disabled tenants (see §6). ~~Tenant guardrail scoping has no first-class field (item 9)~~ **Solved (tier 58):** `guardrails[].scope.tenants` / `exclude_tenants` match the tenant's name with fnmatch globs — one field binds a whole tenant (every member key, tenant admins included, the ceiling applies to them like every member), with no key-name globs or per-key `disabled_guardrails` bookkeeping; a platform key (no tenant) is in no tenant, so `tenants` never widens onto it and `exclude_tenants` never excuses it. ~~The admin UI has no tenant views (per-endpoint 403s degrade in-page for tenant admins)~~ **Solved (tier 61):** the dashboard is role-aware — `GET /admin/whoami` (name, auth method, tenancy, `platform_admin`) is one honest probe replacing the infer-the-role-from-which-endpoints-403 trick; every platform-only tab (tenant management, prompt library, routing/breakers/shadow evidence, guardrail config, playground, reload/backups) renders the same honest "platform-administrator surface" note for a tenant administrator instead of firing a guaranteed-403 request (so the connection badge stops reporting a connection error on a working dashboard); the header names the signed-in principal (an SSO session's email); and platform admins get per-tenant lenses on the keys and logs tabs (`GET /admin/keys?tenant_id=` joins `/admin/logs`'s forced-scope pattern — the lens is ignored for tenant admins, never an exfiltration path). Remaining gaps, honestly: tenant API-key budgets are the only pooling dimension — per-tenant pricing exists as a single cost-plus *markup* multiplier over the shared model pricing table (`pricing_markup_pct`, tier 25), but per-tenant *per-model* price overrides and rate-limit overrides per key-within-tenant still don't exist beyond what the two stacked windows already enforce.
@@ -3381,7 +3423,7 @@ Ship it safely with `mode: observe` first — verdicts land in `/admin/logs` and
 2. Register in `BUILTIN_ADAPTERS` (`providers/__init__.py`) — one line.
 3. Add `providers: bedrock: {...}` + a deployment in `config.yaml`.
 
-**Run multiple workers/replicas (Redis backends)**: the shipped `RedisRateLimiter` / `RedisResponseCache` / `RedisCircuitBreakerRegistry` (`core/redis_backends.py`) preserve the in-memory semantics exactly — true sliding windows (sorted sets, one member per request; token counts in a companion hash), an exact-match cache with server-side TTL and LRU size bound (index sorted set scored by last access; tier 54: the TTL is per-entry — the writer's window — with a companion timestamp key for freshness readers, see the module map), and the same three-state breaker with one hash per deployment (every read-modify-write inside a WATCH/MULTI transaction, so concurrent replicas serialize instead of interleaving; one replica's trip opens the circuit fleet-wide). Enable via config, no code:
+**Run multiple workers/replicas (Redis backends)**: the shipped `RedisRateLimiter` / `RedisResponseCache` / `RedisCircuitBreakerRegistry` / `RedisConcurrencyLimiter` (`core/redis_backends.py`) preserve the in-memory semantics exactly — true sliding windows (sorted sets, one member per request; token counts in a companion hash), an exact-match cache with server-side TTL and LRU size bound (index sorted set scored by last access; tier 54: the TTL is per-entry — the writer's window — with a companion timestamp key for freshness readers, see the module map), the same three-state breaker with one hash per deployment (every read-modify-write inside a WATCH/MULTI transaction, so concurrent replicas serialize instead of interleaving; one replica's trip opens the circuit fleet-wide), and fleet-shared concurrency slots — one expiring lease per admitted call (admission is the same WATCH/MULTI check-and-take; a renewal sweeper keeps live leases fresh; a crashed replica's leases expire at `lease_ttl_seconds` and self-heal at the next admission; outages fail admission open). Enable via config, no code:
 
 ```yaml
 redis:
@@ -3390,6 +3432,7 @@ redis:
 rate_limit: {backend: redis}
 cache:      {backend: redis}
 semantic_cache: {backend: redis}
+concurrency: {backend: redis}
 routing:
   breaker: {backend: redis}
 ```
@@ -3644,6 +3687,17 @@ tests/
 │                        Gemini json_object/json_schema mapping), api-key
 │                        header auth, opt-in CORS (preflight, expose
 │                        headers, unlisted origins)
+├── test_concurrency.py  In-process admission control (caps, priority queueing
+│                        incl. cross-key skip, tenant pooling, fail-fast,
+│                        bypasses, admin view, timeout event) + the Redis
+│                        backend (tier 62): two limiters over one fakeredis
+│                        with a controllable clock — fleet caps, cross-replica
+│                        queue admission, ghost-lease self-heal, lease renewal
+│                        past the original expiry, fail-open outage with
+│                        symmetric release, a queued waiter riding out an
+│                        outage bounded by wait_seconds, the fleet snapshot —
+│                        and e2e incl. two apps sharing one database + one
+│                        Redis over a single capped key
 ├── test_observability.py  OTel span tree/attributes/parenting, W3C propagation, streaming
 │                        span lifetime, retry/fallback events, TTFT + in-flight metrics
 ├── test_redis_backends.py  Redis limiter/cache semantics (fakeredis, deterministic clock)

@@ -72,6 +72,7 @@ from .core.concurrency import ConcurrencyLimiter
 from .core.vault import VaultService
 from .core.redis_backends import (
     RedisCircuitBreakerRegistry,
+    RedisConcurrencyLimiter,
     RedisRateLimiter,
     RedisResponseCache,
     RedisSemanticCache,
@@ -217,6 +218,7 @@ def create_app(
         or config.idempotency.backend == "redis"
         or config.vault.backend == "redis"
         or config.semantic_cache.backend == "redis"
+        or config.concurrency.backend == "redis"
     ):
         redis_client = aioredis.from_url(config.redis.resolve_url())
     breakers = None
@@ -300,8 +302,19 @@ def create_app(
     # priority queueing. Always constructed — enabled/wait_seconds are
     # read off the live config per call (hot reload applies, held
     # slots survive), and the caps live on the key/tenant rows anyway.
-    # In-process state, like the runaway protector: per-replica shares.
-    concurrency = ConcurrencyLimiter()
+    # backend: redis (tier 62) makes the slot count fleet-shared — one
+    # expiring lease per admitted call, cap checks across the whole
+    # deployment (RedisConcurrencyLimiter); memory stays per-replica,
+    # like the runaway protector. A redis backend without a client
+    # (never true via config — the client condition above — but honest
+    # if a caller injects None) falls back to memory: degrade, never
+    # break, the semantic-cache trade.
+    if config.concurrency.backend == "redis" and redis_client is not None:
+        concurrency = RedisConcurrencyLimiter(
+            redis_client, config.concurrency, prefix=config.redis.prefix
+        )
+    else:
+        concurrency = ConcurrencyLimiter()
 
     cost_calculator = CostCalculator(config.pricing)
     # Budget alerts: own (non-instrumented) HTTP client; disabled unless a
@@ -769,6 +782,14 @@ def create_app(
         # client when none was injected).
         if app.state.sso is not None:
             await app.state.sso.aclose()
+        # The concurrency limiter's background tasks (Redis backend
+        # only: the lease-renewal sweeper and the queue poller) stop
+        # before the client they ride goes away. The in-memory backend
+        # owns no tasks — the getattr probe keeps teardown
+        # backend-agnostic, the auth-chain step pattern.
+        concurrency_aclose = getattr(concurrency, "aclose", None)
+        if concurrency_aclose is not None:
+            await concurrency_aclose()
         if redis_client is not None:
             await redis_client.aclose()
         # Background log writes (logging.background_write): drain every

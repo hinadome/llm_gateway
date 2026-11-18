@@ -214,6 +214,9 @@ def make_config(**cache_overrides) -> GatewayConfig:
         # The semantic store too (tier 59) — inert unless enabled, like
         # every backend field.
         config.semantic_cache.backend = "redis"
+        # And the concurrency limiter (tier 62) — likewise inert unless
+        # a key/tenant row carries a cap.
+        config.concurrency.backend = "redis"
     return config
 
 

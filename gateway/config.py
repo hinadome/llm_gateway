@@ -1187,15 +1187,29 @@ class ConcurrencyConfig(BaseModel):
     highest-``priority``-first (``VirtualKey.priority``, FIFO within a
     priority); an expired wait answers 429 + Retry-After.
 
-    State is in-process (like the idempotency in-flight map and
-    runaway detection): a multi-replica fleet enforces its
-    per-replica share.
+    State is in-process by default (like the idempotency in-flight
+    map and runaway detection): a multi-replica fleet enforces its
+    per-replica share. ``backend: redis`` (tier 62) moves the slot
+    count into Redis — one lease per admitted call, cap checks
+    fleet-shared — with ``lease_ttl_seconds`` as the crashed-replica
+    backstop: a lease that stops renewing expires, and the next
+    admission prunes it, so ghost slots self-heal within one TTL. The
+    wait queue stays per-replica either way (bounded by
+    ``wait_seconds``).
     """
 
     enabled: bool = True
     # How long a request queues for a slot before failing with 429
     # (+ Retry-After). 0 = fail fast when all slots are taken.
     wait_seconds: float = 10.0
+    backend: str = "memory"  # memory | redis
+    # Redis backend only: how long an admitted call's lease lives.
+    # Release removes it; a renewal sweeper refreshes live leases
+    # every ttl/2; a lease that stops renewing (a crashed replica)
+    # expires at this bound and the next admission prunes it. Read at
+    # construction — caps and wait_seconds hot-reload, the TTL applies
+    # from the next restart.
+    lease_ttl_seconds: float = 60.0
 
 
 class RedisConfig(BaseModel):

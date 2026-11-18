@@ -803,13 +803,28 @@ runaway:
 # echo). Metrics: gateway_concurrency_inflight{key} /
 # gateway_concurrency_queued{key} gauges,
 # gateway_concurrency_rejected_total{key}; a `concurrency.timeout`
-# observer event fires per refused wait. State is in-process (like the
-# idempotency in-flight map): a multi-replica fleet enforces its
-# per-replica share — run N replicas with cap/N, or accept the
-# approximation.
+# observer event fires per refused wait. State is in-process by
+# default (like the idempotency in-flight map): a multi-replica fleet
+# enforces its per-replica share — run N replicas with cap/N, or set
+# backend: redis (tier 62) and the slot count moves into the shared
+# store: one expiring lease per admitted call, WATCH/MULTI admission
+# (two replicas can never both take the last slot), caps that bind
+# the whole fleet. A lease that stops renewing (a crashed replica)
+# expires at lease_ttl_seconds and the next admission prunes it —
+# ghost slots self-heal; a Redis outage admits anyway (fail open,
+# counted in-process so release stays symmetric). The wait queue
+# stays per-replica either way.
 concurrency:
   enabled: true
   wait_seconds: 10        # queue wait before 429; 0 = fail fast
+  backend: memory         # memory | redis: fleet-shared slots — caps bind
+                          # the whole deployment, not one process
+  #lease_ttl_seconds: 60  # redis only: lease lifetime. The renewal sweeper
+                          # refreshes live leases every ttl/2; a crashed
+                          # replica's leases expire here and self-heal at
+                          # the next admission. Read at construction — caps
+                          # and wait_seconds hot-reload, the TTL applies
+                          # from the next restart.
 
 # Lifecycle events: subscribe handlers to the request-stage boundaries
 # (request.received / request.routed / response.completed / stream.* /
