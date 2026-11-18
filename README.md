@@ -33,7 +33,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Inspection** | Every request/response stored with guardrail decisions, tokens, cost, latency; queryable via `/admin/logs` (filterable by trace id); Prometheus metrics at `/metrics`; OpenTelemetry tracing + logs with trace correlation (opt-in); full Grafana/collector stack in `deploy/`; PII-safe mode stores no bodies (`store_bodies: false`) and old rows are pruned automatically (`retention_days`) |
 | **Admin UI** | Built-in dashboard at `/admin/ui`: key management (create/edit/revoke, budget bars, alert badges, tenant placement, admin-key grants), tenant management (create/edit/delete with pooled budget bars and the kill switch; platform admins only — tenant admins land on a scoped note), request-log browsing with full request/response inspection, routing table with live circuit-breaker state, guardrail inventory, and a System tab (health, config reload, backups) — one self-contained HTML file, no build step, no external resources (works offline) |
 | **Virtual keys** | Per-key model allowlists (fnmatch patterns), RPM/TPM rate limits, USD budgets with spend tracking — total plus **daily / monthly windows** (UTC calendar caps, e.g. "no more than $5/day") |
-| **Multi-tenancy** | Tenants (organizations) group virtual keys under a shared policy ceiling — model allowlist, RPM/TPM, and total/daily/monthly budgets that apply to *every* member key, tenant admins included (they manage their own tenant's keys, not its policy; a member must pass both its own checks and the tenant's — the tenant can only narrow). **Tenant admins** (`is_admin` key inside a tenant) see only their tenant's keys/logs/stats/usage (a cross-tenant id is a 404, not a 403 — no existence leaks) and are 403 on platform endpoints (tenants, prompts, routing, guardrails, reload, backups). `is_active: false` is a kill switch for every member key (re-enable restores them); pooled spend and budget alerts fire per tenant too (`kind: "tenant"` in the payload); responses carry `X-Gateway-Tenant`; caches are isolated per tenant |
+| **Multi-tenancy** | Tenants (organizations) group virtual keys under a shared policy ceiling — model allowlist, RPM/TPM, and total/daily/monthly budgets that apply to *every* member key, tenant admins included (they manage their own tenant's keys, not its policy; a member must pass both its own checks and the tenant's — the tenant can only narrow). **`pricing_markup_pct`** bills member traffic at cost-plus (20.0 = +20% on provider cost): spend, budgets, logs, exports and the per-key metrics record the *billed* cost while `gateway_cost_usd_total{model}` keeps the actual, and `gateway_markup_usd_total{tenant}` counts the revenue (see [Tenant pricing markup](#tenant-pricing-markup)). **Tenant admins** (`is_admin` key inside a tenant) see only their tenant's keys/logs/stats/usage (a cross-tenant id is a 404, not a 403 — no existence leaks) and are 403 on platform endpoints (tenants, prompts, routing, guardrails, reload, backups). `is_active: false` is a kill switch for every member key (re-enable restores them); pooled spend and budget alerts fire per tenant too (`kind: "tenant"` in the payload); responses carry `X-Gateway-Tenant`; caches are isolated per tenant |
 | **Pluggable auth chain** | `auth.chain` lists the strategies that may authenticate a caller, in order: built-in `admin_key` / `virtual_key` / `jwt`, or your own `"pkg.module:ClassName"` step. A **JWT/OAuth bearer token** authenticates the virtual key named by its `sub` claim (HS256 secret or a JWKS with rotation) — budgets, limits and spend accrue to that key exactly as its raw key would |
 | **Audit log** | Security-relevant admin actions (key create/update/revoke, breaker reset) POSTed as JSON webhooks to your SIEM/audit trail — who (key + auth method), what, when; best-effort background delivery, counted on `gateway_audit_events_total` |
 | **Token scoping** | Per-key `allowed_endpoints` (`chat` / `embeddings` / `images` / `audio` / `models`; `chat` covers the native formats and the Responses bridge) and `allowed_ips` (plain IPs or CIDR blocks) — defense in depth beyond model allowlists; admins are never scoped |
@@ -141,7 +141,7 @@ To terminate TLS in front of the gateway instead (nginx, Caddy, a load balancer)
 | `POST /v1/batches/{id}/cancel` | Cancel an in-progress batch |
 | `POST /v1/feedback` | Rate a request the calling key made (by its `X-Request-Id`; rating 1–5, optional comment) — see [Feedback](#feedback) |
 
-Diagnostic response headers on every data-plane response (completions, embeddings, images, audio): `X-Request-Id`, `X-Gateway-Model`, `X-Gateway-Provider`, `X-Gateway-Deployment`, `X-Gateway-Cache` (HIT/SEMANTIC/MISS/IDEMPOTENT; NONE on the non-cacheable surfaces), `X-Gateway-Cost-Usd`, `X-Gateway-Latency-Ms`.
+Diagnostic response headers on every data-plane response (completions, embeddings, images, audio): `X-Request-Id`, `X-Gateway-Model`, `X-Gateway-Provider`, `X-Gateway-Deployment`, `X-Gateway-Cache` (HIT/SEMANTIC/MISS/IDEMPOTENT; NONE on the non-cacheable surfaces), `X-Gateway-Cost-Usd` (the *billed* cost — the tenant's marked-up price when `pricing_markup_pct` is set), `X-Gateway-Latency-Ms`.
 
 ### Native client formats (Anthropic & Gemini)
 
@@ -202,9 +202,9 @@ Things to know when pointing a framework at the gateway:
 | `GET /admin/keys` / `GET /admin/keys/{id}` | List/inspect keys (tenant admins see their own tenant's only; cross-tenant ids 404) |
 | `PATCH /admin/keys/{id}` | Update limits, allowlist, active flag, budgets (total / daily / monthly), `disabled_guardrails`, `model_mappings` / `default_model`, prompt policy (`system_prompt` / `system_prompt_ref` / `prompt_variables`), scoping (`allowed_endpoints` / `allowed_ips`; explicit `null` clears — changing `max_budget_usd` re-arms budget alerts); `tenant_id` re-homes the key (**platform admin only**, target validated — tenant admins get 403) |
 | `DELETE /admin/keys/{id}` | Revoke a key |
-| `POST /admin/tenants` | Create a tenant (platform admin): slug `name` (header-safe pattern — it surfaces in `X-Gateway-Tenant` and log filters), `display_name`, model allowlist, RPM/TPM, budgets |
+| `POST /admin/tenants` | Create a tenant (platform admin): slug `name` (header-safe pattern — it surfaces in `X-Gateway-Tenant` and log filters), `display_name`, model allowlist, RPM/TPM, `pricing_markup_pct` (cost-plus billing), budgets |
 | `GET /admin/tenants` / `GET /admin/tenants/{id}` | List/inspect tenants, with pooled spend and fired alert levels (platform admin) |
-| `PATCH /admin/tenants/{id}` | Update a tenant's policy ceiling (slug immutable) — `is_active: false` disables every member key at once; budget changes re-arm tenant alerts |
+| `PATCH /admin/tenants/{id}` | Update a tenant's policy ceiling (slug immutable) — `is_active: false` disables every member key at once; budget changes re-arm tenant alerts; `pricing_markup_pct` applies from the next request (auth-time snapshot) |
 | `DELETE /admin/tenants/{id}` | Delete a tenant — refused with 409 while any key still references it (a dangling `tenant_id` fails closed at auth time, so re-home or revoke first) |
 | `POST /admin/prompts` | Append a version to a named prompt (first version of a name auto-activates) |
 | `GET /admin/prompts` | One summary per prompt name: active version, A/B candidate, version count |
@@ -553,6 +553,36 @@ pricing:
 - `/admin/routing` echoes `cost_aware` and each deployment's `{input, output, cached_input}_usd_per_mtok` (from the same lookup), so the ranking is inspectable.
 
 15 tests pin the contract (`tests/test_cost_aware.py`).
+
+## Tenant pricing markup
+
+Resellers and platform teams bill tenants at cost-plus. Set `pricing_markup_pct` on a tenant (20.0 = bill member traffic at 1.2× provider cost) and every member-key request — chat, embeddings, images, audio, speech, streams, tenant admins' own traffic — records the **billed** cost everywhere money is accounted:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "acme", "pricing_markup_pct": 20.0, "max_budget_usd": 100}' \
+  http://localhost:8000/admin/tenants
+```
+
+| Surface | Records |
+| --- | --- |
+| `spend_usd` (key + tenant), budget windows, budget alerts | billed |
+| `X-Gateway-Cost-Usd` response header | billed |
+| `RequestLog.cost_usd` → `/admin/logs`, capture export | billed |
+| `/admin/usage/export` (chargeback) + `/admin/stats` | billed |
+| `gateway_key_cost_usd_total{key}` (per-key metrics) | billed |
+| **`gateway_cost_usd_total{model}`** | **actual** — platform economics stay visible beside tenant economics |
+| `gateway_markup_usd_total{tenant}` | the markup revenue itself (billed − actual) |
+
+The rules, so the accounting is never surprising:
+
+- **Snapshot at auth time**, like every other tenant ceiling: a PATCH applies from the next request, never mid-flight.
+- **Budgets enforce the billed cost** — a tenant's ceiling is what they pay, not what you pay.
+- **Platform keys bill at actual**, always (no tenant, no markup); `NULL` (never set) and an explicit `0` both mean no markup.
+- **Shadow mirrors record actual provider cost** — mirror rows compare deployments, they don't bill anyone.
+- Rounding matches the calculator's (8 decimals), so `billed = cost × (1 + pct/100)` reconciles exactly against the log.
+
+10 tests pin the contract (`tests/test_tenant_markup.py`).
 
 ## Architecture
 
@@ -961,7 +991,8 @@ Because the OpenAI adapter is a passthrough, you can point `providers.openai.api
 | `gateway_circuit_state` | gauge | deployment, provider — circuit breaker state (0=closed, 1=half_open, 2=open) |
 | `gateway_circuit_transitions_total` | counter | deployment, provider, state — breaker trips / recoveries |
 | `gateway_tokens_total` | counter | type (prompt/completion) |
-| `gateway_cost_usd_total` | counter | model |
+| `gateway_cost_usd_total` | counter | model — actual upstream cost (tenant markups never touch this series) |
+| `gateway_markup_usd_total` | counter | tenant — pricing-markup revenue (billed − actual, from a tenant's `pricing_markup_pct`) |
 | `gateway_guardrail_blocks_total` | counter | guardrail, phase — enforce mode only |
 | `gateway_guardrail_observed_total` | counter | guardrail, phase, action — would-be verdicts in observe mode |
 | `gateway_cache_hits_total` | counter | result (hit / semantic / miss) |
@@ -972,7 +1003,7 @@ Because the OpenAI adapter is a passthrough, you can point `providers.openai.api
 | `gateway_logs_dropped_total` | counter | request log rows dropped because the background write queue (`logging.background_write`) was full |
 | `gateway_key_requests_total` | counter | key, status — requests per virtual key (`metrics.per_key`; shadow mirrors excluded) |
 | `gateway_key_tokens_total` | counter | key, type — prompt/completion tokens per virtual key (`metrics.per_key`) |
-| `gateway_key_cost_usd_total` | counter | key — upstream cost per virtual key (`metrics.per_key`) |
+| `gateway_key_cost_usd_total` | counter | key — cost per virtual key (`metrics.per_key`; the *billed* cost when the key's tenant carries a markup) |
 | `gateway_key_label_overflow_total` | counter | per-key labels collapsed into `__overflow__` past `metrics.per_key_max_series` distinct keys |
 | `gateway_shadow_requests_total` | counter | deployment, outcome (success / error) — requests mirrored to shadow deployments (never affect the client) |
 | `gateway_shadow_latency_seconds` | histogram | deployment — latency of mirrored (shadow) upstream calls |

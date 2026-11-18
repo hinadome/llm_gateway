@@ -171,6 +171,14 @@ class Tenant(Base):
     allowed_models: Mapped[list | None] = mapped_column(JSONColumn, nullable=True)
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Cost-plus billing: percent markup on the provider cost of every
+    # member-key request (20.0 = bill 1.2x actual). The marked-up cost
+    # is what spend, budgets, log rows, exports and the per-key metrics
+    # record — the chargeback number. gateway_cost_usd_total{model}
+    # keeps the ACTUAL provider cost, so platform economics stay
+    # visible beside tenant economics. NULL = no markup (bill at
+    # actual — the platform default; auto-upgrade adds the column).
+    pricing_markup_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     spend_usd: Mapped[float] = mapped_column(Float, default=0.0)
     # Budget windows: same scheme as VirtualKey (see there) — bucket ids
@@ -198,6 +206,7 @@ class Tenant(Base):
             "allowed_models": self.allowed_models,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
+            "pricing_markup_pct": self.pricing_markup_pct,
             "max_budget_usd": self.max_budget_usd,
             "spend_usd": self.spend_usd,
             "daily_budget_usd": self.daily_budget_usd,

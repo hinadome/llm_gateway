@@ -38,6 +38,12 @@ class AuthContext:
     tenant_daily_bucket: str | None = None
     tenant_monthly_spend_usd: float | None = None
     tenant_monthly_bucket: str | None = None
+    # Tenant cost-plus markup (percent, 20.0 = bill 1.2x provider
+    # cost), snapshotted at auth time like the other tenant ceilings.
+    # The marked-up cost is what spend/budgets/logs/exports record;
+    # gateway_cost_usd_total{model} stays ACTUAL. None = no markup
+    # (platform keys, or a tenant that sets none).
+    tenant_pricing_markup_pct: float | None = None
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
     rpm_limit: int | None = None
     tpm_limit: int | None = None

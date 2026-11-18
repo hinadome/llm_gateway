@@ -8,6 +8,34 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Tenant pricing markup — cost-plus billing for resellers/chargeback.
+  A tenant can carry pricing_markup_pct (e.g. 20.0 = bill member-key
+  traffic at 1.2x provider cost), applied to every modality and every
+  member key, tenant admins included. The BILLED cost —
+  provider_cost * (1 + pct/100), rounded to the calculator's 8
+  decimals — is what spend_usd (key + tenant), the budget windows,
+  budget alerts, RequestLog.cost_usd (/admin/logs, the capture
+  export, /admin/usage/export for chargeback, /admin/stats by-tenant
+  aggregates), the per-key gateway_key_cost_usd_total metric and the
+  X-Gateway-Cost-Usd response header record;
+  gateway_cost_usd_total{model} deliberately keeps the ACTUAL
+  provider cost so platform economics stay visible beside tenant
+  economics, and a new gateway_markup_usd_total{tenant} counter
+  accumulates the markup revenue itself (billed minus actual).
+  Implementation: a shared pipeline._billed_cost helper called from
+  both accounting tails — _account_usage (chat/embeddings/streams)
+  and _account_cost (unit-priced images/audio/speech) — so every
+  modality marks up consistently. Semantics: the markup snapshots at
+  auth time with the rest of the tenant ceiling (a PATCH applies from
+  the next request, never mid-flight); budgets enforce the BILLED
+  cost (a tenant's ceiling is what they pay, not what the platform
+  pays); platform keys, NULL and explicit 0 all bill at actual;
+  shadow-mirror rows keep actual provider cost (mirror rows compare
+  deployments, they don't bill anyone). Surface: Tenant row field
+  (nullable Float, auto-upgrade adds it; exposed in to_public_dict),
+  POST/PATCH /admin/tenants (validated 0..1000 percent; body
+  validation surfaces as the usual 400), and the admin UI tenant
+  form + list column. 10 new tests (tests/test_tenant_markup.py).
 - Cost-aware routing + cached-token billing — two halves of one
   concern: what traffic costs.
   - Cached-token billing: providers discount prompt-cache reads

@@ -29,6 +29,12 @@ COST = Counter(
     ["model"],
 )
 
+MARKUP_USD = Counter(
+    "gateway_markup_usd_total",
+    "Tenant pricing-markup revenue in USD (billed minus actual provider cost).",
+    ["tenant"],
+)
+
 GUARDRAIL_BLOCKS = Counter(
     "gateway_guardrail_blocks_total",
     "Requests/chunks blocked by guardrails.",

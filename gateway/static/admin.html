@@ -414,6 +414,7 @@
         <label class="fld" title="Pooled spend cap across every member key. Changing it re-arms the tenant's budget alerts (levels the current spend has already crossed count as fired).">Max budget (USD) <input id="t-budget" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld" title="Pooled spend cap per UTC calendar day; resets at 00:00 UTC">Daily budget (USD) <input id="t-daily" type="number" min="0" step="0.01" placeholder="unlimited"></label>
         <label class="fld" title="Pooled spend cap per UTC calendar month; resets on the 1st at 00:00 UTC">Monthly budget (USD) <input id="t-monthly" type="number" min="0" step="0.01" placeholder="unlimited"></label>
+        <label class="fld" title="Cost-plus billing: percent markup on provider cost for every member-key request (20 = bill 1.2x). Spend, budgets, logs and exports record the billed cost; gateway_cost_usd_total stays actual. Empty = no markup.">Markup % <input id="t-markup" type="number" min="0" max="1000" step="0.1" placeholder="none"></label>
       </div>
       <label class="fld" style="grid-template-columns:auto 1fr;display:grid;gap:8px;align-items:center;color:var(--text)" id="t-active-row" title="Kill switch: while disabled, every member key fails closed (401) until re-enabled — spend state and keys are untouched.">
         <input type="checkbox" id="t-active" checked style="width:16px;height:16px;accent-color:var(--accent)"> Active
@@ -971,12 +972,16 @@ async function loadTenants() {
     const stateBadge = t.is_active
       ? '<span class="b b-green" title="Normal operation">active</span>'
       : '<span class="b b-red" title="Kill switch: every member key fails closed (401) until re-enabled">disabled</span>';
+    const markupBadge = t.pricing_markup_pct == null
+      ? '<span class="muted">—</span>'
+      : `<span class="b b-blue" title="Cost-plus billing: member traffic bills at ${(100 + t.pricing_markup_pct) / 100}x provider cost; spend/budgets/logs record the billed amount">+${t.pricing_markup_pct}%</span>`;
     return `<tr>
       <td>${nameCell}</td>
       <td>${stateBadge}</td>
       <td class="num">${fmtInt(keyCounts[t.id] || 0)}</td>
       <td>${models}</td>
       <td class="num">${t.rpm_limit == null ? "—" : fmtInt(t.rpm_limit)} / ${t.tpm_limit == null ? "—" : fmtInt(t.tpm_limit)}</td>
+      <td>${markupBadge}</td>
       <td>${budgetCellHtml(t)}</td>
       <td class="muted" style="font-size:12px">${fmtWhen(t.created_at)}</td>
       <td style="white-space:nowrap">
@@ -985,8 +990,8 @@ async function loadTenants() {
       </td></tr>`;
   }).join("");
   $("#tenants-table").innerHTML =
-    "<thead><tr><th>Tenant</th><th>State</th><th class=num>Keys</th><th>Models</th><th class=num>RPM / TPM</th><th>Budget (pooled)</th><th>Created</th><th></th></tr></thead><tbody>" +
-    (rows || '<tr><td colspan="8" class="empty">No tenants — create one, then place keys in it (Keys tab)</td></tr>') + "</tbody>";
+    "<thead><tr><th>Tenant</th><th>State</th><th class=num>Keys</th><th>Models</th><th class=num>RPM / TPM</th><th>Markup</th><th>Budget (pooled)</th><th>Created</th><th></th></tr></thead><tbody>" +
+    (rows || '<tr><td colspan="9" class="empty">No tenants — create one, then place keys in it (Keys tab)</td></tr>') + "</tbody>";
 }
 
 $("#tenants-table").addEventListener("click", async e => {
@@ -1021,6 +1026,7 @@ function openTenantDialog(t) {
   $("#t-budget").value = t && t.max_budget_usd != null ? t.max_budget_usd : "";
   $("#t-daily").value = t && t.daily_budget_usd != null ? t.daily_budget_usd : "";
   $("#t-monthly").value = t && t.monthly_budget_usd != null ? t.monthly_budget_usd : "";
+  $("#t-markup").value = t && t.pricing_markup_pct != null ? t.pricing_markup_pct : "";
   $("#t-active").checked = t ? t.is_active : true;
   $("#t-active-row").style.display = t ? "grid" : "none";
   $("#t-err").textContent = "";
@@ -1035,6 +1041,7 @@ async function submitTenantDialog() {
       ? $("#t-models").value.split(",").map(s => s.trim()).filter(Boolean) : null,
     rpm_limit: num("t-rpm"),
     tpm_limit: num("t-tpm"),
+    pricing_markup_pct: num("t-markup"),
     max_budget_usd: num("t-budget"),
     daily_budget_usd: num("t-daily"),
     monthly_budget_usd: num("t-monthly"),

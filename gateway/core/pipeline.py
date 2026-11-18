@@ -1288,6 +1288,24 @@ class GatewayPipeline:
             headers=headers,
         )
 
+    def _billed_cost(self, ctx: RequestContext, provider_cost: float) -> float:
+        """The caller-billed cost: provider cost plus the tenant's
+        pricing markup (a percent, snapshotted at auth time like the
+        other tenant ceilings). This is the chargeback number — what
+        spend, budgets, log rows, exports and the per-key metrics
+        record — while ``gateway_cost_usd_total{model}`` keeps the
+        ACTUAL provider cost, so platform economics stay visible
+        beside tenant economics. Platform keys (no tenant) and tenants
+        without a markup bill at actual cost."""
+        pct = ctx.auth.tenant_pricing_markup_pct
+        if not pct:
+            return provider_cost
+        billed = provider_cost * (1.0 + pct / 100.0)
+        markup = billed - provider_cost
+        if markup > 0 and ctx.auth.tenant_name:
+            metrics.MARKUP_USD.labels(tenant=ctx.auth.tenant_name).inc(markup)
+        return round(billed, 8)
+
     async def _account_cost(
         self,
         ctx: RequestContext,
@@ -1314,13 +1332,16 @@ class GatewayPipeline:
                 await self.rate_limiter.record_usage(
                     ctx.auth.key_id, prompt_tokens + completion_tokens
                 )
-        ctx.cost_usd = cost
+        # Billed cost (tenant markup included) is what the log row,
+        # spend and the per-key chargeback metrics record; the
+        # model-labeled cost series stays ACTUAL provider cost.
+        ctx.cost_usd = self._billed_cost(ctx, cost)
         metrics.COST.labels(model=ctx.model).inc(cost)
         if self.config.metrics.per_key:
             metrics.KEY_COST.labels(
                 key=self._key_labeler.label(ctx.auth.key_name)
-            ).inc(cost)
-        self._queue_spend(ctx, cost)
+            ).inc(ctx.cost_usd)
+        self._queue_spend(ctx, ctx.cost_usd)
 
     # ------------------------------------------------------------------
     # Streaming machinery
@@ -1816,14 +1837,17 @@ class GatewayPipeline:
         cost = self.cost_calculator.calculate(usage, native_model) or self.cost_calculator.calculate(
             usage, ctx.model
         )
-        ctx.cost_usd = cost
+        # Billed cost (tenant markup included) is what the log row,
+        # spend/budgets and the per-key chargeback metrics record; the
+        # model-labeled cost series stays ACTUAL provider cost.
+        ctx.cost_usd = self._billed_cost(ctx, cost)
         metrics.COST.labels(model=ctx.model).inc(cost)
         if self.config.metrics.per_key:
             metrics.KEY_COST.labels(
                 key=self._key_labeler.label(ctx.auth.key_name)
-            ).inc(cost)
+            ).inc(ctx.cost_usd)
         if spend:
-            self._queue_spend(ctx, cost)
+            self._queue_spend(ctx, ctx.cost_usd)
 
     # ------------------------------------------------------------------
     # Background work + graceful shutdown

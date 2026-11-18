@@ -398,6 +398,11 @@ class TenantCreateRequest(BaseModel):
     allowed_models: list[str] | None = None  # fnmatch patterns; None = all
     rpm_limit: int | None = None
     tpm_limit: int | None = None
+    # Cost-plus billing: percent markup on provider cost (20.0 = bill
+    # 1.2x actual). Applies to every member-key request, tenant admins
+    # included; snapshots at auth time like the other tenant ceilings.
+    # None = bill at actual cost (the platform default).
+    pricing_markup_pct: float | None = Field(default=None, ge=0, le=1000)
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None  # UTC calendar-day cap
     monthly_budget_usd: float | None = None  # UTC calendar-month cap
@@ -411,6 +416,7 @@ class TenantUpdateRequest(BaseModel):
     allowed_models: list[str] | None = None
     rpm_limit: int | None = None
     tpm_limit: int | None = None
+    pricing_markup_pct: float | None = Field(default=None, ge=0, le=1000)
     max_budget_usd: float | None = None
     daily_budget_usd: float | None = None
     monthly_budget_usd: float | None = None

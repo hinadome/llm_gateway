@@ -125,6 +125,9 @@ def auth_context_from_key(
         tenant_monthly_bucket=(
             tenant.monthly_bucket if tenant is not None else None
         ),
+        tenant_pricing_markup_pct=(
+            tenant.pricing_markup_pct if tenant is not None else None
+        ),
         allowed_models=vkey.allowed_models,
         rpm_limit=vkey.rpm_limit,
         tpm_limit=vkey.tpm_limit,
