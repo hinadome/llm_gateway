@@ -34,6 +34,7 @@ from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
 from ..core import billing as billing_core
+from ..core import finops as finops_core
 from ..core import migration as migration_core
 from ..core import promotion as promotion_core
 from ..core import slos as slos_core
@@ -1801,6 +1802,58 @@ async def invoice(
             **data,
         }
     )
+
+
+@router.get("/admin/anomalies")
+async def anomaly_flags(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    tenant_id: str | None = None,
+) -> dict:
+    """Cost anomaly flags (tier 46): unusual money and traffic
+    patterns on the request logs, surfaced as flags — never pager
+    alerts (error-rate health is the SLO epic's job; this is the
+    money lens). Four shapes, each a billing surprise in its own
+    way: ``cost_spike`` (a key spending several times its trailing
+    daily rate), ``traffic_spike`` (the request-rate version),
+    ``traffic_stop`` (a key with real baseline traffic that went
+    silent — the churn/broken-integration signal a spend dashboard
+    structurally cannot show), and ``first_seen_model`` (something
+    new on the bill).
+
+    The comparison: the recent ``window_hours`` (default 24) against
+    the trailing ``baseline_days`` (default 14) immediately before
+    it, over the client-consumed lens (shadow mirrors and trial
+    replays excluded, cache hits included — the tier-45 rules). The
+    honesty rule is the SLO tiers': **a thin baseline is not a
+    verdict** — fewer than ``min_baseline_requests`` baseline rows
+    (default 10) means no spike and no silence, never a scary ratio
+    on thin evidence; a brand-new key cannot spike at all. A
+    baseline that cost nothing with window spend fires with
+    ``ratio: null`` and a message saying so — never a fabricated
+    infinity.
+
+    Every flag carries its own numbers (window vs baseline requests
+    and cost, the ratio where one exists, the bounds in the
+    envelope) so a flag is auditable without calling back.
+    Read-at-request-time — no loop, no state, hot-reload applies
+    instantly. ``finops.enabled: false`` serves an honest empty list
+    while the invoice keeps serving. Tenant admins see their own
+    tenant only (the scope is forced); platform admins may filter
+    ``?tenant_id=`` or read the whole platform.
+    """
+    # Tenant scoping: forced for tenant admins, opt-in for platform
+    # (the invoice's rule — the anomalies are read beside it).
+    effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+    config = raw_request.app.state.config
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        data = await finops_core.anomalies(session, config.finops, tenant_id=effective_tenant)
+    return {
+        "object": "anomalies",
+        "config": config.finops.model_dump(),
+        **data,
+    }
 
 
 # ----------------------------------------------------------------------

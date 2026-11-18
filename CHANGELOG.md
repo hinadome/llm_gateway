@@ -8,6 +8,46 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Cost anomaly flags (tier 46) — the invoice's follow-up: is any of
+  this unusual? `GET /admin/anomalies` compares the recent window
+  (`finops.window_hours`, default 24h) against each key's trailing
+  baseline (`finops.baseline_days`, default the 14d immediately
+  before it), per key and per model over the same client-consumed
+  lens the invoice bills. Four flag shapes, each a billing surprise
+  in its own way:
+  - **`cost_spike` / `traffic_spike`** — the window's daily rate at
+    ≥ `finops.spike_ratio` (default 3×) the baseline's: the
+    runaway-agent shape, the someone-pointed-a-loop-at-us shape;
+    volume before it becomes money.
+  - **`traffic_stop`** — a key with real baseline traffic that went
+    silent: the churn / broken-integration signal a spend dashboard
+    structurally cannot show (nothing is a great price).
+  - **`first_seen_model`** — a model with zero baseline traffic
+    appeared in the window: something new is on the bill, and new
+    line items are how invoices surprise people.
+
+  The honesty rules (the SLO epic's, money edition): a thin baseline
+  (< `finops.min_baseline_requests` rows, default 10) is not a
+  verdict — no spike and no silence on thin evidence, and a
+  brand-new key cannot spike at all (it appears on the invoice, not
+  here with a fabricated verdict); a zero-cost baseline with window
+  spend fires with `ratio: null` and a message saying the baseline
+  cost nothing — never a fabricated infinity. Every flag carries its
+  own window/baseline numbers and a human message, the window and
+  baseline bounds in the envelope. Informational only — no loop, no
+  state, no delivery (error-rate health is the SLO epic's job; this
+  is the money lens); `finops.enabled: false` serves an honest empty
+  flag list while the invoice keeps serving. Tenant admins see their
+  own tenant only (forced); platform admins may `?tenant_id=` filter
+  or read the whole platform.
+
+  The Billing tab grows a Finops flags panel beside the statement
+  (colored kind badges with the human message in the tooltip, the
+  window/baseline numbers beside the ratio where one exists; the
+  panel hides itself when there are no flags — no flags is the good
+  case — except when detection is off, which gets a visible say-so).
+  8 tests + a UI pin in `tests/test_finops.py` /
+  `tests/test_admin_ui.py`; the suite stands at 1219.
 - Usage invoices (tier 45) — the billing epic's first surface. The
   usage export is chargeback raw material (one row per request);
   `GET /admin/invoices` answers the finance-side question: what did

@@ -317,6 +317,13 @@
       <div class="pb muted" style="font-size:12px" id="inv-period"></div>
       <div class="cards" id="inv-cards"></div>
     </div>
+    <div class="panel" id="finops-panel" style="display:none">
+      <div class="ph">Finops flags
+        <div class="right muted" style="font-weight:400;font-size:12px" id="finops-period"></div>
+      </div>
+      <div class="pb muted" style="font-size:12px">unusual money and traffic vs each key's trailing baseline — informational flags, never pager alerts. Each flag carries its own numbers; the human message rides in the badge tooltip. No flags is the good case: the panel hides itself.</div>
+      <div style="overflow-x:auto"><table id="finops-flags"></table></div>
+    </div>
     <div class="panel">
       <div class="ph">Tenants
         <div class="right muted" style="font-weight:400;font-size:12px">spend vs the tenant's monthly budget</div>
@@ -1862,6 +1869,10 @@ async function loadInvoices() {
   ];
   $("#inv-lines").innerHTML = "<thead><tr><th>Tenant</th><th>Key</th><th>Model</th><th class=num>Requests</th><th class=num>Errors</th><th class=num>Prompt</th><th class=num>Completion</th><th class=num>Cached</th><th class=num>Cost</th></tr></thead><tbody>" +
     (lineRows || `<tr><td colspan="9" class="empty">No line items in ${esc(month)}</td></tr>`) + "</tbody>";
+
+  // The flags ride with the statement (the loadOverview→loadSLOs
+  // pattern): the anomalies are read beside the invoice.
+  await loadAnomalies();
 }
 
 $("#inv-month").addEventListener("change", e => {
@@ -1889,6 +1900,82 @@ $("#btn-invoice-csv").addEventListener("click", async () => {  // the CSV is a f
     toast("Invoice CSV downloaded");
   } catch (e) { toast("Invoice CSV failed: " + (e.message || e), true); }
 });
+
+// ---------- finops (tier 46): cost anomaly flags -------------------------
+// The follow-up question the invoice begs: is any of this *unusual*?
+// The last window_hours of client-consumed traffic against the
+// trailing baseline_days immediately before it, per key and per
+// model — four shapes (a cost spike, a traffic spike, a key gone
+// silent, a model on the bill for the first time), each carrying
+// its own numbers and a human message. Flags are informational,
+// never pager alerts — error-rate health is the SLO panel's job;
+// this is the money lens. No flags is the good case: the panel
+// hides itself (the ov-slos-panel pattern — absence means quiet,
+// not error). The honesty rules render too: a "—" ratio is an
+// honest undefined — a zero-cost baseline with window spend, a
+// silence, a first appearance — never an invented infinity, and a
+// thin baseline produces no flag at all, so what is absent here
+// is absent for a reason.
+
+const FLAG_BADGE = {
+  cost_spike: "b-red",
+  traffic_spike: "b-amber",
+  traffic_stop: "b-gray",
+  first_seen_model: "b-blue",
+};
+
+function flagTenant(flag) {
+  // A model flag is about the line item, not the spender: no
+  // tenant field at all. A key flag on the platform reads
+  // "platform" (null tenant), like the invoice's unassigned bucket.
+  if (!("tenant_id" in flag)) return '<span class="muted">—</span>';
+  return flag.tenant_id == null
+    ? '<span class="muted">platform</span>'
+    : esc(state.tenantNames[flag.tenant_id] || flag.tenant_id);
+}
+
+function flagSubject(flag) {
+  return flag.kind === "first_seen_model"
+    ? `<span class="mono">${esc(flag.model)}</span>`
+    : esc(flag.key_name || "—");
+}
+
+function flagRatioCell(flag) {
+  if (flag.ratio == null)
+    return '<span class="b b-gray" title="the ratio cannot express this one — the message says why">—</span>';
+  return `<span class="b ${FLAG_BADGE[flag.kind] || "b-gray"}" title="window rate over baseline rate, both per day">${flag.ratio}x</span>`;
+}
+
+async function loadAnomalies() {
+  const panel = $("#finops-panel");
+  const box = $("#finops-flags");
+  let r;
+  try {
+    r = await api("/admin/anomalies");
+  } catch (e) {
+    panel.style.display = "none";
+    return;
+  }
+  $("#finops-period").textContent =
+    `last ${Math.round(r.window.hours)}h vs the ${Math.round(r.baseline.days)}d before it · read at ${r.generated_at.slice(11, 19)} UTC`;
+  const flags = r.flags || [];
+  // Hidden when quiet — no flags is the good case. The one honest
+  // exception: detection off deserves a visible say-so, not an
+  // absence the operator could mistake for quiet.
+  const show = flags.length > 0 || !r.config.enabled;
+  panel.style.display = show ? "" : "none";
+  if (!show) return;
+  const rows = flags.map(f => `<tr>
+    <td><span class="b ${FLAG_BADGE[f.kind] || "b-gray"}" title="${esc(f.message)}">${esc(f.kind.replace(/_/g, " "))}</span></td>
+    <td>${flagTenant(f)}</td>
+    <td>${flagSubject(f)}</td>
+    <td>${flagRatioCell(f)}</td>
+    <td class="num">${fmtInt(f.window.requests)} · ${fmtUsd(f.window.cost_usd)}</td>
+    <td class="num">${fmtInt(f.baseline.requests)} · ${fmtUsd(f.baseline.cost_usd)}</td>
+  </tr>`).join("");
+  box.innerHTML = "<thead><tr><th>Flag</th><th>Tenant</th><th>Key / model</th><th>Ratio</th><th class=num>Window</th><th class=num>Baseline</th></tr></thead><tbody>" +
+    (rows || `<tr><td colspan="6" class="empty">Detection is off (finops.enabled: false in config.yaml) — the invoice above keeps serving.</td></tr>`) + "</tbody>";
+}
 
 // ---------- routing ----------------------------------------------------
 

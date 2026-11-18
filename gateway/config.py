@@ -780,6 +780,30 @@ class SLOsConfig(BaseModel):
     alerts: SLOAlertsConfig = Field(default_factory=SLOAlertsConfig)
 
 
+class FinopsConfig(BaseModel):
+    """Cost anomaly flags (tier 46): unusual spending and traffic
+    patterns on the request logs, surfaced as *flags* beside the
+    invoice — never pager alerts (error-rate health is the SLO
+    epic's job; this is the money lens).
+
+    The shape is deliberately simple and honest: a recent **window**
+    (``window_hours``) compared against the trailing **baseline**
+    (``baseline_days`` immediately before it), per key and per model.
+    A spike needs the baseline to have something to say — fewer than
+    ``min_baseline_requests`` baseline rows means *no verdict*, not a
+    scary ratio on thin evidence. ``spike_ratio`` is the multiple of
+    the baseline's daily rate that counts. ``enabled: false`` turns
+    detection off (the endpoint serves an empty flag list and says
+    so) while the invoice keeps serving.
+    """
+
+    enabled: bool = True
+    window_hours: float = Field(default=24.0, gt=0)
+    baseline_days: float = Field(default=14.0, gt=0)
+    spike_ratio: float = Field(default=3.0, gt=0)
+    min_baseline_requests: int = Field(default=10, ge=1)
+
+
 class PIIScanConfig(BaseModel):
     """PII/secret scan over *stored* request/response bodies — the
     audit that answers "did secrets or PII land in the request log?".
@@ -1175,6 +1199,7 @@ class GatewayConfig(BaseModel):
     batch: BatchConfig = Field(default_factory=BatchConfig)
     canary: CanaryConfig = Field(default_factory=CanaryConfig)
     slos: SLOsConfig = Field(default_factory=SLOsConfig)
+    finops: FinopsConfig = Field(default_factory=FinopsConfig)
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)

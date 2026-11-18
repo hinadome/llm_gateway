@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 87 Python files, ~31,980 lines, 1210 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 88 Python files, ~32,380 lines, 1219 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -565,6 +565,37 @@ gateway/
 │                           INVOICE_CSV_COLUMNS order, attachment
 │                           invoice_<month>.csv; the composition
 │                           lives in core/billing.py),
+│                           cost anomaly flags (tier 46, GET
+│                           /admin/anomalies — the invoice's
+│                           follow-up: is any of this unusual? the
+│                           recent window (finops.window_hours,
+│                           default 24h) vs each key's trailing
+│                           baseline (finops.baseline_days, default
+│                           the 14d immediately before it), per
+│                           key and per model over the same
+│                           client-consumed lens; four kinds —
+│                           cost_spike / traffic_spike (window
+│                           daily rate ≥ spike_ratio × the
+│                           baseline's), traffic_stop (real
+│                           baseline traffic gone silent — the
+│                           churn signal a spend dashboard
+│                           structurally cannot show) and
+│                           first_seen_model (a zero-baseline
+│                           model appeared); honesty rules:
+│                           thin baseline (< min_baseline_requests
+│                           rows) = no verdict, brand-new keys
+│                           cannot spike, zero-cost baseline with
+│                           window spend = ratio null (never an
+│                           invented infinity); every flag carries
+│                           window/baseline numbers + a human
+│                           message, the bounds in the envelope;
+│                           informational only (no loop, no state,
+│                           no delivery — errors are SLO
+│                           territory, this is the money lens);
+│                           enabled=false = honest empty list while
+│                           the invoice keeps serving; require_admin
+│                           with the invoice's tenant scoping;
+│                           detection lives in core/finops.py),
 │                           routing/guardrail introspection
 │                           (/admin/routing echoes each model's
 │                           context_window, the cost_aware flag and
@@ -1294,6 +1325,44 @@ gateway/
 │   │                       (/admin/invoices) owns auth + the
 │   │                       tenant-admin forced scoping + the CSV
 │   │                       reshape
+│   ├── finops.py         Cost anomaly flags (tier 46): the invoice's
+│   │                       follow-up — is any of this unusual? The
+│   │                       recent window (finops.window_hours, by
+│   │                       default the last 24h) against the trailing
+│   │                       baseline (finops.baseline_days, default
+│   │                       the 14d immediately before it), per key
+│   │                       and per model, over the same client-
+│   │                       consumed lens billing.py bills — the
+│   │                       _measure_between twin (shadow mirrors and
+│   │                       trial replays excluded, cache hits
+│   │                       included). detect_flags is pure — four
+│   │                       shapes, each a billing surprise in its
+│   │                       own way: cost_spike / traffic_spike
+│   │                       (window daily rate ≥ spike_ratio × the
+│   │                       baseline's), traffic_stop (real baseline
+│   │                       traffic gone silent — the churn signal
+│   │                       a spend dashboard structurally cannot
+│   │                       show) and first_seen_model (a zero-
+│   │                       baseline model appeared: something new
+│   │                       is on the bill). The honesty rule is
+│   │                       the SLO epic's: fewer than
+│   │                       min_baseline_requests baseline rows is
+│   │                       no verdict — and a brand-new key cannot
+│   │                       spike at all; a zero-cost baseline with
+│   │                       window spend fires with ratio null and a
+│   │                       message saying so — never a fabricated
+│   │                       infinity; every flag carries its own
+│   │                       window/baseline numbers, the ratio where
+│   │                       one exists and a human message, sorted
+│   │                       deterministically (cost spikes by ratio,
+│   │                       then traffic, then silences by lost
+│   │                       volume, then new models by name);
+│   │                       anomalies composes the two windows and
+│   │                       their bounds; the endpoint
+│   │                       (/admin/anomalies) owns auth + the
+│   │                       invoice's tenant scoping, and
+│   │                       enabled=false serves an honest empty
+│   │                       list while the invoice keeps serving
 │   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
 │   │                       that answers "did secrets land in the request
 │   │                       log?"): detectors mirror the pii_redaction
@@ -1861,7 +1930,25 @@ gateway/
                             — and a future month surfaces as the
                             endpoint's 400, never a fake empty
                             statement; tenant admins see their own
-                            tenant by construction), routing table with
+                            tenant by construction), the finops
+                            flags panel (tier 46: the invoice's
+                            follow-up — is any of this unusual?
+                            reads GET /admin/anomalies right after
+                            the statement; the four kinds with
+                            colored badges — cost_spike red,
+                            traffic_spike amber, traffic_stop gray,
+                            first_seen_model blue — the human
+                            message in the kind badge's tooltip,
+                            the window/baseline numbers beside
+                            the ratio ("—" is an honest undefined
+                            — a zero-cost baseline, a silence, a
+                            first appearance — never an invented
+                            infinity); the panel hides itself when
+                            there are no flags (no flags is the
+                            good case) except when detection is
+                            off, which gets a visible say-so
+                            instead of a mistakable absence),
+                            routing table with
                             live breaker state + reset — plus, tier 35, the
                             shadow-diff evidence table under it (per shadow
                             deployment: verdict breakdown, match rate, mean
@@ -3276,6 +3363,38 @@ tests/
 │                        the mock's 10/7 token usage, under the
 │                        public model name). A fourth UI-surface
 │                        pin covers the Billing tab
+│                        (tests/test_admin_ui.py)
+├── test_finops.py      Cost anomaly flags (tier 46): pure units —
+│                        detect_flags' four shapes in one pass (a
+│                        cost spike with its ratio, a traffic spike,
+│                        a silence, a first-seen model — ordered
+│                        deterministically, every flag carrying its
+│                        own numbers), the thin-baseline gate (no
+│                        spike and no silence under
+│                        min_baseline_requests — a 100x explosion on
+│                        four baseline rows is an anecdote, not an
+│                        anomaly; a brand-new key cannot spike at
+│                        all), the zero-cost baseline (ratio null +
+│                        the message saying so, never an invented
+│                        infinity, sorted first) and quiet-is-quiet
+│                        (a key at its baseline pace produces no
+│                        flags); e2e — the seeded story (a spiking
+│                        key fires cost AND traffic flags with the
+│                        numbers, a silent key its stop, a steady
+│                        key nothing — normal is not a flag — and a
+│                        brand-new model its first_seen, with the
+│                        window/baseline bounds in the envelope),
+│                        scoping (tenant admin forced to their own
+│                        tenant even when asking for another's,
+│                        plain key 403, platform ?tenant_id= filter
+│                        and whole-platform read), the lens (a
+│                        shadow storm + a trial replay count toward
+│                        neither window nor baseline — the key keeps
+│                        its baseline pace and no flag fires) and
+│                        the enabled=false kill switch (an honest
+│                        empty list with the bounds still served,
+│                        the invoice untouched). A fifth UI-surface
+│                        pin covers the flags panel
 │                        (tests/test_admin_ui.py)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app

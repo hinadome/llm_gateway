@@ -311,6 +311,33 @@ async def test_admin_ui_billing_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_finops_surface(env):
+    # Tier 46: the Billing tab's finops flags panel — the follow-up
+    # question the invoice begs (GET /admin/anomalies): the four flag
+    # kinds with colored badges (the human message in the badge
+    # tooltip), window/baseline numbers and the ratio column ("—" is
+    # an honest undefined, never an invented infinity). The panel
+    # hides itself when there are no flags — no flags is the good
+    # case — except when detection is off, which gets a visible
+    # say-so instead of an absence the operator could mistake for
+    # quiet. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="finops-panel"',
+        'id="finops-flags"',
+        "loadAnomalies",
+        "/admin/anomalies",
+        "FLAG_BADGE",
+        "cost_spike",
+        "traffic_spike",
+        "traffic_stop",
+        "first_seen_model",
+        "No flags is the good case",
+        "finops.enabled: false",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307
