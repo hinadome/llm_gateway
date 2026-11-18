@@ -79,6 +79,12 @@ CANARY_PROBES = Counter(
     ["deployment", "provider", "outcome"],
 )
 
+PII_FINDINGS = Counter(
+    "gateway_pii_scan_findings_total",
+    "Scanned request-log rows whose stored bodies matched a detector kind.",
+    ["kind"],
+)
+
 TTFT = Histogram(
     "gateway_stream_ttft_seconds",
     "Time from request start to the first streamed chunk delivered to the client.",

@@ -8,6 +8,36 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- PII/secret scan over stored bodies: an on-demand audit that
+  answers "did secrets or PII land in the request log?" Clients
+  paste API keys into prompts; guardrails may be off, in observe
+  mode, or only masking the upstream copy — the log keeps the
+  original as received (ctx.request_body is captured before the
+  guardrail phase), so stored rows are where exposure actually
+  shows. Redaction protects the provider; this reports what the
+  retention policy is holding. Endpoints (pure reads, nothing
+  persisted): GET /admin/pii-scan — bulk over recent rows (limit /
+  key_name / model / status / tenant_id filters, bounded by
+  pii_scan.max_rows), returning per-row findings for flagged rows
+  plus by_kind aggregates — and GET /admin/logs/{id}/pii-scan for
+  one row. Detectors mirror the pii_redaction guardrail (the same
+  compiled patterns, imported from it — "masked" and "found" can
+  never drift) plus jwt / private-key-block secret shapes and
+  Luhn-validated cards; custom detectors via
+  pii_scan.extra_patterns (name -> regex, validated at load),
+  built-ins droppable via exclude_kinds. Findings are kind + count
+  only — never the matched text, so the audit never becomes its own
+  leak. clean and bodies-not-captured are separate facts
+  (store_bodies=false rows report captured=false, never "safe").
+  Tenant scoping identical to /admin/logs (bulk forced for tenant
+  admins; foreign single rows 404). Flagged rows count on
+  gateway_pii_scan_findings_total{kind} (rows containing the kind,
+  not raw occurrences) and emit pii.found events. Scanner rebuilt in
+  create_app and on config swap. Config: pii_scan section (enabled,
+  max_rows, extra_patterns, exclude_kinds). Caveats: stored bodies
+  are truncated at logging.max_body_chars — a secret past the
+  boundary is invisible to the scan. 10 new tests
+  (tests/test_pii_scan.py).
 - Synthetic canary probes: a background loop sends a tiny chat request
   straight to every configured deployment's provider on a schedule
   (`canary:` config — enabled / interval_seconds / timeout_seconds /

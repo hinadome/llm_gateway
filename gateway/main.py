@@ -47,6 +47,7 @@ from .core.auth import AuthChain
 from .core.audit import AuditLogger
 from .core.batch_worker import BatchWorker
 from .core.canary import CanaryProber
+from .core.pii_scan import PIIScanner
 from .core.cache import ResponseCache
 from .core.events import EventBus
 from .core.cost import CostCalculator
@@ -102,6 +103,9 @@ async def reload_gateway(app: FastAPI, source: str = "admin") -> dict:
     config = GatewayConfig.load(config_path)
     summary = app.state.pipeline.apply_config(config)
     app.state.config = config
+    # Config-derived helpers rebuilt on the successful swap only (a
+    # failed reload leaves the old scanner live with the old config).
+    app.state.pii_scanner = PIIScanner(config.pii_scan)
     summary["source"] = source
     summary["config_path"] = settings.config_path
     return summary
@@ -311,6 +315,9 @@ def create_app(
     # POST /admin/canaries/probe drive waves directly; the lifespan
     # loop below is the only *scheduled* driver).
     canary_prober = CanaryProber(router, config.canary, events=events_bus)
+    # PII/secret scanner: pure computation over stored log bodies —
+    # rebuilt on config swap (detectors depend on pii_scan settings).
+    pii_scanner = PIIScanner(config.pii_scan)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -472,6 +479,8 @@ def create_app(
     # Canary prober (probe_once() driven by the lifespan loop, the
     # probe-now endpoint, or tests directly).
     app.state.canary = canary_prober
+    # PII/secret scanner (admin-plane GETs; rebuilt on config swap).
+    app.state.pii_scanner = pii_scanner
     # Prompt library (admin-plane CRUD routes live in api/admin.py).
     app.state.prompt_library = pipeline.prompt_library
     app.state.config = config

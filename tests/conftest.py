@@ -30,6 +30,7 @@ from gateway.config import (
     LoggingConfig,
     MetricsConfig,
     ModelConfig,
+    PIIScanConfig,
     PromptsConfig,
     ProviderConfig,
     RoutingConfig,
@@ -100,6 +101,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     prompts = cache_overrides.pop("prompts", None) or PromptsConfig()
     batch = cache_overrides.pop("batch", None) or BatchConfig()
     canary = cache_overrides.pop("canary", None) or CanaryConfig()
+    pii_scan = cache_overrides.pop("pii_scan", None) or PIIScanConfig()
     events = cache_overrides.pop("events", None) or EventsConfig()
     guardrails = cache_overrides.pop("guardrails", None) or [
         GuardrailConfig(
@@ -157,6 +159,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         pricing=pricing,
         batch=batch,
         canary=canary,
+        pii_scan=pii_scan,
         events=events,
     )
     if redis_backends:

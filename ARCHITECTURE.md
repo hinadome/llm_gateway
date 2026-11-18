@@ -253,6 +253,12 @@ gateway/
 │                           POST /admin/canaries/probe to run a wave on
 │                           demand; platform-admin-only, like /admin/routing
 │                           — deployment health is platform configuration),
+│                           pii-scan (GET /admin/pii-scan bulk over recent
+│                           rows — per-row findings + by_kind aggregates,
+│                           bodies_not_captured counted separately from
+│                           clean, tenant scoping like /admin/logs; GET
+│                           /admin/logs/{id}/pii-scan for one row; kind +
+│                           count only, never matched text),
 │                           stats
 │                           (by_tenant breakdown for platform admins),
 │                           usage export (CSV/JSON billing
@@ -497,6 +503,28 @@ gateway/
 │   │                       interval_seconds and re-reads
 │   │                       app.state.config.canary each iteration;
 │   │                       under pytest tests drive probe_once() directly
+│   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
+│   │                       that answers "did secrets land in the request
+│   │                       log?"): detectors mirror the pii_redaction
+│   │                       guardrail — the same compiled patterns,
+│   │                       imported from it, so "masked" and "found"
+│   │                       never drift — plus jwt/private-key shapes and
+│   │                       configured extras (pii_scan.extra_patterns;
+│   │                       built-ins droppable via exclude_kinds). The
+│   │                       log keeps the ORIGINAL body as received
+│   │                       (ctx.request_body captured before the
+│   │                       guardrail phase), so this sees what storage
+│   │                       holds, not what the provider saw. Pure
+│   │                       computation over rows (GET endpoints in
+│   │                       admin.py, no writes): findings are kind +
+│   │                       count only — never the matched text (the
+│   │                       audit must not become its own leak) — and
+│   │                       clean vs bodies-not-captured are separate
+│   │                       facts (store_bodies=false rows report
+│   │                       captured=false, never "safe"). Scanner
+│   │                       rebuilt in create_app and on config swap
+│   │                       (reload_gateway); metrics/events fire from
+│   │                       the endpoint layer
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -1011,7 +1039,7 @@ Every stage boundary below is also an event emission (the full catalog with payl
 - **`request.routed`** — after deployment selection, on both the stream and non-stream paths (observer-only: the router's retry machinery has the provider call in flight — an in-band veto there would be unsafe, so routing is notification, not a checkpoint).
 - **`response.completed`** — the final non-streaming response, post-guardrails, pre-client, with usage and cost (and `surface` for the non-chat modalities). *Interceptable* — the last in-band veto point; an interceptor raising here fails the request instead of returning the body.
 - **`stream.started` / `stream.completed`** — first chunk / end of the streamed body, emitted from the stream wrapper's iteration and `finally` (any outcome; `ctx.status` says which). Coarse by design; never per-chunk.
-- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure).
+- **Around the pipeline:** `auth.rejected` at the edge (`api/deps.py`); `key.*` / `tenant.*` / `breaker.reset` at the audit choke point (same names and payload as the audit webhook — a webhook subscriber and an event handler see the same record); `budget.threshold` from the alert manager (per crossed level); `batch.*` from the batch API (created/cancelled) and worker (completed/failed/deferred/expired); `feedback.recorded` from the feedback API (client rated a request); `canary.failed` / `canary.recovered` from the canary prober (probe failed; deployment returned to ok after a failure); `pii.found` from the PII scan endpoints (a scanned log row's stored bodies matched detectors).
 
 Emits enqueue observers *before* an interceptor's abort propagates — subscribers always see the event that was vetoed.
 
@@ -1635,7 +1663,7 @@ A full **self-hosted stack** (collector with tail-based sampling, Jaeger, Loki, 
 
 ### 10.1 Metrics — Prometheus first, OTLP optional
 
-`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
+`gateway_requests_total{provider,model,status}` · `gateway_request_latency_seconds{provider}` · `gateway_stream_ttft_seconds{model}` (time-to-first-chunk, observed per streamed response including cache replays) · `gateway_requests_inflight` (gauge; streams count until the body completes) · `gateway_tokens_total{type}` · `gateway_cost_usd_total{model}` · `gateway_guardrail_blocks_total{guardrail,phase}` (enforced blocks only) · `gateway_guardrail_observed_total{guardrail,phase,action}` (would-be verdicts in observe mode) · `gateway_cache_hits_total{result}` (hit / semantic / miss) · `gateway_batch_lines_total{status}` (batch input lines executed by the worker: completed / failed / deferred — deferral = rate limit or budget backoff, never a failed line) · `gateway_events_total{handler,event,outcome}` (lifecycle-event deliveries to configured handlers: delivered / dropped [queue full] / error [handler crashed, contained] / aborted [interceptor vetoed] — inert with no handlers) · `gateway_feedback_total{rating}` (client-reported quality ratings, 1..5 — the input to /admin/feedback/stats) · `gateway_canary_probes_total{deployment,provider,outcome}` (synthetic deployment health probes: ok / timeout / error) · `gateway_pii_scan_findings_total{kind}` (scanned request-log rows whose stored bodies matched a PII/secret detector kind) · `gateway_circuit_state{deployment,provider}` (gauge: 0=closed, 1=half_open, 2=open; re-synced on every scrape because OPEN→HALF_OPEN happens on the clock, without an event) · `gateway_circuit_transitions_total{deployment,provider,state}` · `gateway_alerts_total{kind,outcome}` (budget-threshold webhooks: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_auth_total{authenticator,result}` (per auth-chain step: authenticated / rejected) · `gateway_audit_events_total{event,outcome}` (admin-action audit records: `sent` / `failed` / `skipped` when no URL is configured) · `gateway_logs_pruned_total` (request log rows deleted by the retention task) · `gateway_logs_dropped_total` (rows dropped because the `logging.background_write` queue was full) · `gateway_shadow_requests_total{deployment,outcome}` (requests mirrored to shadow deployments — success/error, never affects the client) · `gateway_shadow_latency_seconds{deployment}` (latency of mirrored shadow calls) · `gateway_prompt_mirror_requests_total{prompt,outcome}` (requests mirrored to a library prompt's A/B candidate version — never client-facing) · `gateway_prompt_mirror_latency_seconds{prompt}` (latency of mirrored prompt A/B calls) · per-key family, opt-in via `metrics.per_key` and emitted right beside the global request/token/cost counters: `gateway_key_requests_total{key,status}` · `gateway_key_tokens_total{key,type}` · `gateway_key_cost_usd_total{key}` (shadow mirrors excluded) · `gateway_key_label_overflow_total` (keys collapsed into `__overflow__` past `metrics.per_key_max_series` distinct labels).
 
 Scraping `/metrics` is the primary, full-fidelity path (exact histograms). When tracing is enabled *and* an OTLP metrics endpoint is configured, `metrics_bridge.py` additionally mirrors every `gateway.*` series into OTLP with the same names and labels — counters become observable counters, gauges observable gauges, and histograms become `_count`/`_sum`/`_bucket{le}` gauges (this SDK has no observable histogram instrument). The bridge reads the live `prometheus_client` registry from callbacks on each collection interval, so recording code is untouched; it only starts when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` (or the generic endpoint) is set.
 

@@ -10,6 +10,7 @@ Two layers:
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -493,6 +494,42 @@ class CanaryConfig(BaseModel):
     deployments: list[str] | None = None  # fnmatch patterns; None = all
 
 
+class PIIScanConfig(BaseModel):
+    """PII/secret scan over *stored* request/response bodies — the
+    audit that answers "did secrets or PII land in the request log?".
+    Clients paste API keys into prompts; guardrails may be off, in
+    observe mode, or only masking the *upstream* copy — the log keeps
+    the original as received, so this is where exposure actually
+    shows. On-demand (no loop): ``GET /admin/pii-scan`` over recent
+    rows, ``GET /admin/logs/{id}/pii-scan`` for one.
+
+    Detectors mirror the ``pii_redaction`` guardrail (the same
+    compiled patterns — "masked" and "found" never drift) plus
+    secret shapes a redactor wouldn't mask (JWTs, private-key
+    blocks). ``extra_patterns`` adds name → regex detectors;
+    ``exclude_kinds`` disables built-ins (e.g. leave noisy ``ipv4``
+    out). Findings never include the matched text — only kind +
+    count — so the audit never becomes its own leak.
+    """
+
+    enabled: bool = True
+    max_rows: int = 500  # bulk scan bound
+    extra_patterns: dict[str, str] = Field(default_factory=dict)  # name -> regex
+    exclude_kinds: list[str] = Field(default_factory=list)  # built-ins to drop
+
+    @field_validator("extra_patterns")
+    @classmethod
+    def _patterns_compile(cls, value: dict[str, str]) -> dict[str, str]:
+        for name, pattern in value.items():
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"pii_scan.extra_patterns[{name!r}]: invalid regex: {exc}"
+                ) from exc
+        return value
+
+
 class RedisConfig(BaseModel):
     """Connection for the Redis-backed cache / rate limiter.
 
@@ -581,6 +618,7 @@ class GatewayConfig(BaseModel):
     uploads: UploadsConfig = Field(default_factory=UploadsConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
     canary: CanaryConfig = Field(default_factory=CanaryConfig)
+    pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
 

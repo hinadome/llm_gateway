@@ -65,6 +65,9 @@ Event                            Fired / payload
 ``canary.failed`` / ``canary.recovered``  deployment health-probe result
                                  and transition [deployment, provider,
                                  model, outcome, error | latency_ms]
+``pii.found``                   stored bodies of a scanned log row
+                                 matched PII/secret detectors [log_id,
+                                 request_id, key_name, model, kinds]
 ``batch.created`` / ``batch.cancelled`` / ``batch.completed`` /
 ``batch.failed`` / ``batch.expired`` / ``batch.deferred``
                                  batch lifecycle [batch_id, ...]

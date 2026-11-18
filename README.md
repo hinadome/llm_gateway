@@ -44,6 +44,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Lifecycle events** | Subscribe your own handlers to the request-stage boundaries (`request.received` / `routed` / `cache_hit` / `rejected` / `failed`, `response.completed`, `stream.started` / `completed`, `auth.rejected`, `key.*`, `budget.threshold`, `batch.*`) — **observers** are fire-and-forget on a background queue (a slow or crashing handler can never affect a request), **interceptors** run in-band with veto power at the two pre-irreversible events; with no handlers the bus is inert (see [Lifecycle events](#lifecycle-events)) |
 | **Feedback capture** | `POST /v1/feedback` lets clients rate any logged request (by `X-Request-Id`, rating 1–5) — the missing half of the quality story: shadow mirroring and prompt A/B compare *outputs*, feedback says which one was good. Admin list + per-model/per-key quality aggregates; counted on `gateway_feedback_total`; `feedback.recorded` event (see [Feedback](#feedback)) |
 | **Synthetic canary probes** | A background loop sends a tiny chat request straight to every configured deployment's provider on a schedule (`canary:` config, disabled by default) — upstream health is *measured*, not inferred from traffic. Direct adapter calls: no pipeline, no log rows, no spend, no breaker accounting. `GET /admin/canaries` fleet view, `POST /admin/canaries/probe` for on-demand waves; `canary.failed` / `canary.recovered` events; `gateway_canary_probes_total{deployment,provider,outcome}` (see [Canary probes](#canary-probes)) |
+| **PII/secret scan** | On-demand audit over *stored* request bodies (`GET /admin/pii-scan` bulk, `GET /admin/logs/{id}/pii-scan` per row): the log keeps the original as received, so this is where exposure actually shows — clients paste API keys into prompts; guardrails may be off or only masking the upstream copy. Detectors mirror the `pii_redaction` guardrail plus jwt/private-key shapes, extendable via `pii_scan.extra_patterns`; findings are kind + count only, never the matched text (see [PII scan](#pii-scan)) |
 | **Caching** | Exact-match response cache with TTL; cache hits replay for streaming requests too; optional **semantic cache** serves near-duplicate prompts by embedding similarity (configurable model + threshold) |
 | **Provider translation** | OpenAI passthrough (any OpenAI-compatible base: vLLM, Ollama, Groq, ...), Azure OpenAI (deployment-addressed, `api-key` header, `api-version`), Anthropic & Gemini full request/response/stream translation incl. tools |
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model |
@@ -213,6 +214,8 @@ Things to know when pointing a framework at the gateway:
 | `GET /admin/feedback/stats` | Quality aggregates from client feedback: overall + by-model + by-key buckets (`count`, `avg_rating`, `pct_negative` [1–2], `pct_positive` [4–5]); `model`/`key_name`/`tenant_id` filters |
 | `GET /admin/canaries` | Last synthetic-probe result per deployment (`outcome` ok/timeout/error, latency, last checked; `unknown` before the first wave) + the canary config echo — platform admin only (deployment health is platform configuration) |
 | `POST /admin/canaries/probe` | Run one probe wave now, regardless of `canary.enabled` — "probe now" for ops; returns fresh per-deployment results |
+| `GET /admin/pii-scan` | Scan recent request-log bodies for PII/secrets (bulk, `limit`/`key_name`/`model`/`status`/`tenant_id` filters, bounded by `pii_scan.max_rows`): per-row findings for flagged rows + `by_kind` aggregates; `bodies_not_captured` counted separately from clean; pure read, nothing persisted |
+| `GET /admin/logs/{id}/pii-scan` | PII/secret findings for one log row (kind + count only — the matched text is never returned) |
 | `GET /admin/logs/{id}` | One log row in full, including the stored request/response bodies (cross-tenant ids 404 for tenant admins) |
 | `GET /admin/stats` | Requests, error rate, tokens, cost, latency + TTFT percentiles (client traffic only — shadow mirrors are excluded); tenant admins see their own tenant's traffic, platform admins additionally get a `by_tenant` breakdown |
 | `GET /admin/usage/export` | Billing / chargeback export: `format=csv\|json`, `since`/`until` (ISO-8601, default last 30 days), `key_name`/`model`/`status`/`tenant_id` filters, `include_shadow`; JSON adds totals + per-key/model/status aggregates (+ per-tenant for platform admins); tenant admins export their own tenant only |
@@ -350,6 +353,7 @@ Event catalog:
 | `feedback.recorded` | client rated a request | `request_id`, `model`, `rating`, `key_name` |
 | `canary.failed` | a synthetic probe failed (per failed probe — count or dedupe on your side) | `deployment`, `provider`, `model`, `outcome` (`error`/`timeout`), `error` |
 | `canary.recovered` | a deployment's probe returned to ok after a failure | `deployment`, `provider`, `model`, `latency_ms` |
+| `pii.found` | a scanned log row's stored bodies matched PII/secret detectors | `log_id`, `request_id`, `key_name`, `model`, `kinds` |
 | `batch.created` / `cancelled` / `completed` / `failed` / `deferred` / `expired` | batch lifecycle | `batch_id`, `key_id`, line counts, output/error file ids |
 
 Per-chunk stream events are deliberately absent — the hot path only ever carries the two coarse stream events. Deliveries count on `gateway_events_total{handler,event,outcome}` (delivered / dropped / error / aborted). The `events:` config is hot-reloadable (handlers swap live; `queue_size` applies at restart). 20 tests pin the contract (`tests/test_events.py`).
@@ -395,6 +399,30 @@ canary:
 - **Admin**: `GET /admin/canaries` (fleet view: outcome, latency, last check, plus config echo) and `POST /admin/canaries/probe` (run a wave now, regardless of `enabled`). Both platform-admin-only — deployment health is platform configuration, like `/admin/routing`. Hot-reloadable: `enabled` / interval / timeout / allowlist apply from the next loop iteration (the loop always runs, idling at a 30s re-check when disabled, so enabling takes effect immediately).
 
 8 tests pin the contract (`tests/test_canary.py`).
+
+## PII scan
+
+An audit that answers "did secrets or PII land in the request log?" Clients paste API keys into prompts; guardrails may be off, in observe mode, or only masking the *upstream* copy — the log keeps the **original as received** (`ctx.request_body` is captured before the guardrail phase), so stored rows are where exposure actually shows. Redaction protects the provider; this tells you what your retention policy is holding.
+
+```bash
+# Bulk: scan the last 100 rows (bounded by pii_scan.max_rows)
+curl -H "Authorization: Bearer sk-gw-admin-..." \
+  "http://localhost:8000/admin/pii-scan?limit=100"
+# → { "scanned": 100, "with_findings": 2, "bodies_not_captured": 0,
+#     "by_kind": {"api_key": 1, "jwt": 1}, "rows": [...], "kinds": [...] }
+
+# One row (kind + count only — never the matched text)
+curl -H "Authorization: Bearer sk-gw-admin-..." \
+  "http://localhost:8000/admin/logs/42/pii-scan"
+```
+
+- **Detectors mirror the `pii_redaction` guardrail** — the same compiled patterns, imported from it, so "masked" and "found" can never drift — plus secret shapes a redactor wouldn't mask (JWTs, private-key blocks), all Luhn-validated credit cards. Custom detectors: `pii_scan.extra_patterns` (name → regex); drop noisy built-ins with `exclude_kinds` (e.g. `ipv4`).
+- **Findings are kind + count only** — never the matched text. The audit must not become its own leak: a report that quotes the API key it found is a report full of API keys.
+- **Clean ≠ not captured**: rows written with `logging.store_bodies: false` report `captured: false` and count under `bodies_not_captured` — the report never claims "safe" for rows it could not see.
+- **Pure read**: scans are idempotent GETs, nothing persisted. Flagged rows count on `gateway_pii_scan_findings_total{kind}` (rows containing the kind, not raw occurrences) and emit `pii.found` events; tenant admins are scoped to their own tenant exactly like `/admin/logs`.
+- **Caveats**: stored bodies are truncated at `logging.max_body_chars` — a secret past the boundary is invisible; and `store_bodies: false` is the only mode where nothing can leak into storage in the first place (this audit is for the mode where bodies are kept).
+
+10 tests pin the contract (`tests/test_pii_scan.py`).
 
 ## Architecture
 

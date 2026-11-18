@@ -19,6 +19,7 @@ from ..core.prompt_library import PromptLibrary
 from ..db import get_sessionmaker
 from ..errors import GatewayError
 from ..models import Feedback, RequestLog, Tenant, VirtualKey
+from ..observability.metrics import PII_FINDINGS
 from ..schemas import (
     KeyCreateRequest,
     KeyUpdateRequest,
@@ -871,6 +872,125 @@ async def canary_probe_now(
         "healthy": sum(1 for r in results if r["healthy"]),
         "data": results,
     }
+
+
+# ----------------------------------------------------------------------
+# PII / secret scan
+# ----------------------------------------------------------------------
+
+
+async def _scan_and_record(raw_request: Request, rows: "list[RequestLog]") -> list[dict]:
+    """Scan rows once with the current scanner; count + emit per
+    flagged row. Returns every row's result (clean rows included —
+    the bulk view reports them too).
+
+    Metrics count *rows* containing a kind (not raw occurrences —
+    one pasted key in a row is one exposure); ``pii.found`` events
+    carry the same per-row kinds so a subscriber can alert/ticket."""
+    scanner = raw_request.app.state.pii_scanner
+    events = getattr(raw_request.app.state, "events", None)
+    results = []
+    for row in rows:
+        result = scanner.scan_log(row)
+        results.append(result)
+        if result["clean"]:
+            continue
+        request_findings = result["findings"]["request"]
+        response_findings = result["findings"]["response"]
+        for kind in set(request_findings) | set(response_findings):
+            PII_FINDINGS.labels(kind=kind).inc()
+        if events is not None:
+            events.emit_background(
+                "pii.found",
+                None,
+                log_id=result["log_id"],
+                request_id=result["request_id"],
+                key_name=result["key_name"],
+                model=result["model"],
+                kinds={
+                    kind: request_findings.get(kind, 0) + response_findings.get(kind, 0)
+                    for kind in sorted(set(request_findings) | set(response_findings))
+                },
+            )
+    return results
+
+
+@router.get("/admin/pii-scan")
+async def pii_scan_bulk(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    limit: int = Query(100, ge=1, le=5000),
+    key_name: str | None = None,
+    model: str | None = None,
+    status: str | None = None,
+    tenant_id: str | None = None,
+) -> dict:
+    """Scan recent request-log bodies for PII/secrets, on demand (a
+    pure read — idempotent, nothing persisted). Returns per-row
+    findings for the rows that have any, plus aggregates. Tenant
+    admins are scoped to their own tenant (forced, like /admin/logs).
+    Rows whose bodies were never stored report ``captured: false`` —
+    counted separately from clean rows, never blurred."""
+    config = raw_request.app.state.config.pii_scan
+    if not config.enabled:
+        raise GatewayError(404, "PII scan is disabled (pii_scan.enabled).",
+                            "invalid_request_error")
+    limit = min(limit, config.max_rows)
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        stmt = select(RequestLog).order_by(RequestLog.id.desc())
+        effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+        if effective_tenant:
+            stmt = stmt.where(RequestLog.tenant_id == effective_tenant)
+        if key_name:
+            stmt = stmt.where(RequestLog.key_name == key_name)
+        if model:
+            stmt = stmt.where(RequestLog.model == model)
+        if status:
+            stmt = stmt.where(RequestLog.status == status)
+        rows = (await session.execute(stmt.limit(limit))).scalars().all()
+
+    results = await _scan_and_record(raw_request, rows)
+    flagged = [r for r in results if not r["clean"]]
+    by_kind: dict[str, int] = {}
+    for result in flagged:
+        for direction in ("request", "response"):
+            for kind, count in result["findings"][direction].items():
+                by_kind[kind] = by_kind.get(kind, 0) + count
+    return {
+        "object": "pii_scan",
+        "scanned": len(results),
+        "with_findings": len(flagged),
+        "bodies_not_captured": sum(1 for r in results if not r["captured"]),
+        "kinds": sorted(raw_request.app.state.pii_scanner.detectors),
+        "by_kind": dict(sorted(by_kind.items())),
+        "rows": flagged,
+    }
+
+
+@router.get("/admin/logs/{log_id}/pii-scan")
+async def pii_scan_one(
+    log_id: int,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+) -> dict:
+    """PII/secret findings for one request-log row (kind + count
+    only — the matched text is never returned). Same access rule as
+    GET /admin/logs/{id}: tenant admins may scan their own tenant's
+    rows only."""
+    config = raw_request.app.state.config.pii_scan
+    if not config.enabled:
+        raise GatewayError(404, "PII scan is disabled (pii_scan.enabled).",
+                            "invalid_request_error")
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        log = await session.get(RequestLog, log_id)
+        if log is None:
+            raise GatewayError(404, f"Log entry {log_id} not found.",
+                               "invalid_request_error")
+        _require_log_access(admin, log)
+    result = (await _scan_and_record(raw_request, [log]))[0]
+    return {"object": "pii_scan_result", **result}
 
 
 # ----------------------------------------------------------------------
