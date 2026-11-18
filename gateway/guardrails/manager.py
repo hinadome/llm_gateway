@@ -115,14 +115,15 @@ class GuardrailManager:
         re-running response-phase guardrails, so two callers may share
         an entry only when the policy that shapes responses is the same.
         Applicability here covers everything that can differ: key-level
-        ``disabled_guardrails``, and key/model/route scoping (a
-        redactor scoped to other keys never applied to the stored
-        body). Observe-mode guardrails never modify anything, so they
-        are excluded. The tenant rides along for data isolation — two
-        tenants never read each other's cached responses, even under
-        identical policies. The key id is deliberately NOT part of it:
-        two keys with the same response policy sharing entries is the
-        point of the cache.
+        ``disabled_guardrails``, and key/tenant/model/route scoping (a
+        redactor scoped to other keys — or to another tenant — never
+        applied to the stored body; a tenant-scoped guardrail cannot
+        shape a platform key's entry). Observe-mode guardrails never
+        modify anything, so they are excluded. The tenant rides along
+        for data isolation — two tenants never read each other's cached
+        responses, even under identical policies. The key id is
+        deliberately NOT part of it: two keys with the same response
+        policy sharing entries is the point of the cache.
         """
         parts: list[list[Any]] = []
         for g in self._active(ctx):
@@ -161,11 +162,14 @@ class GuardrailManager:
         Patterns are fnmatch globs. ``exclude_*`` wins over ``keys`` /
         ``models`` / ``routes``; a request must match every present field.
         Key names are the human labels from /admin/keys (the admin key is
-        "admin"); models are public names; routes are the inbound API
-        surface ("chat" = /v1/chat/completions, "responses" = /v1/responses,
-        "messages" = the native Anthropic format, "gemini" = the native
-        Gemini format). Guardrails registered programmatically
-        (no scope set) apply everywhere, unchanged.
+        "admin"); tenant patterns match the tenant's name from
+        /admin/tenants (a platform key — no tenant — is in no tenant:
+        it matches no ``tenants`` pattern and is never excluded by
+        ``exclude_tenants``); models are public names; routes are the
+        inbound API surface ("chat" = /v1/chat/completions, "responses"
+        = /v1/responses, "messages" = the native Anthropic format,
+        "gemini" = the native Gemini format). Guardrails registered
+        programmatically (no scope set) apply everywhere, unchanged.
         """
         scope = getattr(guardrail, "scope", None)
         if scope is None:
@@ -176,6 +180,23 @@ class GuardrailManager:
         ):
             return False
         if scope.keys and not any(fnmatch.fnmatch(key_name, p) for p in scope.keys):
+            return False
+        # Tenant scoping: patterns match the tenant's *name* (the human
+        # label from /admin/tenants) — one field binds the whole tenant,
+        # every member key, instead of key-name globs or per-key
+        # disabled_guardrails. A request with no tenant (a platform
+        # key) is in no tenant: it matches no tenants include (even
+        # "*") and exclude_tenants never excludes it — the same shape
+        # as route scoping over a route-less call.
+        tenant_name = ctx.auth.tenant_name
+        if scope.exclude_tenants and tenant_name is not None and any(
+            fnmatch.fnmatch(tenant_name, p) for p in scope.exclude_tenants
+        ):
+            return False
+        if scope.tenants and (
+            tenant_name is None
+            or not any(fnmatch.fnmatch(tenant_name, p) for p in scope.tenants)
+        ):
             return False
         model = ctx.model or ""
         if scope.exclude_models and any(

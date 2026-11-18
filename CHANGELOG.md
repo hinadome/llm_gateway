@@ -8,6 +8,27 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Tenant guardrail scoping (tier 58) — `guardrails[].scope.tenants` /
+  `exclude_tenants`: fnmatch globs over the caller's tenant *name*
+  (§8.2 item 9, the last first-class gap in the tenant story). One
+  field binds a **whole tenant** — every member key, tenant admins
+  included (the tenant is a policy ceiling, and its admins are subject
+  to it like every member) — where before an operator had to reach the
+  same effect with key-name globs that break the moment a key is
+  renamed or added, or per-key `disabled_guardrails` rows that must be
+  maintained key by key. Composes with every existing scope axis (a
+  request must match all present fields; `exclude_*` wins over the
+  include list). A key with **no tenant** (a platform key) is in *no*
+  tenant: it matches no `tenants` pattern — even `*` — and is never
+  excused by `exclude_tenants`, so tenant scoping can only narrow who
+  a guardrail touches, never silently widen it onto the platform. The
+  dashboard's guardrail inventory renders the new fields automatically
+  (it prints the scope JSON). 14 new tests — a 12-row matrix extension
+  in `tests/test_guardrail_scoping.py` (include/exclude, the
+  no-tenant cases, AND across keys+tenants) plus two e2e: `tenants`
+  binding member *and* tenant-admin keys of the named tenant while
+  another tenant and a platform key pass untouched, and
+  `exclude_tenants` excusing only the named tenant; suite 1370.
 - PII dashboard panel (tier 57) — the tier-53 teeth get their
   dashboard surface. The scan had endpoints and a background sweep
   but no admin.html presence: an operator auditing what storage

@@ -239,6 +239,20 @@ guardrails:
       mask_in_stream: false
       stream_reserve_chars: 100
 
+  # Scope: bind a guardrail to certain callers/models/routes — fnmatch
+  # globs, all fields optional, a request must match every present one,
+  # exclude_* wins. tenants matches the caller's /admin/tenants name and
+  # binds the WHOLE tenant (every member key, tenant admins included —
+  # the tenant is a policy ceiling); a key with no tenant matches no
+  # tenants pattern and is never excluded by exclude_tenants. keys match
+  # key names (the admin key is "admin"), models public model names
+  # (on the MCP route: the server name), routes the inbound surface
+  # (chat, responses, messages, gemini, realtime, mcp). Example:
+  #   scope:
+  #     tenants: ["acme*"]
+  #     keys: ["mobile-*"]
+  #     exclude_models: ["*-mini"]
+  #     routes: ["chat"]
   - name: prompt_injection
     enabled: true
     params:

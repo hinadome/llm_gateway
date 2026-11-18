@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 93 Python files, ~35,600 lines, 1356 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 93 Python files, ~35,600 lines, 1370 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -101,7 +101,7 @@ gateway/
 │                           exception handlers
 ├── config.py               Two-layer config: env Settings (secrets/DB) + YAML GatewayConfig (providers,
 │                           models — incl. shadow deployments/canary weights — model_aliases/default_model,
-│                           guardrails + their scopes, cache, routing incl. breaker backend, auth chain
+│                           guardrails + their scopes (key/tenant/model/route fnmatch globs), cache, routing incl. breaker backend, auth chain
 │                           (admin_key/virtual_key/jwt/custom + JWT verification), audit + alerts webhooks,
 │                           pricing (per-1M-token + modality unit prices), logging incl.
 │                           store_bodies/retention_days/
@@ -2179,8 +2179,11 @@ gateway/
 │   │                       applied), mid-stream rewriting (StreamRewriteState
 │   │                       per request, run_stream_rewrite chains rewriters —
 │   │                       each sees the previous one's output), scoping:
-│   │                       _in_scope (fnmatch over key name / public model /
-│   │                       inbound route) + per-key disabled_guardrails
+│   │                       _in_scope (fnmatch over key name / tenant
+│   │                       name — the whole tenant binds, and a
+│   │                       no-tenant platform key matches no tenants
+│   │                       pattern / public model / inbound route) +
+│   │                       per-key disabled_guardrails
 │   │                       override — out-of-scope guardrails are skipped
 │   │                       before any phase runs; response_policy_token
 │   │                       fingerprints the response-capable guardrails
@@ -2593,7 +2596,7 @@ classDiagram
     class YourCustomGuardrail
 
     note for GuardrailResult "action: allow (pass through) / modify (replace messages or response, redirect the model, overlay request fields) / block (reject). Return None from a phase to skip it."
-    note for Guardrail "mode: enforce (default) or observe — set by the manager from config, never read by subclasses. Same for scope (keys/models/routes globs) — the manager filters before any phase runs."
+    note for Guardrail "mode: enforce (default) or observe — set by the manager from config, never read by subclasses. Same for scope (keys/tenants/models/routes globs) — the manager filters before any phase runs."
     note for GuardrailManager "All verdicts are recorded on RequestContext.guardrail_actions (logs, admin API, metrics). Observe-mode verdicts are logged + counted but never applied."
     note for Guardrail "rewrite_stream_text opts in via supports_stream_rewrite — rewrite streamed output as it streams. It receives everything not yet emitted and returns (emit_now, keep_pending); the pipeline flushes pending before the finish chunk."
     note for PresidioPIIGuardrail "Microsoft Presidio detector (optional extra). NLP engine with spacy, or pattern-only; redacts or blocks per entity."
@@ -2633,7 +2636,7 @@ All verdicts are recorded into `RequestContext.guardrail_actions` (→ request l
 
 **Scoping.** Two composing mechanisms decide which *requests* a guardrail applies to — neither requires anything of the guardrail subclass:
 
-1. **Config scope** (`guardrails[].scope`, fnmatch globs): `keys`/`exclude_keys` match the calling key's *name* (the admin key is `"admin"`), `models`/`exclude_models` match the public model name *after* alias resolution (and after any guardrail redirect), `routes`/`exclude_routes` match the inbound API surface (`chat` / `responses` / `messages` / `gemini` — per-route policy without separate guardrail instances). `exclude_*` wins over the matching include list, and all present fields must match (`AND`).
+1. **Config scope** (`guardrails[].scope`, fnmatch globs): `keys`/`exclude_keys` match the calling key's *name* (the admin key is `"admin"`), `tenants`/`exclude_tenants` match the caller's *tenant* name (tier 58 — one field binds the whole tenant: every member key, tenant admins included, since the tenant is a policy ceiling; a key with **no tenant** is in no tenant, so it matches no `tenants` pattern, even `*`, and `exclude_tenants` never excuses it — tenant scoping can only narrow, never widen onto the platform), `models`/`exclude_models` match the public model name *after* alias resolution (and after any guardrail redirect; on the MCP route the "model" is the server name), `routes`/`exclude_routes` match the inbound API surface (`chat` / `responses` / `messages` / `gemini` / `realtime` / `mcp` — per-route policy without separate guardrail instances). `exclude_*` wins over the matching include list, and all present fields must match (`AND`).
 2. **Per-key runtime override** (`VirtualKey.disabled_guardrails`, a flat name list set via the admin API/UI without a restart): always wins over config scope — disable-only, so the blast radius of a mis-edit is "one guardrail on one key", never "guardrail off for everyone".
 
 The manager filters (`_in_scope` + `_active`) *before* running any phase, so an out-of-scope guardrail produces no verdict, no log entry and no metric — as if it weren't configured. Scopes show up in `describe()` → `/admin/guardrails` and the dashboard's guardrail inventory.
@@ -3220,7 +3223,7 @@ Being honest about the seams — these are the current trade-offs (all are local
 7. ~~Single-process state~~ **Mostly solved:** rate limiting, caching and circuit-breaker state all have Redis backends (`rate_limit.backend: redis`, `cache.backend: redis`, `routing.breaker.backend: redis`) that share windows, entries and circuits across workers/replicas — the multi-replica caveat now only applies if you deliberately keep the in-memory backends. RPM/TPM semantics are identical (true sliding window via Redis sorted sets); breaker state lives in one hash per deployment with every read-modify-write inside a WATCH/MULTI transaction (one replica's trip opens the circuit fleet-wide), and a Redis outage fails the breaker *open* — routing continues, circuits just stop protecting until Redis returns. Three deliberately in-process exceptions remain: idempotency's in-flight dedup (cross-replica Redis dedups completed entries only), runaway-agent detection (per-replica loop windows — a fleet detects the same loop at per-replica rate, bounded, just slower to trip; the jail and release are per-replica too) and concurrency admission (per-replica slot counts — run N replicas behind a load balancer with cap/N, or accept the approximation).
 8. ~~Inline logging~~ **Solved, config-selectable:** `logging.background_write` moves the request-log INSERT behind a bounded queue drained by a lazily started background consumer (`QueuedLoggingService`, a drop-in subclass of `LoggingService` — same call sites, no pipeline changes). The default remains the awaited write, deliberately: it preserves the invariant that a returned response implies its log row is queryable, which the admin UI, exports and ~10 test suites lean on. The queue trades that for hot-path headroom: a full queue drops rows (counted on `gateway_logs_dropped_total`) instead of pushing back-pressure into latency, and the lifespan teardown drains everything pending. (Retention was already backgrounded — `logging.retention_days` prunes old rows from a lifespan loop — and `store_bodies: false` keeps bodies out of the write entirely.)
 9. ~~Guardrail scope is global~~ **Solved:** `guardrails[].scope` (fnmatch globs over key names, public model names *and inbound routes* — `routes`/`exclude_routes` with values `chat`/`responses`/`messages`/`gemini`, so per-route policy needs no separate guardrail instances) plus per-key runtime overrides (`disabled_guardrails` on the key row, admin-API-settable without a restart) cover per-key, per-model, per-route and exclusion scoping; they compose with observe mode, and out-of-scope guardrails cost nothing (skipped before any phase). Still missing: a first-class tenant dimension in `scope` (tenants exist now — see below — but a tenant-wide guardrail is expressed as key-name globs or per-key `disabled_guardrails`, not a `scope.tenant` field).
-10. ~~No tenant concept~~ **Solved:** tenants (`models.Tenant`) group virtual keys under a narrowing policy ceiling — allowlist, RPM/TPM, the three budget windows — with no admin bypass at the tenant layer; tenant admins are scoped (own keys/logs/stats/usage, 404 on cross-tenant ids, 403 on platform endpoints) and auth fails closed on dangling/disabled tenants (see §6). Remaining gaps, honestly: tenant guardrail scoping has no first-class field (item 9), the admin UI has no tenant views (per-endpoint 403s degrade in-page for tenant admins), and tenant API-key budgets are the only pooling dimension — per-tenant pricing exists as a single cost-plus *markup* multiplier over the shared model pricing table (`pricing_markup_pct`, tier 25), but per-tenant *per-model* price overrides and rate-limit overrides per key-within-tenant still don't exist beyond what the two stacked windows already enforce.
+10. ~~No tenant concept~~ **Solved:** tenants (`models.Tenant`) group virtual keys under a narrowing policy ceiling — allowlist, RPM/TPM, the three budget windows — with no admin bypass at the tenant layer; tenant admins are scoped (own keys/logs/stats/usage, 404 on cross-tenant ids, 403 on platform endpoints) and auth fails closed on dangling/disabled tenants (see §6). ~~Tenant guardrail scoping has no first-class field (item 9)~~ **Solved (tier 58):** `guardrails[].scope.tenants` / `exclude_tenants` match the tenant's name with fnmatch globs — one field binds a whole tenant (every member key, tenant admins included, the ceiling applies to them like every member), with no key-name globs or per-key `disabled_guardrails` bookkeeping; a platform key (no tenant) is in no tenant, so `tenants` never widens onto it and `exclude_tenants` never excuses it. Remaining gaps, honestly: the admin UI has no tenant views (per-endpoint 403s degrade in-page for tenant admins), and tenant API-key budgets are the only pooling dimension — per-tenant pricing exists as a single cost-plus *markup* multiplier over the shared model pricing table (`pricing_markup_pct`, tier 25), but per-tenant *per-model* price overrides and rate-limit overrides per key-within-tenant still don't exist beyond what the two stacked windows already enforce.
 
 ### 8.3 Extension recipes
 
@@ -3296,10 +3299,12 @@ tests/
 │                        write and reload files under tmp_path, never the
 │                        repo's ./config.yaml
 ├── test_guardrails.py   Unit tests per builtin + manager chaining/blocking + observe mode
-├── test_guardrail_scoping.py  Scope matching matrix (keys/models include+exclude globs,
-│                        admin-as-key-name, AND across fields) + per-key overrides
+├── test_guardrail_scoping.py  Scope matching matrix (keys/tenants/models include+exclude
+│                        globs, admin-as-key-name, no-tenant platform keys, AND across
+│                        fields) + per-key overrides
 │                        (wins over scope, no-restart toggle via admin API) + e2e:
-│                        scoped enforcement, PII modify respects scope, stream phase,
+│                        scoped enforcement, tenant + exclude_tenants binding (member
+│                        and tenant-admin keys alike), PII modify respects scope, stream phase,
 │                        no verdict/log entry when out of scope, /admin introspection
 ├── test_guardrail_surface.py  The wider guardrail surface (Tier 8): request-phase
 │                        redirect (allowlist re-validation, cache identity, admin

@@ -262,11 +262,16 @@ class GuardrailScope(BaseModel):
 
     Patterns are fnmatch globs, matched against the calling key's *name*
     (as shown in /admin/keys — the admin key is named "admin"), the
-    *public* model name, and the inbound *route* ("chat" =
-    /v1/chat/completions, "responses" = /v1/responses, "messages" =
-    the native Anthropic format, "gemini" = the native Gemini format).
-    ``exclude_*`` wins over the matching include list; a request must
-    satisfy every present field to run the guardrail.
+    caller's *tenant* name (as shown in /admin/tenants — the whole
+    tenant binds, no per-key bookkeeping), the *public* model name, and
+    the inbound *route* ("chat" = /v1/chat/completions, "responses" =
+    /v1/responses, "messages" = the native Anthropic format, "gemini" =
+    the native Gemini format). ``exclude_*`` wins over the matching
+    include list; a request must satisfy every present field to run the
+    guardrail. A request with no tenant (a platform key) is in *no*
+    tenant: it matches no ``tenants`` pattern (even ``*``) and is never
+    excluded by ``exclude_tenants`` — the same shape as route scoping
+    over a route-less call.
 
     A guardrail out of scope for a request is skipped entirely — no
     verdict, no log entry, no metric — as if it were not configured.
@@ -274,6 +279,10 @@ class GuardrailScope(BaseModel):
 
     keys: list[str] | None = None  # only run for these key names
     exclude_keys: list[str] | None = None  # never run for these key names
+    # Tenant scoping (the whole tenant binds — every member key,
+    # tenant admins included, since the tenant is a policy ceiling).
+    tenants: list[str] | None = None  # only run for keys in these tenants
+    exclude_tenants: list[str] | None = None  # never run for these tenants
     models: list[str] | None = None  # only run for these public models
     exclude_models: list[str] | None = None  # never run for these public models
     routes: list[str] | None = None  # only run on these inbound routes
