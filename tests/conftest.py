@@ -32,6 +32,7 @@ from gateway.config import (
     MCPConfig,
     MCPServerConfig,
     ReplayConfig,
+    TrialsConfig,
     RunawayConfig,
     ConcurrencyConfig,
     LoggingConfig,
@@ -112,6 +113,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
     pii_scan = cache_overrides.pop("pii_scan", None) or PIIScanConfig()
     idempotency = cache_overrides.pop("idempotency", None) or IdempotencyConfig()
     replay = cache_overrides.pop("replay", None) or ReplayConfig()
+    trials = cache_overrides.pop("trials", None) or TrialsConfig()
     runaway = cache_overrides.pop("runaway", None) or RunawayConfig()
     concurrency = cache_overrides.pop("concurrency", None) or ConcurrencyConfig()
     mcp = cache_overrides.pop("mcp", None) or MCPConfig()
@@ -179,6 +181,7 @@ def make_config(**cache_overrides) -> GatewayConfig:
         pii_scan=pii_scan,
         idempotency=idempotency,
         replay=replay,
+        trials=trials,
         runaway=runaway,
         concurrency=concurrency,
         events=events,
@@ -216,6 +219,12 @@ class MockUpstream:
         # shadow deployment at a model that answers differently, so the
         # pair scores divergent instead of exact).
         self.model_content: dict[str, str] = {}
+        # Concurrency visibility (candidate-trial tests): requests
+        # currently inside the handler, and the high-water mark — what
+        # the delay sleep below makes observable, so a wave cap can be
+        # asserted as "never more than N in flight".
+        self.inflight: int = 0
+        self.max_inflight: int = 0
 
     @staticmethod
     def _embedding_response(body: dict) -> dict:
@@ -368,6 +377,17 @@ class MockUpstream:
         return files
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
+        # The concurrency wrapper: count every request inside the
+        # handler (the high-water mark is what wave/throttle tests
+        # assert against), then delegate to the real handler.
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            return await self._handler_inner(request)
+        finally:
+            self.inflight -= 1
+
+    async def _handler_inner(self, request: httpx.Request) -> httpx.Response:
         if self.delay_seconds > 0:
             await asyncio.sleep(self.delay_seconds)
         try:

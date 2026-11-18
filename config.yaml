@@ -601,6 +601,31 @@ replay:
   enabled: true
   max_entries: 500
 
+# Candidate trials — the deliberate-replay leg of provider migration.
+# Where shadow mirroring is passive evidence (only traffic the model
+# actually gets, only candidates wired as shadow deployments), a trial
+# replays a CAPTURED window on demand: POST /admin/trials takes one
+# public model's successful, body-storing chat rows (since/until,
+# newest first, up to limit) and sends each to a named candidate
+# deployment with REAL upstream calls — any configured deployment,
+# it need not belong to the replayed model. Runs are throttled (waves
+# of concurrency parallel calls) and spend-capped (max_cost_usd, a
+# between-wave cap: it stops the NEXT wave, never one in flight).
+# Execution is mirror-like — no guardrails, counters, budgets, caches,
+# events or metrics, and no breaker bookkeeping either: an experiment
+# must not trip a serving candidate's circuit. Nobody's spend moves;
+# each replayed entry writes a scored shadow log row (tier-35 verdict
+# vocabulary) carrying the run's trial_id, excluded from the standing
+# /admin/shadow-diff aggregate; /admin/trials/{id}/pairs is the
+# drilldown. The three max_* fields are CEILINGS: per-run values in
+# the POST are clamped into range, so a caller can never ask for more
+# replay volume, parallelism or spend than allowed here.
+trials:
+  enabled: true
+  max_entries: 200        # ceiling for per-run limit (replayed entries)
+  max_concurrency: 2     # ceiling for per-run concurrency (calls per wave)
+  max_cost_usd: 1.0      # ceiling for per-run candidate spend (USD)
+
 # Runaway-agent protection: identical-request loop detection with an
 # escalating cooldown jail. An agent stuck in a loop (retry storm,
 # regenerating tool-call loop) sends the SAME request over and over at

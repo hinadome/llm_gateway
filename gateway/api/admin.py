@@ -17,17 +17,18 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from ..core.alerts import BudgetAlertManager
 from ..core.context import AuthContext
 from ..core.prompt_library import PromptLibrary
 from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
+from ..core import trials as trials_core
 from ..core.vault import VaultService
 from ..db import get_sessionmaker
 from ..errors import GatewayError
-from ..models import Feedback, RequestLog, Tenant, VirtualKey
+from ..models import Feedback, RequestLog, Tenant, Trial, VirtualKey
 from ..observability.metrics import PII_FINDINGS
 from ..schemas import (
     KeyCreateRequest,
@@ -38,6 +39,7 @@ from ..schemas import (
     ReplayRequest,
     TenantCreateRequest,
     TenantUpdateRequest,
+    TrialCreateRequest,
 )
 from .deps import ENDPOINT_SCOPES, hash_key, require_admin, require_platform_admin
 
@@ -807,6 +809,9 @@ def _log_row(row: RequestLog) -> dict:
         "prompt_variant": row.prompt_variant,
         "shadow_verdict": row.shadow_verdict,
         "shadow_similarity": row.shadow_similarity,
+        # Candidate trial (tier 36): the run this shadow row replays for
+        # (None on primaries, mirrors and prompt A/B rows).
+        "trial_id": row.trial_id,
         # BYOK vault: the provider whose upstream call used the TENANT'S
         # stored credential (None = platform credential). Observability
         # only — the credential itself is never stored anywhere.
@@ -1494,6 +1499,7 @@ def _usage_row(row: RequestLog) -> dict:
         "prompt_variant": row.prompt_variant,
         "shadow_verdict": row.shadow_verdict,
         "shadow_similarity": row.shadow_similarity,
+        "trial_id": row.trial_id,
     }
 
 
@@ -1802,6 +1808,228 @@ async def shadow_diff_pair_list(
             limit=limit,
             offset=offset,
         )
+
+
+# -- candidate trials (tier 36) -------------------------------------------
+# The deliberate-replay leg: a captured window of one public model's
+# traffic replayed against a named candidate deployment with real
+# upstream calls, throttled + spend-capped, scored like shadow mirrors.
+# Platform-admin-only for the same reason as shadow-diff: the pairs
+# carry request bodies, which cross tenants.
+
+
+def _trial_dict(row: Trial) -> dict:
+    return {
+        "id": row.id,
+        "model": row.model,
+        "deployment": row.deployment,
+        "provider": row.provider,
+        "params": row.params or {},
+        "status": row.status,
+        "stop_reason": row.stop_reason,
+        "error_message": row.error_message,
+        "selected": row.selected,
+        "completed": row.completed,
+        "skipped": row.skipped,
+        "cost_usd": row.cost_usd,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+    }
+
+
+@router.post("/admin/trials")
+async def create_trial(
+    raw_request: Request,
+    body: TrialCreateRequest,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Start a candidate trial: replay a captured traffic window of
+    ``model`` (its successful, body-storing chat rows inside
+    ``since``/``until``, newest first, up to ``limit``) against the
+    ``deployment`` candidate — real upstream calls in waves of
+    ``concurrency``, cumulative candidate spend capped at
+    ``max_cost_usd`` (all three clamped to the ``trials:`` ceilings).
+    Each replayed entry writes a scored shadow log row (the tier-35
+    vocabulary); the run executes in the background and its row
+    reports progress. The candidate may be any configured deployment —
+    it does not need to belong to the replayed model."""
+    config = raw_request.app.state.config
+    if not config.trials.enabled:
+        raise GatewayError(
+            404,
+            "Candidate trials are disabled on this gateway "
+            "(config: trials.enabled: false).",
+            "invalid_request_error",
+            code="trials_disabled",
+        )
+    target = trials_core.validate_run_request(config, body.model, body.deployment)
+    params = trials_core.clamp_params(
+        config.trials,
+        limit=body.limit,
+        concurrency=body.concurrency,
+        max_cost_usd=body.max_cost_usd,
+    )
+    if body.since:
+        params["since"] = _parse_range_ts(body.since, "since").isoformat()
+    if body.until:
+        params["until"] = _parse_range_ts(body.until, "until").isoformat()
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        row = Trial(
+            model=body.model,
+            deployment=target.name,
+            provider=target.provider,
+            params=params,
+        )
+        session.add(row)
+        await session.commit()
+    # Tracked background work: shutdown drains the run like mirrors.
+    pipeline = raw_request.app.state.pipeline
+    pipeline._spawn(trials_core.run_trial(pipeline, row.id))
+    raw_request.app.state.audit.record(
+        "trial.created",
+        actor=admin,
+        trial_id=row.id,
+        model=row.model,
+        deployment=row.deployment,
+    )
+    return _trial_dict(row)
+
+
+@router.get("/admin/trials")
+async def list_trials(
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """Trial runs, newest first — status, progress counters, cumulative
+    candidate spend and the stop reason (done / no_entries / cost_cap /
+    cancelled / orphaned_by_restart / error). Each row carries its
+    verdict summary (one grouped query for the page) so the table can
+    show the verdict breakdown without per-run detail fetches."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        total = (
+            await session.execute(select(func.count()).select_from(Trial))
+        ).scalar_one()
+        rows = (
+            (
+                await session.execute(
+                    select(Trial)
+                    .order_by(Trial.created_at.desc(), Trial.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        summaries = await trials_core.run_summaries(session, [row.id for row in rows])
+        data = []
+        for row in rows:
+            out = _trial_dict(row)
+            out["summary"] = summaries.get(row.id)
+            data.append(out)
+        return {
+            "data": data,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+@router.get("/admin/trials/{trial_id}")
+async def get_trial(
+    trial_id: str, admin: Annotated[AuthContext, Depends(require_platform_admin)]
+) -> dict:
+    """One trial run: the row plus its verdict summary (exact / near /
+    divergent / shadow_error / not_comparable counts and the mean
+    similarity over comparable pairs), computed from the run's log
+    rows."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        row = await session.get(Trial, trial_id)
+        if row is None:
+            raise GatewayError(
+                404, f"No trial '{trial_id}'.", "invalid_request_error"
+            )
+        out = _trial_dict(row)
+        out["summary"] = await trials_core.run_summary(session, trial_id)
+        return out
+
+
+@router.get("/admin/trials/{trial_id}/pairs")
+async def trial_pair_list(
+    trial_id: str,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+    verdict: str | None = Query(None, pattern=_VERDICT_PATTERN),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """The trial drilldown — the same pair shape as /admin/shadow-diff/
+    pairs (both sides' status/latency/tokens/cost + text excerpts),
+    scoped to the run's rows. ``?verdict=divergent`` is the migration
+    review queue for the trial."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        row = await session.get(Trial, trial_id)
+        if row is None:
+            raise GatewayError(
+                404, f"No trial '{trial_id}'.", "invalid_request_error"
+            )
+        return await shadow_pairs(
+            session,
+            model=row.model,
+            deployment=row.deployment,
+            verdict=verdict,
+            limit=limit,
+            offset=offset,
+            trial_id=row.id,
+        )
+
+
+@router.post("/admin/trials/{trial_id}/cancel")
+async def cancel_trial(
+    raw_request: Request,
+    trial_id: str,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Cancel a pending/running trial. Guarded on the current status:
+    a run that already finished answers 409; a live one stops within
+    one wave (the runner re-checks this row between waves — DB status
+    is the only cross-replica truth)."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        row = await session.get(Trial, trial_id)
+        if row is None:
+            raise GatewayError(
+                404, f"No trial '{trial_id}'.", "invalid_request_error"
+            )
+        result = await session.execute(
+            update(Trial)
+            .where(Trial.id == trial_id, Trial.status.in_(["pending", "running"]))
+            .values(
+                status="cancelled",
+                stop_reason=trials_core.STOP_CANCELLED,
+                finished_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+        if (result.rowcount or 0) == 0:
+            raise GatewayError(
+                409,
+                f"Trial '{trial_id}' already finished ({row.status}).",
+                "invalid_request_error",
+            )
+        raw_request.app.state.audit.record(
+            "trial.cancelled", actor=admin, trial_id=trial_id
+        )
+        # expire_on_commit is off, so re-read the row the guarded
+        # UPDATE just rewrote — the response must show the new state.
+        await session.refresh(row)
+        return _trial_dict(row)
 
 
 @router.get("/admin/mcp")

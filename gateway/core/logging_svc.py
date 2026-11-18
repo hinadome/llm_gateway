@@ -107,6 +107,7 @@ class LoggingService:
                 prompt_variant=ctx.prompt_variant,
                 shadow_verdict=ctx.shadow_verdict,
                 shadow_similarity=ctx.shadow_similarity,
+                trial_id=ctx.trial_id,
                 byok_provider=ctx.byok_provider,
                 trace_id=ctx.trace_id,
                 span_id=ctx.span_id,

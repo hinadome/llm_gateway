@@ -8,6 +8,77 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Candidate trials (tier 36) — the deliberate-replay leg of provider
+  migration. Shadow mirroring + diffing is passive evidence: only the
+  traffic a model actually gets, only candidates wired as `shadow:
+  true`, and only at the rate real requests arrive. When a migration
+  decision needs evidence now — or the candidate isn't wired as a
+  shadow — `POST /admin/trials` replays a captured traffic window on
+  demand: one public model's successful, body-storing chat rows
+  (`since`/`until`, newest first, up to `limit`) are re-sent to a
+  named candidate deployment with REAL upstream calls (unlike the
+  dry-run replay harness, which exists to diff config, not providers):
+  - **The candidate can be any configured deployment** — it does not
+    need to belong to the replayed model. The adapter maps the
+    request to the candidate's upstream model, which is exactly how
+    migrations work (a candidate usually runs a *different* model).
+  - **Throttled and spend-capped** — entries replay in waves of at
+    most `concurrency` parallel calls (the batch worker's wave
+    precedent), and between waves the runner re-reads the run row:
+    cumulative candidate spend at `max_cost_usd` refuses the NEXT
+    wave (never one in flight — the cap can overshoot by at most one
+    wave), a status change stops the run. All three per-run values
+    are clamped to the new `trials:` ceilings (`max_entries` 200,
+    `max_concurrency` 2, `max_cost_usd` $1.00; asking for more just
+    runs at the ceiling — the clamped params are what the row
+    stores and what ran).
+  - **Mirror-like execution, minus the breaker** — trial calls skip
+    guardrails, rate limits, budgets, the caches, lifecycle events
+    and metrics, and unlike real mirrors they skip *breaker
+    bookkeeping* too: an experiment must not trip a serving
+    candidate's circuit. Nobody's spend moves — each replayed entry
+    writes a shadow request-log row sharing the original's
+    `request_id` (plus a `trial_id`, auto-upgraded column) with its
+    own cost, totaled on the run row, billed to no key or tenant.
+    The run row plus the scored log rows are the evidence surface.
+  - **Scored like mirrors, honestly** — every replayed entry is
+    scored with the tier-35 verdict vocabulary against the
+    primary's stored body. One difference is forced by the
+    persistence boundary: the primary's raw provider text is not
+    stored, so a primary that a response/stream guardrail REWROTE
+    (its stored body is the client-seen text) scores
+    `not_comparable` instead of fake divergence — the same
+    raw-vs-raw honesty mirrors get by capturing the baseline before
+    the response phase, paid for here with one bucket.
+  - **The standing evidence stays clean** — trial rows are excluded
+    from `/admin/shadow-diff` (`trial_id IS NULL` is the live-
+    mirroring scope); `GET /admin/trials/{id}/pairs` is the run's
+    own drilldown, the same pair shape, verdict-filterable
+    (`?verdict=divergent` = the trial's review queue). `GET
+    /admin/trials` lists runs newest-first with progress
+    (`selected`/`completed`/`skipped`), spend, stop reason and the
+    verdict summary folded into each row (one grouped query — no
+    N+1); `GET /admin/trials/{id}` is the run plus its summary.
+  - **DB status is the only truth** — claiming (`pending` →
+    `running`), progress/cost accrual (column-arithmetic UPDATEs)
+    and finalization are guarded on the row's current status, and
+    the runner re-checks between waves: `POST /admin/trials/{id}/
+    cancel` (finished runs answer 409), another replica, or the
+    startup sweep — trials a dead process left `pending`/`running`
+    are cancelled with `orphaned_by_restart` at boot; a run live on
+    another replica sees the cancel within one wave — always win.
+    Stop reasons say why a run ended: `done` / `no_entries` /
+    `cost_cap` / `cancelled` / `orphaned_by_restart` / `error`.
+  All five endpoints are platform-admin-only (the pairs carry
+  request bodies, which cross tenants — the same boundary as
+  `/admin/shadow-diff`); create/cancel are audited
+  (`trial.created` / `trial.cancelled`). `trials.enabled: false`
+  answers the POST with 404 `trials_disabled`. The admin
+  dashboard's Routing tab gains the "Candidate trials" panel — run
+  form (model window, candidate, caps), runs table with verdict
+  badges, and the same pair-dialog as mirror pairs, endpoint-swapped.
+  15 tests + a UI-surface pin (`tests/test_trials.py`,
+  `tests/test_admin_ui.py`); the suite stands at 1097.
 - Shadow diffing (tier 35) — the evidence layer over mirrored traffic.
   Shadow mirroring already wrote paired rows (the client-facing primary
   and the mirrored candidate share a request_id, each with its own

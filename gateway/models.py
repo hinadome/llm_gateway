@@ -407,6 +407,14 @@ class RequestLog(Base):
     # no comparison happened (mirror error / not comparable) so AVG()
     # aggregates only over comparable pairs.
     shadow_similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Candidate trials (tier 36, core/trials.py): the trial run this
+    # shadow row belongs to. Trial rows deliberately replay a captured
+    # primary against a candidate deployment, sharing the original's
+    # request_id like mirror rows do; the standing /admin/shadow-diff
+    # scope excludes them (trial_id IS NULL — a trial is an experiment,
+    # not live mirroring) and GET /admin/trials/{id}/pairs filters on
+    # it. Nullable: NULL on every other row (auto-upgrade adds it NULL).
+    trial_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     # BYOK vault (tier 31): the provider whose upstream call was made
     # with the TENANT'S stored credential instead of the platform's
     # configured key (None = platform credential, incl. every row from
@@ -589,6 +597,65 @@ class BatchResult(Base):
     status: Mapped[str] = mapped_column(String(16), default="succeeded")
     response: Mapped[dict] = mapped_column(JSONColumn, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class Trial(Base):
+    """One candidate trial (tier 36): a captured traffic window
+    deliberately replayed against a named candidate deployment — real
+    upstream calls, throttled (waves of ``params["concurrency"]``) and
+    spend-capped (``params["max_cost_usd"]``) — scored with the tier-35
+    verdict vocabulary. For migrations shadow mirroring hasn't seen
+    enough traffic for, or candidates not wired as shadow deployments.
+
+    Each replayed entry writes a shadow RequestLog row (own body/cost,
+    sharing the original primary's request_id, ``trial_id`` set) with
+    ``shadow_verdict``/``shadow_similarity`` — scored against the
+    primary's STORED body, honestly ``not_comparable`` when the primary
+    was rewritten by a response/stream guardrail (the stored body is
+    the client-seen text there; raw-vs-raw is impossible).
+
+    Status lifecycle: ``pending`` → ``running`` → ``completed`` (or
+    ``cancelled`` / ``failed``). ``stop_reason`` says why a run stopped
+    short: ``done`` (all entries replayed), ``no_entries``,
+    ``cost_cap``, ``cancelled``, ``orphaned_by_restart`` (the startup
+    sweep). Transitions are guarded on the row's current status — DB
+    state is the only cross-replica truth, and the runner re-checks it
+    between waves so a cancel (another replica, a POST, a restart)
+    always wins within one wave.
+    """
+
+    __tablename__ = "trials"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    # The public model whose captured traffic is replayed...
+    model: Mapped[str] = mapped_column(String(128))
+    # ...against this candidate deployment. It may be ANY configured
+    # deployment — need not belong to the replayed model; the adapter
+    # maps the request to deployment.model.
+    deployment: Mapped[str] = mapped_column(String(128))
+    provider: Mapped[str] = mapped_column(String(32), default="")
+    # The clamped run parameters (what actually runs): since / until
+    # (ISO strings or None), limit, concurrency, max_cost_usd.
+    params: Mapped[dict] = mapped_column(JSONColumn, default=dict)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Progress counters: selected = entries found to replay; completed
+    # = entries that produced a trial row (success or error — both are
+    # evidence); skipped = unparseable stored bodies (no row).
+    selected: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    # Cumulative candidate spend across the run so far (the cap halts
+    # the NEXT wave, not the one in flight).
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class Feedback(Base):

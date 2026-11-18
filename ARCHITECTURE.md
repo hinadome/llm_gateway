@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 81 Python files, ~27,200 lines, 1081 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 82 Python files, ~28,200 lines, 1097 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -77,7 +77,12 @@ flowchart TB
 ```
 gateway/
 ├── main.py                 App factory (create_app): composes ALL services; lifespan (DB init,
-│                           key seeding, log-retention background task, SIGHUP →
+│                           key seeding, candidate-trial orphan sweep (tier 36:
+│                           pending/running rows a dead process left are marked
+│                           cancelled — a live run on another replica sees it
+│                           at its next between-wave check; runs whether or
+│                           not trials are enabled now, best-effort),
+│                           log-retention background task, SIGHUP →
 │                           reload, readiness flag, drain-before-close), reload_gateway
 │                           (one path for /admin/reload + SIGHUP), /healthz liveness
 │                           (never checks deps) + /readyz readiness (503 while
@@ -103,11 +108,13 @@ gateway/
 ├── errors.py               OpenAI-style error envelope + typed errors (ProviderError, GuardrailBlocked,
 │                           RateLimitError, BudgetExceededError, ...)
 ├── models.py / db.py       SQLAlchemy ORM (Tenant, VirtualKey, RequestLog, Prompt,
-│                           SettingKV) + async engine management incl. get_engine (readiness
+│                           SettingKV, Trial) + async engine management incl. get_engine (readiness
 │                           checks, VACUUM INTO backups); RequestLog's
 │                           tier-35 shadow-diff columns (shadow_verdict /
-│                           shadow_similarity, mirror rows only) ride the
-│                           auto-upgrade like every nullable addition
+│                           shadow_similarity, mirror rows only) and tier-36
+│                           trial_id (trial replay rows only) ride the
+│                           auto-upgrade like every nullable addition; the
+│                           trials table is created by the same create_all
 ├── bootstrap.py           First-boot seeding: admin key, default virtual key
 ├── serve.py + __main__.py `python -m gateway` runner (wrapped by scripts/gateway.sh):
 │                           HTTP by default, HTTPS via three certificate modes —
@@ -315,7 +322,23 @@ gateway/
 │                           pairs (tier 35, platform-admin-only — the
 │                           pairs carry request bodies, which cross
 │                           tenants) serve core/shadow_diff's migration
-│                           evidence over mirrored traffic;
+│                           evidence over mirrored traffic; the
+│                           candidate-trials surface (tier 36, same
+│                           platform-admin boundary, trial.created/
+│                           trial.cancelled audited): POST /admin/trials
+│                           validates + clamps a run (model window,
+│                           candidate deployment — any configured one —
+│                           and the three caps) and spawns it,
+│                           GET /admin/trials lists runs newest-first
+│                           with each verdict summary folded in (one
+│                           grouped query), GET /admin/trials/{id} is
+│                           the run + summary, GET /admin/trials/{id}/
+│                           pairs the drilldown (shadow_diff.pairs
+│                           scoped by trial_id — same pair shape as
+│                           the standing drilldown), POST
+│                           /admin/trials/{id}/cancel a guarded
+│                           UPDATE (finished runs 409; a live run
+│                           stops within one wave) — see core/trials;
 │                           tenant scoping forced for tenant
 │                           admins, ?tenant_id= filter for platform), feedback
 │                           (GET /admin/feedback list with key/model/rating
@@ -1070,7 +1093,73 @@ gateway/
 │   │                       Deployment mirrors only: prompt_variant rows
 │   │                       are excluded (their divergence is by
 │   │                       design), pre-tier-35 rows (verdict NULL)
-│   │                       are never re-guessed.
+│   │                       are never re-guessed. Tier 36: _pair_
+│   │                       conditions takes a trial_id — None (the
+│   │                       standing scope) excludes candidate-trial
+│   │                       replay rows so a deliberate experiment
+│   │                       never pollutes live-mirroring evidence;
+│   │                       a trial id selects exactly that run's
+│   │                       pairs (the /admin/trials/{id}/pairs
+│   │                       drilldown reuses the same query).
+│   ├── trials.py           Candidate trials (tier 36): the deliberate-
+│   │                       replay leg of provider migration. Where
+│   │                       shadow mirroring is passive (only traffic
+│   │                       the model gets, only shadow-wired
+│   │                       candidates), run_trial replays a CAPTURED
+│   │                       window on demand — one public model's
+│   │                       successful, body-storing chat rows
+│   │                       (select_entries, newest first, snapshot
+│   │                       into dicts so a retention prune can never
+│   │                       race a wave) against a named candidate
+│   │                       deployment (resolve_deployment: ANY
+│   │                       configured deployment — the adapter maps
+│   │                       to its upstream model, which is how
+│   │                       migrations work) with REAL upstream calls.
+│   │                       Three boundaries shape it: (1) mirror-like
+│   │                       execution — _run_entry calls adapter.
+│   │                       complete directly: no guardrails,
+│   │                       counters, budgets, caches, events or
+│   │                       metrics, and no BREAKER bookkeeping either
+│   │                       (an experiment must not trip a serving
+│   │                       candidate; the run row + scored log rows
+│   │                       are the evidence surface); (2) throttled
+│   │                       + spend-capped — waves of at most
+│   │                       concurrency parallel calls (the batch
+│   │                       worker's wave precedent), and between
+│   │                       waves the row is re-read: cumulative
+│   │                       cost_usd ≥ max_cost_usd refuses the NEXT
+│   │                       wave (never one in flight), a status
+│   │                       change stops the run; (3) DB status is
+│   │                       the only truth — claim (pending→running),
+│   │                       progress/cost (column-arithmetic UPDATEs,
+│   │                       safe under concurrent writers) and the
+│   │                       guarded _finalize (running→completed/
+│   │                       failed) are all keyed on the row's current
+│   │                       status, so a cancel from the API, another
+│   │                       replica or the startup sweep
+│   │                       (sweep_stale: orphans → cancelled/
+│   │                       orphaned_by_restart) wins within one wave.
+│   │                       clamp_params folds per-run caps into the
+│   │                       trials: ceilings (missing = ceiling,
+│   │                       explicit = clamped) — the stored params
+│   │                       are the truth that ran. Scoring honesty:
+│   │                       the primary's raw provider text is not
+│   │                       persisted, so pairs score against the
+│   │                       STORED body — and _primary_rewritten
+│   │                       (a response/stream "modify" in the
+│   │                       primary's guardrail_actions means the
+│   │                       stored body is the rewritten client-seen
+│   │                       text) forces not_comparable instead of
+│   │                       fake divergence. Each replay writes a
+│   │                       shadow row sharing the original's
+│   │                       request_id + trial_id (cost on the row
+│   │                       and the run, nobody's key/tenant spend);
+│   │                       run_summaries is the reporting layer —
+│   │                       verdict counts + mean similarity per run
+│   │                       in one grouped query, folded into the
+│   │                       trial list rows. stop_reason vocabulary:
+│   │                       done / no_entries / cost_cap / cancelled
+│   │                       / orphaned_by_restart / error.
 │   └── events.py           Lifecycle events (pub/sub over the request
 │                           stages): EventBus + EventHandler ABC +
 │                           GatewayEvent. Two handler kinds — observer
@@ -1256,7 +1345,18 @@ gateway/
                             deployment: verdict breakdown, match rate, mean
                             similarity, latency/cost deltas) and the pair-
                             drilldown dialog (verdict-filtered, both sides'
-                            text side by side, load-more paging) —
+                            text side by side, load-more paging; tier 36
+                            generalizes it — the same dialog serves trial
+                            pairs, swapping the endpoint on a trialId in
+                            the dialog state), and, tier 36, the
+                            candidate-trials panel: the run form (model-
+                            window + candidate-deployment selects, since/
+                            limit/concurrency/max-cost caps, clamped
+                            server-side) and the runs table (status badges,
+                            stop reason, progress, per-run verdict badges
+                            + cost; Pairs/Divergent buttons open the shared
+                            dialog, Cancel for live runs; tenant admins get
+                            an in-place 403 note — pairs cross tenants) —
                             guardrail inventory, system (health/readiness,
                             config reload, backups). A test enforces the
                             no-external-resources invariant.
@@ -1732,6 +1832,7 @@ erDiagram
         int ttft_ms "streamed: ms to first content chunk; NULL when not streamed / cache hit"
         bool cache_hit
         bool shadow "mirrored (shadow deployment) call, not client-facing; shares the primary's request_id, excluded from /admin/stats"
+        str trial_id "indexed; candidate-trial replay row (tier 36), NULL on every other row — the standing /admin/shadow-diff scope excludes it"
         str trace_id "indexed; OTel trace (32 hex), NULL when tracing off"
         str span_id "OTel span (16 hex), NULL when tracing off"
         str auth_method "which chain step authenticated (virtual_key/jwt/...)"
@@ -1808,11 +1909,29 @@ erDiagram
         json response "OpenAI batch-line shape: {status_code, request_id, body}"
         datetime created_at
     }
+    TRIAL {
+        str id PK "uuid hex"
+        str model "public model whose captured window is replayed"
+        str deployment "the candidate — any configured deployment, need not belong to the model"
+        str provider "candidate's provider, denormalized"
+        json params "the clamped run parameters that executed: since/until/limit/concurrency/max_cost_usd"
+        str status "indexed; pending | running | completed | cancelled | failed"
+        str stop_reason "done | no_entries | cost_cap | cancelled | orphaned_by_restart | error"
+        text error_message "why a run failed"
+        int selected "captured entries found to replay"
+        int completed "entries that produced a trial row (success or error)"
+        int skipped "unparseable stored bodies — no row"
+        float cost_usd "cumulative candidate spend — capped between waves, billed to nobody"
+        datetime created_at
+        datetime started_at
+        datetime finished_at
+    }
 
     VIRTUAL_KEY ||--o{ STORED_FILE : "key_id"
     VIRTUAL_KEY ||--o{ BATCH : "key_id"
     STORED_FILE ||--o{ BATCH : "input_file_id"
     BATCH ||--o{ BATCH_RESULT : "batch_id"
+    TRIAL ||--o{ REQUEST_LOG : "trial_id (no FK — trial rows share the original primary's request_id)"
 ```
 
 **Tenancy.** A `Tenant` is an organization of virtual keys with its own policy ceiling: `allowed_models`, `allowed_tools`, `allowed_mcp_servers`, RPM/TPM and the same three budget windows keys have, mirrored field-for-field so the enforcement code paths stay symmetric. The semantics are strictly *narrowing*: a member key must pass both its own checks and the tenant's (model allowlists intersect; tool allowlists intersect the same way — a declared tool must match patterns on both rows, and so do `allowed_mcp_servers` patterns — a proxied MCP server must be granted on both the key and the tenant rows; rate limits are two windows — the key's and the pooled `tenant:{id}` one; budgets check both snapshots). There is **no admin bypass at the tenant layer** — that is the point of tenancy: a *tenant admin* (`is_admin` key with a `tenant_id`) manages that tenant's keys and reads its logs/stats/usage, but the ceiling binds them like every other member. A *platform admin* is `is_admin` with no tenant: they configure the platform (tenants, prompts, routing, guardrails, reload, backups — `require_platform_admin`) and can re-home keys between tenants; tenant admins' key creation is forced into their own tenant (a mismatching explicit `tenant_id` is a 400, not a silent override) and re-homing is a 403. Cross-tenant ids answer 404 rather than 403 (confirming another tenant's key exists would leak it). `load_tenant_for_key` fails **closed**: a dangling `tenant_id` (corrupt state — deletes are refused while keys reference the tenant) or `is_active: false` (the kill switch) rejects every member key at auth time, so a tenant's keys can never be served as unrestricted platform keys. Spend accounting writes both rows — the key's UPDATE…RETURNING first, then the identical statement on the tenant row in a separate transaction (a tenant-write failure never loses the key's accounting) — and budget alerts fire per level on either, `kind: "key" | "tenant"` in the payload. Cache identity folds the tenant (plus the response-policy token) into every chat cache key and the tenant alone into embeddings keys: entries never cross tenants, while keys with identical policies still share them. **Cost-plus billing:** a tenant's `pricing_markup_pct` (20.0 = +20%) marks up the provider cost of every member-key request on every modality — `pipeline._billed_cost` is called from both accounting tails (`_account_usage` for the token paths, `_account_cost` for unit-priced images/audio/speech), so the billed number is what spend, budget windows, budget alerts, `RequestLog.cost_usd`, the usage export, `/admin/stats` by-tenant aggregates, the per-key cost metric and the `X-Gateway-Cost-Usd` header record — the chargeback number — while `gateway_cost_usd_total{model}` keeps the ACTUAL provider cost (platform economics stay visible beside tenant economics), `gateway_markup_usd_total{tenant}` counts the markup revenue, and shadow mirrors keep actual cost (mirror rows compare deployments; they don't bill anyone). The markup snapshots at auth time with the rest of the ceiling (a PATCH applies from the next request), binds tenant admins like every member, and `NULL`/`0`/platform keys bill at actual. Budgets therefore enforce the *billed* cost — a tenant's ceiling is what they pay, not what the platform pays. **BYOK vault (tier 31):** a tenant can additionally store its *own* provider credentials — one encrypted entry per (tenant, provider), `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every member request through that provider then authenticates with the tenant's key instead of the platform's configured one (see `core/vault.py`; the swap happens in `Router._resolve_provider_cfg`, per candidate inside the retry/fallback loop, so the stored key follows every leg and an unkeyed fallback provider rides the platform's credential alone — realtime sessions included: `handle_realtime` resolves per candidate at the upstream handshake, so a tenant that keyed the provider connects its WebSocket sessions with *their* credential, and the session row records `byok_provider` like any HTTP row). Raw keys are Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (env only; MultiFernet list = rotation), exist only in the PUT body and the upstream auth header, and are never echoed, logged or audited — the API and audit records speak `key_hint`, log rows `byok_provider` (the provider name). Undecryptable entries (a rotated-away master key) fail closed with `byok_key_unreadable` — a tenant that deliberately brought its own key is never silently re-billed to the platform's; platform callers are untouched. Tenant admins manage their own tenant's credentials only (cross-tenant 404, like everything tenant-scoped); without a master key the vault is simply off — endpoints 400 honestly, serving unchanged. **Tier 34 hardening:** `vault.strict` is the platform-economics stance — a strict tenant's routing ladder is narrowed *before the walk* (`Router._enforce_strict` on both ladder heads and the realtime connect-time ladder), so retries and fallbacks can never cross to an unkeyed provider, and a model whose every deployment is unkeyed refuses 403 `byok_key_required` naming the sorted providers, the model and the `PUT` path; platform callers and the platform's own machinery are untouched, and the stance reads live off the config (hot-reloadable — `backend`/`ttl_seconds` report `restart_required`, `strict` does not). `vault.backend: redis` closes the multi-replica window: admin writes publish `(tenant_id, provider)` on `{redis.prefix}:vault-invalidation` and every replica's listener task drops the cached entry **and its negative twin** (the cached "no key stored" answer that would keep routing the platform's key after another replica stored one) — best-effort both directions (failed publish / malformed message / Redis outage → the TTL backstop, listener backs off 5s). `GET /admin/vault` reports the honest state (enabled or the reason naming the env var, strict, backend, TTL) plus `admin_context` — the tenant a tenant admin manages, so the dashboard's Vault tab serves platform admins (tenant select) and tenant admins (pinned) alike; no secrets anywhere in the payload.
@@ -1896,7 +2015,7 @@ Every constructor parameter is an injection point: tests (and any alternative de
 
 `create_app` composes once, but the config-derived half of the tree can be **swapped in place**. `reload_gateway(app)` — the one path behind both `POST /admin/reload` and SIGHUP — re-reads `config.yaml` and calls `pipeline.apply_config(config)` → `router.apply_config(config)`, which build the new guardrails, model groups, routing policy, pricing, aliases, prompt knobs and event handlers *before* anything is assigned: an invalid config raises with the old one still live, and a reload that changed infra-bound sections (`providers`, `auth`, `cache`/`rate_limit`/breaker *backends*, `redis`, `semantic_cache`, `logging`/`alerts`/`audit` delivery, `metrics`) reports them in `restart_required` rather than pretending to apply them. Circuit breakers and provider adapters survive the swap by design (`breaker.register()` is idempotent — a reload is not a health event; the adapters own the HTTP client). The event bus likewise survives: its queue and dispatcher keep running while the handler set swaps (`queue_size` applies at restart).
 
-Shutdown is the mirror image of composition, in reverse dependency order: `/readyz` flips to 503 first (load balancers route elsewhere), in-flight requests finish (uvicorn's graceful window), tracked background work — `pipeline._spawn`'d spend accounting, shadow mirrors, prompt A/B — drains (bounded at 10s), then the log queue and the event dispatcher's pending observer deliveries (both drain, never drop), telemetry, HTTP clients and finally the engine close. Liveness (`/healthz`) deliberately checks nothing but the process, so a wedged dependency fails readiness without also getting the pod killed.
+Shutdown is the mirror image of composition, in reverse dependency order: `/readyz` flips to 503 first (load balancers route elsewhere), in-flight requests finish (uvicorn's graceful window), tracked background work — `pipeline._spawn`'d spend accounting, shadow mirrors, prompt A/B, candidate-trial runs — drains (bounded at 10s), then the log queue and the event dispatcher's pending observer deliveries (both drain, never drop), telemetry, HTTP clients and finally the engine close. Liveness (`/healthz`) deliberately checks nothing but the process, so a wedged dependency fails readiness without also getting the pod killed.
 
 ---
 
@@ -2179,6 +2298,27 @@ tests/
 │                        bodies-off (verdicts survive, excerpts honestly null),
 │                        platform-admin-only, prompt_variant + pre-tier-35
 │                        rows excluded, 400s on bad/missing params
+├── test_trials.py       Candidate trials (tier 36): clamp_params units (missing
+│                        = ceiling, explicit clamped), the e2e run (captured
+│                        chats replay against a candidate on ANOTHER model,
+│                        verdicts folded into run rows, both sides in the
+│                        drilldown), divergent scoring + the verdict-filter
+│                        review queue, the not_comparable honesty pin (a
+│                        response-rewritten primary — PII-masked client body —
+│                        scores not_comparable, never fake divergence; the
+│                        candidate's raw answer still lands on its row), the
+│                        between-wave cost cap (first wave runs, next refused),
+│                        concurrency-bounded waves (mock upstream high-water
+│                        mark), cancel-wins-within-one-wave (in-flight wave
+│                        counted, then stopped; re-cancel 409), selection
+│                        (error/embedding/mirror rows never replay),
+│                        unparseable-capture skips, the empty window
+│                        (no_entries), mirror-like isolation (key spend
+│                        untouched, a failing candidate's breaker stays closed),
+│                        standing shadow-diff unaffected by trial rows, 403s
+│                        for tenant/plain keys on all five endpoints, validation
+│                        400s + the disabled 404, the startup sweep + the
+│                        guarded claim (a cancelled run can never start)
 ├── test_usage_export.py  /admin/usage/export: CSV columns/order/attachment download,
 │                        JSON summary + by_key/by_model/by_status aggregates, key/model/
 │                        status filters, time windows (default 30d, naive=UTC), shadow

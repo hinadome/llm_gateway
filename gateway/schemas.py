@@ -522,3 +522,22 @@ class ReplayRequest(BaseModel):
     diff)."""
 
     entries: list[dict] = Field(min_length=1)
+
+
+class TrialCreateRequest(BaseModel):
+    """POST /admin/trials (tier 36) — replay a captured traffic window
+    against a candidate deployment. ``model`` selects the window (that
+    public model's logged chat traffic), ``deployment`` the candidate
+    (any configured deployment — it need not belong to the model; the
+    adapter maps to its upstream model). ``since``/``until`` (ISO-8601)
+    bound the window; the three caps are clamped to the ``trials:``
+    ceilings server-side, so asking for more than allowed just runs
+    at the ceiling."""
+
+    model: str = Field(min_length=1, max_length=128)
+    deployment: str = Field(min_length=1, max_length=128)
+    since: str | None = Field(default=None, max_length=40)
+    until: str | None = Field(default=None, max_length=40)
+    limit: int | None = Field(default=None, ge=1)
+    concurrency: int | None = Field(default=None, ge=1)
+    max_cost_usd: float | None = Field(default=None, gt=0)

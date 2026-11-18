@@ -205,6 +205,11 @@ class RequestContext:
     # SQL aggregates skip it. The raw score ships so re-bucketing with
     # different thresholds is possible after the fact.
     shadow_similarity: float | None = None
+    # Candidate trials (tier 36): the trial run this shadow row belongs
+    # to (core/trials.py replays a captured primary against a candidate
+    # deployment). None on every other row — mirrors, primaries, prompt
+    # A/B.
+    trial_id: str | None = None
     # The library prompt this request was served with (set at step 0.5
     # when the key references one) — drives prompt A/B mirroring.
     library_prompt: Any | None = None

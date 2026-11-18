@@ -311,6 +311,33 @@
       </div>
       <div style="overflow-x:auto"><table id="shadow-diff-table"></table></div>
     </div>
+    <div class="panel" style="margin-top:14px">
+      <div class="ph">Candidate trials
+        <div class="right muted" style="font-weight:400;font-size:12px">deliberate replay of a captured window against a candidate &middot; real upstream calls &middot; throttled + spend-capped &middot; scored like mirrors</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1.3fr 1.3fr 1.2fr .7fr .8fr .8fr auto;gap:8px;align-items:end;margin-bottom:12px">
+        <label class="fld">Model (captured window)
+          <select id="trial-model"></select>
+        </label>
+        <label class="fld" title="Any configured deployment — it need not belong to the replayed model; the adapter maps the request to its upstream model.">Candidate deployment
+          <select id="trial-deployment"></select>
+        </label>
+        <label class="fld" title="ISO-8601; empty replays the newest captured traffic.">Since (optional)
+          <input id="trial-since" placeholder="2026-11-01T00:00:00Z" autocomplete="off">
+        </label>
+        <label class="fld" title="Entries to replay — clamped to the trials.max_entries ceiling.">Limit
+          <input id="trial-limit" type="number" min="1" placeholder="200" autocomplete="off">
+        </label>
+        <label class="fld" title="Upstream calls per wave — clamped to trials.max_concurrency.">Concurrency
+          <input id="trial-concurrency" type="number" min="1" placeholder="2" autocomplete="off">
+        </label>
+        <label class="fld" title="Cumulative candidate spend the run may accrue — clamped to trials.max_cost_usd; stops before the next wave.">Max cost ($)
+          <input id="trial-cost" type="number" min="0.01" step="0.01" placeholder="1.00" autocomplete="off">
+        </label>
+        <button class="primary" id="btn-newtrial">Run trial</button>
+      </div>
+      <div style="overflow-x:auto"><table id="trials-table"></table></div>
+    </div>
   </section>
 
   <!-- Guardrails -->
@@ -1566,6 +1593,7 @@ async function loadRouting() {
   }
   $("#routing-table").innerHTML = html + "</tbody>";
   await loadShadowDiff();
+  await loadTrials(r);
 }
 $("#routing-table").addEventListener("click", async e => {
   const btn = e.target.closest("button[data-reset]");
@@ -1585,7 +1613,7 @@ const VERDICT_BADGE = {
   exact: "b-green", near: "b-blue", divergent: "b-amber",
   shadow_error: "b-red", not_comparable: "b-gray",
 };
-const shadowPairs = { model: null, deployment: null, verdict: null, limit: 25, offset: 0, total: 0 };
+const shadowPairs = { model: null, deployment: null, verdict: null, trialId: null, limit: 25, offset: 0, total: 0 };
 
 function signedDelta(v, fmt) {
   if (v == null) return "—";
@@ -1657,7 +1685,7 @@ function pairSideHtml(label, side, missingText) {
 }
 
 async function openShadowPairs(model, deployment, verdict) {
-  Object.assign(shadowPairs, { model, deployment, verdict, offset: 0, total: 0 });
+  Object.assign(shadowPairs, { model, deployment, verdict, trialId: null, offset: 0, total: 0 });
   $("#shadow-pairs-title").textContent = `Shadow pairs — ${model} / ${deployment}` + (verdict ? ` · ${verdict}` : "");
   $("#shadow-pairs-list").innerHTML = "";
   $("#dlg-shadow-pairs").showModal();
@@ -1666,13 +1694,22 @@ async function openShadowPairs(model, deployment, verdict) {
 
 async function loadShadowPairsPage() {
   const s = shadowPairs;
-  const params = new URLSearchParams({ model: s.model, deployment: s.deployment, limit: s.limit, offset: s.offset });
-  if (s.verdict) params.set("verdict", s.verdict);
-  const r = await api("/admin/shadow-diff/pairs?" + params);
+  // The same dialog serves live mirror pairs and candidate-trial pairs
+  // (tier 36): a trialId in the state swaps the endpoint — the payload
+  // shape is identical by design.
+  const params = new URLSearchParams({ limit: s.limit, offset: s.offset });
+  if (s.trialId) {
+    if (s.verdict) params.set("verdict", s.verdict);
+  } else {
+    params.set("model", s.model);
+    params.set("deployment", s.deployment);
+    if (s.verdict) params.set("verdict", s.verdict);
+  }
+  const r = await api((s.trialId ? `/admin/trials/${s.trialId}/pairs?` : "/admin/shadow-diff/pairs?") + params);
   s.total = r.total;
   const list = $("#shadow-pairs-list");
   if (!r.data.length && s.offset === 0) {
-    list.innerHTML = `<div class="muted">No pairs${s.verdict ? ` with verdict '${s.verdict}'` : ""} scored for this deployment.</div>`;
+    list.innerHTML = `<div class="muted">No pairs${s.verdict ? ` with verdict '${s.verdict}'` : ""} scored for this ${s.trialId ? "trial" : "deployment"}.</div>`;
   }
   for (const p of r.data) {
     const badge = `<span class="b ${VERDICT_BADGE[p.verdict] || "b-gray"}">${esc(p.verdict || "")}</span>`;
@@ -1693,6 +1730,109 @@ async function loadShadowPairsPage() {
   $("#shadow-pairs-more").hidden = s.offset >= s.total;
 }
 $("#shadow-pairs-more").addEventListener("click", loadShadowPairsPage);
+
+// ---------- candidate trials (tier 36) ----------------------------------
+
+const TRIAL_BADGE = { completed: "b-green", running: "b-blue", pending: "b-amber", cancelled: "b-gray", failed: "b-red" };
+
+function fillSelect(el, names, current) {
+  const seen = new Set();
+  let html = "";
+  for (const n of names) {
+    if (seen.has(n)) continue;
+    seen.add(n);
+    html += `<option value="${esc(n)}"${n === current ? " selected" : ""}>${esc(n)}</option>`;
+  }
+  el.innerHTML = html;
+}
+
+async function loadTrials(routing) {
+  // Form selects come from the routing payload the tab already holds;
+  // the runs table is its own endpoint. Errors render in place (the
+  // routing table above must keep working for tenant admins, who get
+  // 403 here — pairs carry request bodies, which cross tenants).
+  const models = (routing.models || []).map(m => m.name);
+  const deployments = [];
+  for (const m of routing.models || []) for (const d of m.deployments || []) deployments.push(d.name);
+  const selM = $("#trial-model"), selD = $("#trial-deployment");
+  const prevM = selM.value, prevD = selD.value;
+  fillSelect(selM, models, prevM || models[0]);
+  fillSelect(selD, deployments, prevD || deployments[0]);
+  let r;
+  try { r = await api("/admin/trials?limit=100"); }
+  catch (e) {
+    $("#trials-table").innerHTML = `<tbody><tr><td class="muted">${esc(e.message || e)}</td></tr></tbody>`;
+    return;
+  }
+  if (!r.data.length) {
+    $("#trials-table").innerHTML = `<tbody><tr><td class="muted">No trial runs yet. Pick a model's captured window and a candidate deployment above — the gateway replays it with real upstream calls (throttled, spend-capped) and scores every pair like a mirror.</td></tr></tbody>`;
+    return;
+  }
+  let html = "<thead><tr><th>Run</th><th>Model &rarr; candidate</th><th>Status</th><th class=num>Progress</th><th>Verdicts</th><th class=num>Cost</th><th>Created</th><th></th></tr></thead><tbody>";
+  for (const t of r.data) {
+    const verdicts = t.summary ? [
+      ["exact", t.summary.exact], ["near", t.summary.near], ["divergent", t.summary.divergent],
+      ["shadow_error", t.summary.shadow_error], ["not_comparable", t.summary.not_comparable],
+    ].filter(([, n]) => n > 0)
+     .map(([v, n]) => `<span class="b ${VERDICT_BADGE[v]}" title="trial rows with verdict ${v}">${n} ${v.replace(/_/g, " ")}</span>`)
+     .join(" ") : "";
+    const progress = `${fmtInt(t.completed)}/${fmtInt(t.selected)}` + (t.skipped ? ` <span class="muted" style="font-size:11px">(+${t.skipped} skipped)</span>` : "");
+    html += `<tr>
+      <td class="mono" title="${esc(t.id)}">${esc(t.id.slice(0, 8))}</td>
+      <td class="mono" style="font-size:12px">${esc(t.model)} &rarr; ${esc(t.deployment)}</td>
+      <td><span class="b ${TRIAL_BADGE[t.status] || "b-gray"}">${esc(t.status)}</span>${t.stop_reason ? ` <span class="muted" style="font-size:11px">${esc(t.stop_reason)}</span>` : ""}</td>
+      <td class="num">${progress}</td>
+      <td>${verdicts || '<span class="muted">—</span>'}</td>
+      <td class="num">${fmtUsd(t.cost_usd)}</td>
+      <td class="muted" style="font-size:12px">${fmtWhen(t.created_at)}</td>
+      <td>
+        <button class="small ghost" data-trial-pairs="${esc(t.id)}" title="Both sides of every replayed pair">Pairs</button>
+        ${(t.summary && t.summary.divergent > 0) ? `<button class="small ghost" data-trial-pairs="${esc(t.id)}" data-trial-verdict="divergent">Divergent ${t.summary.divergent}</button>` : ""}
+        ${["pending", "running"].includes(t.status) ? `<button class="small ghost" data-trial-cancel="${esc(t.id)}">Cancel</button>` : ""}
+      </td></tr>`;
+  }
+  $("#trials-table").innerHTML = html + "</tbody>";
+}
+$("#btn-newtrial").addEventListener("click", async () => {
+  const body = {
+    model: $("#trial-model").value,
+    deployment: $("#trial-deployment").value,
+  };
+  if ($("#trial-since").value.trim()) body.since = $("#trial-since").value.trim();
+  if ($("#trial-limit").value) body.limit = Number($("#trial-limit").value);
+  if ($("#trial-concurrency").value) body.concurrency = Number($("#trial-concurrency").value);
+  if ($("#trial-cost").value) body.max_cost_usd = Number($("#trial-cost").value);
+  try {
+    const t = await api("/admin/trials", { method: "POST", body: JSON.stringify(body) });
+    toast(`Trial ${t.id.slice(0, 8)} started — ${t.params.limit} entr${t.params.limit === 1 ? "y" : "ies"} at concurrency ${t.params.concurrency}, capped at $${t.params.max_cost_usd}`);
+    loadRouting();
+  } catch (err) { toast(err.message, true); }
+});
+$("#trials-table").addEventListener("click", async e => {
+  const pairs = e.target.closest("button[data-trial-pairs]");
+  if (pairs) {
+    const id = pairs.dataset.trialPairs;
+    const trial = (await api(`/admin/trials/${id}`));
+    Object.assign(shadowPairs, {
+      model: trial.model, deployment: trial.deployment,
+      verdict: pairs.dataset.trialVerdict || null, trialId: id, offset: 0, total: 0,
+    });
+    $("#shadow-pairs-title").textContent = `Trial pairs — ${trial.model} / ${trial.deployment}` + (shadowPairs.verdict ? ` · ${shadowPairs.verdict}` : "");
+    $("#shadow-pairs-list").innerHTML = "";
+    $("#dlg-shadow-pairs").showModal();
+    await loadShadowPairsPage();
+    return;
+  }
+  const cancel = e.target.closest("button[data-trial-cancel]");
+  if (!cancel) return;
+  const id = cancel.dataset.trialCancel;
+  if (!confirm(`Cancel trial ${id.slice(0, 8)}? A live run stops within one wave; replayed pairs stay.`)) return;
+  try {
+    await api(`/admin/trials/${id}/cancel`, { method: "POST" });
+    toast("Trial cancelled");
+    loadRouting();
+  } catch (err) { toast(err.message, true); }
+});
 
 // ---------- system -----------------------------------------------------
 

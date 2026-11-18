@@ -169,6 +169,7 @@ def _pair_conditions(
     deployment: str | None = None,
     verdict: str | None = None,
     since=None,
+    trial_id: str | None = None,
 ) -> list:
     """The WHERE terms shared by the aggregate and the drilldown.
 
@@ -178,11 +179,22 @@ def _pair_conditions(
     re-guessed. The primary join condition (not a WHERE term) is LEFT:
     a primary can be missing (retention pruning, legacy rows) — the
     pair still scored, only its baseline deltas are absent.
+
+    Tier 36: ``trial_id`` scopes the pair set. None (the standing
+    scope) excludes candidate-trial rows — a deliberate replay is an
+    experiment, not live mirroring, and would double-count a candidate
+    already shadow-mirrored; a non-null value selects exactly that
+    trial's pairs (the /admin/trials/{id}/pairs drilldown).
     """
     terms = [
         shadow.shadow.is_(True),
         shadow.prompt_variant.is_(None),
         shadow.shadow_verdict.is_not(None),
+        (
+            shadow.trial_id.is_(None)
+            if trial_id is None
+            else shadow.trial_id == trial_id
+        ),
     ]
     if model is not None:
         terms.append(shadow.model == model)
@@ -206,6 +218,7 @@ async def aggregate(
     session,
     model: str | None = None,
     since=None,
+    trial_id: str | None = None,
 ) -> dict:
     """Migration evidence per (model, shadow deployment).
 
@@ -215,6 +228,11 @@ async def aggregate(
     token deltas against the paired primaries. A group with zero
     comparable pairs reports null similarity/match-rate rather than a
     misleading number.
+
+    ``trial_id`` (tier 36): None keeps the standing scope — live
+    mirroring only, candidate-trial rows excluded; a trial id scopes
+    the aggregate to that run (its rows share the trial's model and
+    candidate deployment, so they collapse into one group).
     """
     shadow = aliased(RequestLog)
     primary = aliased(RequestLog)
@@ -244,7 +262,11 @@ async def aggregate(
         )
         .select_from(shadow)
         .outerjoin(primary, _primary_join(primary, shadow))
-        .where(*_pair_conditions(shadow, primary, model=model, since=since))
+        .where(
+            *_pair_conditions(
+                shadow, primary, model=model, since=since, trial_id=trial_id
+            )
+        )
         .group_by(shadow.model, shadow.deployment, shadow.provider)
         .order_by(shadow.model, shadow.deployment)
     )
@@ -319,6 +341,7 @@ async def pairs(
     verdict: str | None = None,
     limit: int = 25,
     offset: int = 0,
+    trial_id: str | None = None,
 ) -> dict:
     """The drilldown: individual scored pairs for one shadow deployment,
     newest first — the divergent ones are the migration review queue.
@@ -327,12 +350,21 @@ async def pairs(
     stored bodies' text excerpts; ``primary.text``/``shadow.text`` are
     null when the bodies were not persisted (the verdict still exists
     — it was computed in memory at mirror time).
+
+    ``trial_id`` (tier 36): None keeps the standing scope (live
+    mirrors); a trial id returns that run's pairs instead — same
+    shape, so the admin panel's drilldown dialog serves both.
     """
     limit = max(1, min(limit, 100))
     shadow = aliased(RequestLog)
     primary = aliased(RequestLog)
     conditions = _pair_conditions(
-        shadow, primary, model=model, deployment=deployment, verdict=verdict
+        shadow,
+        primary,
+        model=model,
+        deployment=deployment,
+        verdict=verdict,
+        trial_id=trial_id,
     )
     rows_stmt = (
         select(shadow, primary)

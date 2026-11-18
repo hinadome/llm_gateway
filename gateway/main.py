@@ -60,6 +60,7 @@ from .core.prompt_library import PromptLibrary
 from .core.pipeline import GatewayPipeline
 from .core.ratelimit import RateLimiter
 from .core.runaway import RunawayProtector
+from .core.trials import sweep_stale as sweep_stale_trials
 from .core.concurrency import ConcurrencyLimiter
 from .core.vault import VaultService
 from .core.redis_backends import (
@@ -399,6 +400,20 @@ def create_app(
         await init_engine(settings.database_url)
         app.state.admin_key = await ensure_admin_key(settings)
         await ensure_default_key()
+        # Candidate trials (tier 36): a run whose process died stays
+        # "running" forever otherwise. The sweep cancels orphans —
+        # unconditionally, because a trial created while trials were
+        # enabled can outlive a config reload that disables them.
+        # Cross-replica honest: a run LIVE on another replica sees the
+        # cancel at its next between-wave check and stops within one
+        # wave. Under pytest (ASGITransport skips the lifespan) the
+        # sweep never runs — tests call it directly.
+        try:
+            swept = await sweep_stale_trials(get_sessionmaker())
+            if swept:
+                logger.info("candidate trials: cancelled %d orphaned run(s)", swept)
+        except Exception:  # noqa: BLE001 — startup must not die on this
+            logger.exception("candidate-trial startup sweep failed")
         # Log retention: prune once at startup, then periodically. Best
         # effort — a failed prune logs and retries on the next interval.
         prune_task: asyncio.Task | None = None

@@ -725,6 +725,40 @@ class ReplayConfig(BaseModel):
     max_entries: int = 500
 
 
+class TrialsConfig(BaseModel):
+    """Candidate trials (tier 36): the deliberate-replay leg of the
+    provider-migration epic. ``POST /admin/trials`` takes a captured
+    traffic window (request-log rows of one public model with stored
+    bodies) and replays it against a named candidate deployment — real
+    upstream calls, unlike the dry-run replay harness — writing shadow
+    request-log rows that score with the tier-35 verdict vocabulary
+    (``core/shadow_diff``). This is for candidates shadow mirroring
+    hasn't seen enough traffic for, or that aren't wired as shadow
+    deployments.
+
+    Trial runs are THROTTLED and SPEND-CAPPED, and deliberately
+    mirror-like: no guardrails, no rate-limit/budget/idempotency
+    counters, no cache, no breaker bookkeeping (a trial must not
+    punish a serving deployment), no metrics — the run row plus the
+    scored log rows are the evidence surface.
+
+    The three ``max_*`` fields are *ceilings*: per-run values in the
+    POST are clamped into range, so a caller can never ask for more
+    replay volume, parallelism or spend than the platform allows.
+    """
+
+    enabled: bool = True
+    # Ceiling for per-run ``limit`` (replayed entries per run).
+    max_entries: int = 200
+    # Ceiling for per-run ``concurrency`` (upstream calls in flight per
+    # wave; waves run to completion before the next starts, and the
+    # cost cap + cancel checks happen between waves).
+    max_concurrency: int = 2
+    # Ceiling for per-run ``max_cost_usd`` (cumulative candidate spend
+    # the run may accrue before the next wave is refused).
+    max_cost_usd: float = 1.0
+
+
 class RunawayConfig(BaseModel):
     """Runaway-agent protection: loop detection with an escalating
     cooldown jail.
@@ -942,6 +976,7 @@ class GatewayConfig(BaseModel):
     pii_scan: PIIScanConfig = Field(default_factory=PIIScanConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
+    trials: TrialsConfig = Field(default_factory=TrialsConfig)
     runaway: RunawayConfig = Field(default_factory=RunawayConfig)
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)

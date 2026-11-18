@@ -93,6 +93,31 @@ async def test_admin_ui_shadow_diff_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_trials_surface(env):
+    # Tier 36: the routing tab also carries the candidate-trials
+    # panel — the run form (model/candidate selects, window + the
+    # three clamped caps) and the runs table whose Pairs buttons feed
+    # the same drilldown dialog as shadow pairs.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="trials-table"',
+        'id="trial-model"',
+        'id="trial-deployment"',
+        'id="trial-since"',
+        'id="trial-limit"',
+        'id="trial-concurrency"',
+        'id="trial-cost"',
+        'id="btn-newtrial"',
+        "loadTrials",
+        "/admin/trials",
+        "data-trial-pairs",
+        "data-trial-verdict",
+        "data-trial-cancel",
+        "TRIAL_BADGE",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307
