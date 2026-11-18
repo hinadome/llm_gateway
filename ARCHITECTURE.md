@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 88 Python files, ~32,380 lines, 1219 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 89 Python files, ~32,900 lines, 1229 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -596,6 +596,30 @@ gateway/
 │                           the invoice keeps serving; require_admin
 │                           with the invoice's tenant scoping;
 │                           detection lives in core/finops.py),
+│                           spend forecasts (tier 47, GET
+│                           /admin/forecasts — the invoice's
+│                           forward-looking sibling: where will
+│                           this month land? Two projections per
+│                           key and per tenant over the billing
+│                           lens — the run-rate (spend so far
+│                           over the elapsed fraction, scaled to
+│                           the month) and the recent pace (the
+│                           last 7 days' daily spend, bounded to
+│                           the month, carried over the
+│                           remaining days) — with the trend
+│                           ratio beside them and the budget
+│                           verdicts decided by the recent pace
+│                           when both exist (verdict_based_on
+│                           says which); a complete month serves
+│                           its actuals (month_complete — the
+│                           invoice IS the final bill), a trend
+│                           needs 2+ days of month and a nonzero
+│                           average, the clock context (elapsed/
+│                           remaining days) ships in the envelope
+│                           so every number is auditable against
+│                           the response itself; require_admin
+│                           with the invoice's tenant scoping;
+│                           the math lives in core/forecasts.py),
 │                           routing/guardrail introspection
 │                           (/admin/routing echoes each model's
 │                           context_window, the cost_aware flag and
@@ -1363,6 +1387,44 @@ gateway/
 │   │                       invoice's tenant scoping, and
 │   │                       enabled=false serves an honest empty
 │   │                       list while the invoice keeps serving
+│   ├── forecasts.py     Spend forecasts (tier 47): the invoice's
+│   │                       forward-looking sibling — where will
+│   │                       this month land? Two projections over
+│   │                       the billing lens (the measure_between
+│   │                       rule: shadow/trial rows excluded,
+│   │                       cache hits included): the run-rate
+│   │                       (spend so far over the elapsed
+│   │                       fraction, scaled to the month) and
+│   │                       the recent pace (the last 7 days'
+│   │                       daily spend, bounded to the month,
+│   │                       carried over the remaining days); the
+│   │                       trend ratio (recent daily over
+│   │                       month-to-date daily) and the budget
+│   │                       verdicts ride along, decided by the
+│   │                       recent pace when both exist
+│   │                       (verdict_based_on says which). The
+│   │                       honesty rules: a complete month serves
+│   │                       its actuals as the projection
+│   │                       (month_complete — the invoice IS the
+│   │                       final bill), a trend needs
+│   │                       _MIN_TREND_DAYS of month and a nonzero
+│   │                       month average (null, never a guess or
+│   │                       an invented infinity), no budget →
+│   │                       pct and verdict null. The measure/
+│   │                       pure split: measure_between (one
+│   │                       grouped aggregation per window, plain
+│   │                       range predicates — UTC arithmetic
+│   │                       pinned in Python, no SQL date
+│   │                       functions, so the calendar means the
+│   │                       same on SQLite and PostgreSQL),
+│   │                       project pure, rollup pure (keys into
+│   │                       tenants — the invoice's zero-usage/
+│   │                       deleted-key rules, month-end
+│   │                       projections leading the sort), and
+│   │                       forecast composing them. No config: the
+│   │                       window is a module constant and
+│   │                       parse_month the invoice's own contract
+│   │                       (same months, same 400s)
 │   ├── pii_scan.py        PII/secret scan over stored bodies (the audit
 │   │                       that answers "did secrets land in the request
 │   │                       log?"): detectors mirror the pii_redaction
@@ -1930,7 +1992,26 @@ gateway/
                             — and a future month surfaces as the
                             endpoint's 400, never a fake empty
                             statement; tenant admins see their own
-                            tenant by construction), the finops
+                            tenant by construction), the forecast
+                            panel (tier 47: the invoice's forward-
+                            looking sibling — where will this month
+                            land? reads GET /admin/forecasts
+                            between the statement and the flags,
+                            sharing its month picker; cards for
+                            the projected month-end (the recent-
+                            pace projection when both exist, a
+                            "final" say-so on a complete month),
+                            spend so far and the daily pace (the
+                            trend ratio in the sub line — "—" is
+                            honest: under two days of month, a
+                            zero average, or the month complete),
+                            tenants + keys tables in the invoice's
+                            shapes — both projections in one cell
+                            with the other a tooltip away, verdict
+                            badges projected-vs-budget at the
+                            80/100% thresholds ("—" when no
+                            budget), the clock context in the
+                            period line), the finops
                             flags panel (tier 46: the invoice's
                             follow-up — is any of this unusual?
                             reads GET /admin/anomalies right after
@@ -3395,6 +3476,36 @@ tests/
 │                        empty list with the bounds still served,
 │                        the invoice untouched). A fifth UI-surface
 │                        pin covers the flags panel
+│                        (tests/test_admin_ui.py)
+├── test_forecasts.py    Spend forecasts (tier 47): pure units —
+│                        the projection math (run-rate vs recent
+│                        pace mid-month, the recent window bounded
+│                        to the month's elapsed days — day one's
+│                        two projections are identical because the
+│                        window IS the month so far — a complete
+│                        month serving its actuals with trend
+│                        null, and the stopped/accelerated/
+│                        started-from-zero shapes: trend 0.0 flat,
+│                        trend > 1, trend null against a zero
+│                        average, never an invented infinity) and
+│                        the rollup (verdicts against budgets at
+│                        the 80/100% thresholds, no-budget honest
+│                        nulls, month-end ordering, zero-spend
+│                        keys projecting $0 of their budgets,
+│                        deleted keys where they lived, tenant
+│                        totals recomputed from the raw rows);
+│                        e2e — the seeded story (a two-phase
+│                        spender, every number recomputed from
+│                        the envelope's own rounded clock context,
+│                        verdicts against real budgets, the
+│                        unassigned bucket riding the totals),
+│                        scoping (tenant admin forced, plain key
+│                        403, platform ?tenant_id=), the month
+│                        rules (a complete month's actuals, future
+│                        and malformed months the invoice's 400)
+│                        and the lens (a shadow storm + trial
+│                        replay project toward nothing). A sixth
+│                        UI pin covers the forecast panel
 │                        (tests/test_admin_ui.py)
 ├── test_presidio_guardrail.py  Presidio detector (module-scoped engines: NLP + pattern-only),
 │                        entity validation, block/redact, response masking, e2e through the app

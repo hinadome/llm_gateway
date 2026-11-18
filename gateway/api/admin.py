@@ -35,6 +35,7 @@ from ..core.replay import replay_entries
 from ..core.shadow_diff import VERDICTS, aggregate as shadow_aggregate, pairs as shadow_pairs
 from ..core import billing as billing_core
 from ..core import finops as finops_core
+from ..core import forecasts as forecasts_core
 from ..core import migration as migration_core
 from ..core import promotion as promotion_core
 from ..core import slos as slos_core
@@ -1852,6 +1853,57 @@ async def anomaly_flags(
     return {
         "object": "anomalies",
         "config": config.finops.model_dump(),
+        **data,
+    }
+
+
+@router.get("/admin/forecasts")
+async def spend_forecast(
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_admin)],
+    month: str | None = None,
+    tenant_id: str | None = None,
+) -> dict:
+    """Spend forecasts (tier 47): the invoice's forward-looking
+    sibling — where will this month land? Two projections over the
+    same client-consumed rows (the billing lens: shadow mirrors and
+    trial replays excluded, cache hits included): the **run-rate**
+    (spend so far over the elapsed fraction of the month, scaled to
+    the whole month) and the **recent pace** (the last 7 days' daily
+    spend carried over the remaining days, on top of the booked
+    spend — the correction for keys that stopped or accelerated).
+    The trend ratio (recent daily over month-to-date daily) ships
+    with them, and the projected-vs-budget verdicts — over budget /
+    at risk ≥80% / within, decided by the recent pace when one
+    exists (`verdict_based_on` says which) — sit beside both, per
+    key and per tenant, every existing key included (an unused key
+    projects $0 of its budget: information, not an absence).
+
+    The honesty rules: a COMPLETE month is not forecast — a past
+    month serves its actual total as the projection
+    (`month_complete: true`, remaining days 0, trend null): the
+    invoice IS the final bill, and projecting a finished month
+    would be a lie told with extra steps. A future or malformed
+    month is the invoice's 400. A trend needs two days of month —
+    less is hours of evidence dressed as a line, so `trend_ratio`
+    is null there (the projections still ship, and
+    `elapsed_days` rides in the envelope so the reader judges the
+    day-one noise themselves). No budget set → projected pct and
+    verdict null, never a fake zero.
+
+    Read at request time — no loop, no state, no config. Tenant
+    admins see their own tenant only (the scope is forced, even
+    when they ask for another); platform admins may filter
+    ``?tenant_id=`` or read the whole platform.
+    """
+    effective_tenant = admin.tenant_id if admin.tenant_id is not None else tenant_id
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        data = await forecasts_core.forecast(
+            session, month, tenant_id=effective_tenant
+        )
+    return {
+        "object": "forecast",
         **data,
     }
 

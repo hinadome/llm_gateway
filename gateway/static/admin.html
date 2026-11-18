@@ -317,6 +317,17 @@
       <div class="pb muted" style="font-size:12px" id="inv-period"></div>
       <div class="cards" id="inv-cards"></div>
     </div>
+    <div class="panel" id="forecast-panel">
+      <div class="ph">Month-end forecast
+        <div class="right muted" style="font-weight:400;font-size:12px" id="forecast-period"></div>
+      </div>
+      <div class="pb muted" style="font-size:12px">run-rate (straight-line over the elapsed month) and recent-pace (the last 7 days carried over the rest) projections — the recent pace decides the verdict when both exist. A complete month is its actuals, not a projection.</div>
+      <div class="cards" id="forecast-cards"></div>
+      <div class="pb" style="margin-top:2px"><b>Tenants</b> — projected month-end spend vs the pooled budget, platform keys in their own row</div>
+      <div style="overflow-x:auto"><table id="forecast-tenants"></table></div>
+      <div class="pb" style="margin-top:2px"><b>Keys</b> — every key projected, an unused one honestly at $0</div>
+      <div style="overflow-x:auto"><table id="forecast-keys"></table></div>
+    </div>
     <div class="panel" id="finops-panel" style="display:none">
       <div class="ph">Finops flags
         <div class="right muted" style="font-weight:400;font-size:12px" id="finops-period"></div>
@@ -1870,6 +1881,10 @@ async function loadInvoices() {
   $("#inv-lines").innerHTML = "<thead><tr><th>Tenant</th><th>Key</th><th>Model</th><th class=num>Requests</th><th class=num>Errors</th><th class=num>Prompt</th><th class=num>Completion</th><th class=num>Cached</th><th class=num>Cost</th></tr></thead><tbody>" +
     (lineRows || `<tr><td colspan="9" class="empty">No line items in ${esc(month)}</td></tr>`) + "</tbody>";
 
+  // The forecast rides with the statement (before the flags — where
+  // will it land, then is any of it unusual): the loadOverview→
+  // loadSLOs pattern, one shared month picker.
+  await loadForecasts();
   // The flags ride with the statement (the loadOverview→loadSLOs
   // pattern): the anomalies are read beside the invoice.
   await loadAnomalies();
@@ -1900,6 +1915,85 @@ $("#btn-invoice-csv").addEventListener("click", async () => {  // the CSV is a f
     toast("Invoice CSV downloaded");
   } catch (e) { toast("Invoice CSV failed: " + (e.message || e), true); }
 });
+
+// ---------- forecasts (tier 47): the month-end projection -----------------
+// Where will this month land? Two projections beside the invoice:
+// the run-rate (spend so far over the elapsed fraction, scaled to
+// the month) and the recent pace (the last 7 days' daily spend
+// carried over the remaining days). The recent pace decides the
+// verdicts when both exist — it corrects for spenders that stopped
+// or accelerated — and both always render, the other line a
+// tooltip away. A complete month renders its actuals with a "final"
+// say-so: the invoice IS the final bill, and projecting the past
+// would be a lie told with extra steps.
+
+const FC_VERDICT = { over_budget: "b-red", at_risk: "b-amber", within_budget: "b-green" };
+
+function fcProjectionCell(section) {
+  // The effective projection — the recent pace's when one exists
+  // (the module's rule), the run-rate's otherwise — with both lines
+  // a tooltip away. No budget sections (verdict_based_on null) pick
+  // by the same daily-pace rule, not by the verdict.
+  const value = section.recent_pace.daily_usd != null
+    ? section.recent_pace.projected_month_usd
+    : section.run_rate.projected_month_usd;
+  const tip = `run-rate ${fmtUsd(section.run_rate.projected_month_usd)} · recent pace ${fmtUsd(section.recent_pace.projected_month_usd)}`;
+  return `<span title="${esc(tip)}">${fmtUsd(value)}</span>`;
+}
+
+function fcTrendCell(section) {
+  if (section.trend_ratio == null)
+    return '<span class="b b-gray" title="no trend yet — under two days of month, a zero average so far, or the month is complete">—</span>';
+  const tip = "recent daily pace over the month-to-date daily average";
+  return `<span class="b ${section.trend_ratio >= 1 ? "b-amber" : "b-green"}" title="${esc(tip)}">${section.trend_ratio}x</span>`;
+}
+
+function fcVerdictCell(section) {
+  if (section.verdict == null)
+    return '<span class="b b-gray" title="no monthly budget set — nothing to compare against">—</span>';
+  const tip = `projected ${Math.round(section.projected_pct_of_budget)}% of ${fmtUsd(section.monthly_budget_usd)} by month end — the ${section.verdict_based_on} projection`;
+  return `<span class="b ${FC_VERDICT[section.verdict]}" title="${esc(tip)}">${Math.round(section.projected_pct_of_budget)}% ${esc(section.verdict.replace(/_/g, " "))}</span>`;
+}
+
+async function loadForecasts() {
+  const month = state.invMonth || new Date().toISOString().slice(0, 7);
+  const f = await api("/admin/forecasts?month=" + encodeURIComponent(month));
+  const t = f.totals;
+  $("#forecast-period").textContent = f.month_complete
+    ? `${month} is complete — these are the actuals, not a projection`
+    : `${f.elapsed_days.toFixed(1)} of ${f.days_in_month} days elapsed · ${f.remaining_days.toFixed(1)} remaining`;
+  const projected = t.recent_pace.daily_usd != null
+    ? t.recent_pace.projected_month_usd
+    : t.run_rate.projected_month_usd;
+  $("#forecast-cards").innerHTML = `
+    <div class="card"><div class="k">Projected month-end${f.month_complete ? " (final)" : ""}</div><div class="v">${fmtUsd(projected)}</div><div class="sub">${f.month_complete ? "the month is over — the invoice is the final bill" : "recent-pace projection"}</div></div>
+    <div class="card"><div class="k">Spend so far</div><div class="v">${fmtUsd(t.spend_so_far_usd)}</div><div class="sub">${fmtInt(t.requests)} requests</div></div>
+    <div class="card"><div class="k">Daily pace</div><div class="v">${fmtUsd(t.recent_pace.daily_usd != null ? t.recent_pace.daily_usd : t.run_rate.daily_usd)}</div><div class="sub">run-rate ${fmtUsd(t.run_rate.daily_usd)}/day${t.trend_ratio != null ? " · trend " + t.trend_ratio + "x" : " · trend —"}</div></div>`;
+
+  // Tenants + the unassigned platform bucket, one row each.
+  const tenants = [...f.tenants, ...f.unassigned];
+  $("#forecast-tenants").innerHTML = "<thead><tr><th>Tenant</th><th>Budget</th><th class=num>Spend so far</th><th class=num>Projected</th><th>Trend</th><th>Verdict</th></tr></thead><tbody>" +
+    (tenants.map(tn => `<tr>
+      <td><b>${esc(tn.tenant_name || tn.tenant_id || "platform keys (no tenant)")}</b></td>
+      <td>${tn.monthly_budget_usd == null ? '<span class="b b-gray">—</span>' : fmtUsd(tn.monthly_budget_usd)}</td>
+      <td class="num">${fmtUsd(tn.spend_so_far_usd)}</td>
+      <td class="num">${fcProjectionCell(tn)}</td>
+      <td>${fcTrendCell(tn)}</td>
+      <td>${fcVerdictCell(tn)}</td>
+    </tr>`).join("") || `<tr><td colspan="6" class="empty">No spenders yet in ${esc(month)}</td></tr>`) + "</tbody>";
+
+  const keys = tenants.flatMap(tn => tn.keys.map(k => [tn, k]));
+  $("#forecast-keys").innerHTML = "<thead><tr><th>Tenant</th><th>Key</th><th>Budget</th><th class=num>Spend so far</th><th class=num>Projected</th><th>Trend</th><th>Verdict</th></tr></thead><tbody>" +
+    (keys.map(([tn, k]) => `<tr>
+      <td>${esc(tn.tenant_name || tn.tenant_id || "—")}</td>
+      <td>${esc(k.key_name || "—")}</td>
+      <td>${k.monthly_budget_usd == null ? '<span class="b b-gray">—</span>' : fmtUsd(k.monthly_budget_usd)}</td>
+      <td class="num">${fmtUsd(k.spend_so_far_usd)}</td>
+      <td class="num">${fcProjectionCell(k)}</td>
+      <td>${fcTrendCell(k)}</td>
+      <td>${fcVerdictCell(k)}</td>
+    </tr>`).join("") || `<tr><td colspan="7" class="empty">No keys</td></tr>`) + "</tbody>";
+}
 
 // ---------- finops (tier 46): cost anomaly flags -------------------------
 // The follow-up question the invoice begs: is any of this *unusual*?

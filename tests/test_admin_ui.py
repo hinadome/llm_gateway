@@ -338,6 +338,31 @@ async def test_admin_ui_finops_surface(env):
         assert marker in body, marker
 
 
+async def test_admin_ui_forecast_surface(env):
+    # Tier 47: the Billing tab's month-end forecast panel — the
+    # invoice's forward-looking sibling (GET /admin/forecasts): cards
+    # (projected month-end, spend so far, the two daily paces with the
+    # trend), tenants/keys tables with projected-vs-budget verdict
+    # badges (the recent pace deciding when both projections exist,
+    # verdict_based_on in the tooltip) and a complete month rendering
+    # its actuals with a "final" say-so. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="forecast-panel"',
+        'id="forecast-cards"',
+        'id="forecast-tenants"',
+        'id="forecast-keys"',
+        "loadForecasts",
+        "/admin/forecasts",
+        "FC_VERDICT",
+        "over_budget",
+        "at_risk",
+        "within_budget",
+        "the invoice is the final bill",
+    ):
+        assert marker in body, marker
+
+
 async def test_admin_redirects_to_ui(env):
     resp = await env.client.get("/admin", follow_redirects=False)
     assert resp.status_code == 307

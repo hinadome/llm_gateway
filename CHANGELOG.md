@@ -8,6 +8,52 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Spend forecasts (tier 47) — the invoice's forward-looking sibling:
+  where will this month land? `GET /admin/forecasts` (`month=YYYY-MM`,
+  the invoice's own month contract) projects the final bill per key and
+  per tenant over the same client-consumed lens, with two projections
+  because one honest number is not always possible:
+  - **Run-rate** — spend so far over the elapsed fraction of the month,
+    scaled to the whole month. Straight-line and honest about being an
+    average: a key that stopped spending three days ago still projects
+    its old pace.
+  - **Recent pace** — the last 7 days' daily spend (bounded to the
+    month: on day 2, "the last 7 days" is really 2 days, and divides
+    by 2) carried over the remaining days on top of the booked spend.
+    The correction: a stopped key projects flat, an accelerated one
+    projects the acceleration.
+  - **Trend ratio and verdicts** — the recent daily pace over the
+    month-to-date daily average rides beside both, and the
+    projected-vs-budget verdicts (`over_budget` / `at_risk` ≥80% /
+    `within_budget`) are decided by the recent-pace projection when
+    one exists, `verdict_based_on` saying which. Both projections
+    always ship side by side — a verdict is never a mystery about
+    its inputs.
+
+  The honesty rules, forward-looking edition: a **complete month is not
+  forecast** — a past month serves its actual total as the projection
+  (`month_complete: true`, remaining 0, trend null; the invoice *is*
+  the final bill), and a future or malformed month is the invoice's
+  400. A **trend needs 2+ days of month** and a nonzero month average —
+  less is hours of evidence dressed as a line, so `trend_ratio` is null
+  there, and a zero average with recent spend is null too, never a
+  fabricated infinity. The **clock context ships in the envelope**
+  (`elapsed_days` / `remaining_days` / `days_in_month`), so every
+  projection is recomputable from the response itself. **No budget →
+  projected pct and verdict null**, while every existing key still
+  appears — an unused key projects $0 of its budget; deleted keys
+  project where they lived, no budget to compare against. Read at
+  request time — no loop, no state, no config (the 7-day window is a
+  module constant). Tenant admins see their own tenant only (forced);
+  platform admins may `?tenant_id=` filter.
+
+  The Billing tab grows a Month-end forecast panel between the
+  statement and the flags — where will it land, then is any of it
+  unusual — both projections in one cell with the other a tooltip
+  away, verdict badges at the 80/100% thresholds, and a complete month
+  rendering its actuals with a "final" say-so.
+  9 tests + a UI pin in `tests/test_forecasts.py` /
+  `tests/test_admin_ui.py`; the suite stands at 1229.
 - Cost anomaly flags (tier 46) — the invoice's follow-up: is any of
   this unusual? `GET /admin/anomalies` compares the recent window
   (`finops.window_hours`, default 24h) against each key's trailing
