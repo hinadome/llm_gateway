@@ -8,6 +8,46 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Dashboard UI for the eight API-only admin surfaces (tier 63) —
+  the admin dashboard at `/admin/ui` now covers every admin endpoint
+  that had no visual surface; no backend changes — the endpoints
+  already returned display-ready shapes.
+  - **Replay-harness panel on the logs tab**: capture the filtered
+    window (`GET /admin/logs/export`, same filters as the table,
+    100–5000 rows) and replay it against the current config (`POST
+    /admin/replay`) in one motion; the report dialog renders the
+    summary chips and one row per line — result badge, changed
+    fields with recorded→predicted tooltips, skip reasons, the
+    predicted routing ladder, auth-rejection error codes — capped
+    at 500 rendered rows with an honest say-so. *Download capture*
+    saves the JSONL for the curl flow. A disabled harness
+    (`replay.enabled: false`) renders the endpoint's 404 as the
+    honest say-so. Tenant admins replay their own tenant's traffic
+    (the export scopes like the table).
+  - **Feedback tab**: client-reported ratings become reviewable —
+    quality cards and by-model / by-key bucket tables from `GET
+    /admin/feedback/stats` (average, count, the 4–5 / 1–2 sentiment
+    split), plus the filterable, paginated rows from `GET
+    /admin/feedback` with rating badges (1–2 red, 3 amber, 4–5
+    green), min/max-rating and key/model/request-id filters, and the
+    platform-admin tenant lens. The stats query carries only the
+    scoping filters — the endpoint takes no pager or rating bounds.
+    Tenant admins see their own rows.
+  - **System tab: four live-state panels** (platform admins only —
+    a tenant administrator gets the same honest platform-only note,
+    naming the surface, instead of a fired 403): **concurrency**
+    (keys/tenants holding in-flight slots, waiters queued, the
+    wait-seconds echo), the **runaway jail** (cooldown left,
+    offenses, a Release button per row — `POST
+    /admin/runaway/{key_id}/release`, the `key_not_jailed` 404 as a
+    toast), the **canary fleet** (per-deployment outcome badges,
+    latency, last check, and *Probe now* — `POST /admin/canaries/probe`,
+    its real provider-quota cost warned in the tooltip) and the
+    **MCP proxy** (per server: url, timeout, auth-header names,
+    open sessions).
+  - 3 new UI-surface tests (`tests/test_admin_ui.py`, 31 total in
+    the file); suite now 1419.
+
 - Redis-backed concurrency limiter (tier 62) —
   `concurrency.backend: redis` closes §8.2 item 7's last deliberate
   in-process exception ("concurrency admission: per-replica slot

@@ -182,6 +182,7 @@
   <button data-tab="vault">Vault</button>
   <button data-tab="prompts">Prompts</button>
   <button data-tab="logs">Request logs</button>
+  <button data-tab="feedback">Feedback</button>
   <button data-tab="pii">PII scan</button>
   <button data-tab="billing">Billing</button>
   <button data-tab="routing">Routing &amp; breakers</button>
@@ -312,6 +313,66 @@
         <button class="ghost small" id="btn-clearfilter">Reset</button>
       </div>
       <div style="overflow-x:auto"><table id="logs-table"></table></div>
+    </div>
+    <!-- Replay harness (tier 63): the capture/replay safety net for a
+         hot reload. GET /admin/logs/export is the capture (the filtered
+         window as JSONL with recorded baselines); POST /admin/replay
+         re-executes those lines through the CURRENT config — request
+         policy only, no upstream calls, no counters, no spend — and
+         diffs each against what was recorded. The "changed" lines are
+         what this config would change about that traffic. -->
+    <div class="panel">
+      <div class="ph">Replay harness
+        <div class="right" style="display:flex;gap:8px;align-items:center;font-weight:400;font-size:12px">
+          <span class="muted">rows to capture</span>
+          <select id="replay-limit" style="width:auto">
+            <option>100</option><option>500</option><option selected>1000</option><option>5000</option>
+          </select>
+          <button class="ghost small" id="btn-replay-download" title="Download the capture: the filtered window as JSONL (one line per request, with the recorded baseline each replay diffs against).">Download capture</button>
+          <button class="primary small" id="btn-replay" title="Capture the filtered window, re-execute each line through the current request policy (no upstream calls, no counters, no spend) and diff it against what was recorded.">Capture &amp; replay</button>
+        </div>
+      </div>
+      <div class="pb" id="replay-status" style="font-size:12.5px">Re-execute captured traffic against the current config: the changed lines are what a hot reload would change about that traffic — the safety net before you apply.</div>
+    </div>
+  </section>
+
+  <!-- Client-reported feedback (tier 63): the ratings clients attach
+       via POST /feedback — quality aggregates (GET /admin/feedback/stats)
+       and the reviewable rows (GET /admin/feedback). Tenant admins see
+       their own tenant's rows; the lens select is the platform
+       admin's. -->
+  <section class="tab" id="tab-feedback">
+    <div class="panel">
+      <div class="ph">Feedback quality
+        <div class="right muted" style="font-weight:400;font-size:12px">client ratings · positive = 4&ndash;5, negative = 1&ndash;2</div>
+      </div>
+      <div id="fb-cards" class="pb" style="display:flex;gap:12px;flex-wrap:wrap"></div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:start">
+        <div style="flex:1;min-width:280px"><div class="muted" style="font-size:12px;padding:0 2px">By model</div><table id="fb-by-model"></table></div>
+        <div style="flex:1;min-width:280px"><div class="muted" style="font-size:12px;padding:0 2px">By key</div><table id="fb-by-key"></table></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph">Feedback rows
+        <div class="right"><span class="pager" id="fb-pager"></span></div>
+      </div>
+      <div class="pb toolbar">
+        <select id="fb-min" title="Minimum rating (1&ndash;5)">
+          <option value="">min rating</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+        </select>
+        <select id="fb-max" title="Maximum rating (1&ndash;5)">
+          <option value="">max rating</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+        </select>
+        <input id="fb-key" placeholder="key name">
+        <input id="fb-model" placeholder="model">
+        <input id="fb-reqid" placeholder="request id" class="mono" style="width:180px">
+        <select id="fb-tenant" style="display:none" title="Per-tenant lens (platform admins): only this tenant's rows">
+          <option value="">any tenant</option>
+        </select>
+        <button class="primary small" id="btn-fb-filter">Apply</button>
+        <button class="ghost small" id="btn-fb-clearfilter">Reset</button>
+      </div>
+      <div style="overflow-x:auto"><table id="feedback-table"></table></div>
     </div>
   </section>
 
@@ -518,6 +579,36 @@
       </div>
       <div style="overflow-x:auto"><table id="backups-table"></table></div>
       <div class="muted" style="padding:6px 2px;font-size:12px">Restore is offline by design: stop the gateway, replace the database file with a backup, start it again.</div>
+    </div>
+    <!-- Live fleet state (tier 63): the four platform-only read surfaces
+         — concurrency admission, the runaway jail, the canary fleet and
+         the MCP proxy. All are snapshots of right-now state, not
+         configuration. -->
+    <div class="panel">
+      <div class="ph">Concurrency
+        <div class="right muted" style="font-weight:400;font-size:12px">slots held / waiters queued, right now</div>
+      </div>
+      <div id="system-concurrency" class="muted" style="padding:8px 2px">Loading…</div>
+    </div>
+    <div class="panel">
+      <div class="ph">Runaway-agent jail
+        <div class="right muted" style="font-weight:400;font-size:12px">keys in escalating cooldown for identical-request loops</div>
+      </div>
+      <div id="system-runaway" class="muted" style="padding:8px 2px">Loading…</div>
+    </div>
+    <div class="panel">
+      <div class="ph">Canary fleet
+        <div class="right" style="font-weight:400">
+          <button class="ghost small" id="btn-canary-probe" title="Run one probe wave now (regardless of canary.enabled) — a direct provider call per deployment, bounded by the canary timeout. Costs max_tokens of provider quota per deployment; no log rows, no spend, no breaker accounting.">&#9889; Probe now</button>
+        </div>
+      </div>
+      <div id="system-canaries" class="muted" style="padding:8px 2px">Loading…</div>
+    </div>
+    <div class="panel">
+      <div class="ph">MCP proxy
+        <div class="right muted" style="font-weight:400;font-size:12px">configured servers and open gateway sessions</div>
+      </div>
+      <div id="system-mcp" class="muted" style="padding:8px 2px">Loading…</div>
     </div>
   </section>
 
@@ -737,6 +828,17 @@
   <form method="dialog" class="df"><button>Close</button></form>
 </dialog>
 
+<!-- replay report (tier 63): the capture/replay diff — what the
+     current config would change about the captured traffic. -->
+<dialog id="dlg-replay">
+  <div class="dh">Replay report</div>
+  <div class="db" style="min-width:860px;max-width:1020px;max-height:70vh;overflow:auto">
+    <div id="replay-summary" style="margin-bottom:10px"></div>
+    <div style="overflow-x:auto"><table id="replay-report"></table></div>
+  </div>
+  <form method="dialog" class="df"><button>Close</button></form>
+</dialog>
+
 <div id="toasts"></div>
 
 <script>
@@ -755,6 +857,7 @@ const state = {
   hours: 24,
   auto: true,
   logs: { limit: 25, offset: 0, total: 0 },
+  fb: { limit: 50, offset: 0, total: 0 },   // feedback tab (tier 63)
   editing: null,          // key id being edited (null = create)
   editingTenant: null,    // tenant id being edited (null = create)
   openLog: null,          // expanded log row id
@@ -958,6 +1061,7 @@ async function bootstrapAdminInfo() {
   // The per-tenant lenses are platform-admin surfaces.
   $("#keys-f-tenant").style.display = state.platformAdmin ? "" : "none";
   $("#f-tenant").style.display = state.platformAdmin ? "" : "none";
+  $("#fb-tenant").style.display = state.platformAdmin ? "" : "none";
 }
 $("#btn-login").addEventListener("click", tryLogin);
 $("#login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryLogin(); });
@@ -1049,6 +1153,7 @@ async function refresh() {
     else if (state.tab === "vault") await loadVault();
     else if (state.tab === "prompts") await loadPrompts();
     else if (state.tab === "logs") await loadLogs();
+    else if (state.tab === "feedback") await loadFeedback();
     else if (state.tab === "pii") await loadPII();
     else if (state.tab === "billing") await loadInvoices();
     else if (state.tab === "routing") await loadRouting();
@@ -1955,8 +2060,11 @@ $("#form-prompt").addEventListener("submit", async e => {
 
 // ---------- logs -------------------------------------------------------
 
-function logFilters() {
-  const p = new URLSearchParams({ limit: state.logs.limit, offset: state.logs.offset });
+function logFilters(overrides = {}) {
+  const p = new URLSearchParams({
+    limit: overrides.limit ?? state.logs.limit,
+    offset: overrides.offset ?? state.logs.offset,
+  });
   const add = (id, name) => { const v = $("#" + id).value.trim(); if (v) p.set(name, v); };
   add("f-key", "key_name"); add("f-model", "model"); add("f-reqid", "request_id"); add("f-trace", "trace_id");
   add("f-tenant", "tenant_id");  // platform-admin lens; empty for tenant admins
@@ -2059,6 +2167,214 @@ async function fillLogDetail(id) {
     cell.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
 }
+
+// ---------- replay harness (tier 63) ------------------------------------
+//
+// The capture/replay safety net for a hot reload: GET /admin/logs/export
+// is the capture (the filtered window as JSONL, each line carrying the
+// recorded baseline), POST /admin/replay re-executes those lines through
+// the CURRENT request policy — resolution, prompt policy, permissions,
+// guardrails, routing selection; never an upstream call, counter, cache
+// write, spend or log row — and diffs each against what was recorded.
+// The report's "changed" lines are what this config would change about
+// that traffic. api() assumes JSON, and the capture is a JSONL file —
+// so the fetch is raw, like the billing CSV export.
+
+async function fetchCapture() {
+  const p = logFilters({ limit: $("#replay-limit").value, offset: 0 });
+  const res = await fetch("/admin/logs/export?" + p.toString(), {
+    headers: { Authorization: "Bearer " + state.key },
+  });
+  if (!res.ok) {
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* no body */ }
+    throw Object.assign(
+      new Error(body?.error?.message || res.status + " " + res.statusText),
+      { status: res.status }
+    );
+  }
+  return res.text();
+}
+
+$("#btn-replay-download").addEventListener("click", async () => {
+  try {
+    const text = await fetchCapture();
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([text], { type: "application/x-ndjson" })),
+      download: "replay-capture.jsonl",
+    });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast("Capture downloaded");
+  } catch (e) { toast("Capture failed: " + e.message, true); }
+});
+
+// Render one replay result row. `changes` is a list of field names; the
+// recorded and predicted values ride the row, so the tooltip can say
+// exactly what moved (recorded -> predicted) per field.
+const REPLAY_BADGE = {
+  changed: "b-amber", unchanged: "b-green",
+  not_comparable: "b-gray", error: "b-red",
+};
+function replayLine(r) {
+  const p = r.predicted || {}, rec = r.recorded || {};
+  // Predicted carries the *current* routing ladder (deployments), the
+  // recording the single deployment that served; an auth rejection
+  // carries its error — the finding the operator most needs to see.
+  const outcome = o => {
+    if (!o) return "—";
+    const dep = o.deployment || (o.deployments || []).join(", ") || "—";
+    const err = o.error
+      ? ` · <span class="b b-red" title="${esc(o.error.message || "")}">${esc(o.error.code || "error")}</span>`
+      : "";
+    return `<b>${esc(o.status || "—")}</b> <span class="muted">${esc(o.model || "—")} · ${esc(dep)}</span>${err}`;
+  };
+  const why = r.skip_reason || r.detail || "";
+  return `<tr>
+    <td><span class="b ${REPLAY_BADGE[r.result] || "b-gray"}">${esc(r.result)}</span></td>
+    <td>${r.changes && r.changes.length
+      ? `<span class="mono" title="${esc(r.changes.map(f => f + ": " + JSON.stringify(rec[f] ?? null) + " -> " + JSON.stringify(p[f] ?? null)).join("\n"))}">${r.changes.map(c => `<span class="b b-amber">${esc(c)}</span>`).join(" ")}</span>`
+      : '<span class="muted">—</span>'}</td>
+    <td class="muted" style="font-size:12px">${esc(why) || "—"}</td>
+    <td>${outcome(p)}</td>
+    <td>${outcome(rec)}</td>
+  </tr>`;
+}
+
+$("#btn-replay").addEventListener("click", async () => {
+  const btn = $("#btn-replay");
+  btn.disabled = true;
+  $("#replay-status").textContent = "Capturing the filtered window and replaying it against the current config…";
+  try {
+    const text = await fetchCapture();
+    const entries = text.trim() ? text.trim().split("\n").map(l => JSON.parse(l)) : [];
+    if (!entries.length) {
+      $("#replay-status").textContent = "No replayable rows in this window — nothing with a stored request body matches the filters.";
+      return;
+    }
+    const report = await api("/admin/replay", {
+      method: "POST",
+      body: JSON.stringify({ entries }),
+    });
+    const CAP = 500;  // DOM guard for large captures; the summary stays exact
+    $("#replay-summary").innerHTML =
+      `<span class="b b-blue">replayed ${fmtInt(report.replayed)}</span> ` +
+      `<span class="b b-amber">changed ${fmtInt(report.changed)}</span> ` +
+      `<span class="b b-green">unchanged ${fmtInt(report.unchanged)}</span> ` +
+      `<span class="b b-gray">not comparable ${fmtInt(report.not_comparable)}</span> ` +
+      `<span class="b b-red">errors ${fmtInt(report.errors)}</span>` +
+      `<div class="muted" style="font-size:12px;margin-top:6px">Each line re-executed through the current request policy — no upstream calls, counters, cache writes or spend — and was diffed against its recorded baseline. A changed line is what this config would do differently to that traffic.</div>`;
+    const rows = report.results.slice(0, CAP).map(replayLine).join("");
+    $("#replay-report").innerHTML =
+      "<thead><tr><th>Result</th><th>Changes</th><th>Why</th><th>Predicted</th><th>Recorded</th></tr></thead><tbody>" +
+      rows +
+      (report.results.length > CAP
+        ? `<tr><td colspan="5" class="empty">Showing the first ${CAP} of ${fmtInt(report.results.length)} lines — download the capture and replay it in slices for a full review.</td></tr>`
+        : "") +
+      "</tbody>";
+    $("#dlg-replay").showModal();
+    $("#replay-status").textContent = `Last replay: ${fmtInt(report.replayed)} lines, ${fmtInt(report.changed)} changed.`;
+  } catch (e) {
+    if (e.status === 404) {
+      $("#replay-status").innerHTML = "Enable <span class='mono'>replay.enabled</span> in config.yaml to use the replay harness — it is off by default.";
+    } else {
+      $("#replay-status").textContent = "Replay failed: " + e.message;
+    }
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---------- feedback (tier 63) --------------------------------------------
+//
+// Client-reported ratings (POST /feedback from the data plane) become
+// reviewable here: quality aggregates (GET /admin/feedback/stats) and
+// the rows themselves (GET /admin/feedback). Tenant admins see their
+// own tenant's rows — the lens select is the platform admin's.
+
+function RATING_BADGE(r) {
+  const cls = r <= 2 ? "b-red" : r === 3 ? "b-amber" : "b-green";
+  return `<span class="b ${cls}">${r} / 5</span>`;
+}
+function fbBucketCell(b) {
+  if (!b || !b.count) return '<span class="muted">—</span>';
+  return `<b>${b.avg_rating == null ? "—" : b.avg_rating.toFixed(2)}</b> <span class="muted">(${fmtInt(b.count)})</span> ` +
+    `<span class="b b-green">${Math.round(b.pct_positive)}% pos</span> <span class="b b-red">${Math.round(b.pct_negative)}% neg</span>`;
+}
+function fbFilters() {
+  const p = new URLSearchParams({ limit: state.fb.limit, offset: state.fb.offset });
+  const add = (id, name) => { const v = $("#" + id).value.trim(); if (v) p.set(name, v); };
+  add("fb-key", "key_name"); add("fb-model", "model"); add("fb-reqid", "request_id");
+  add("fb-tenant", "tenant_id");  // platform-admin lens; empty for tenant admins
+  if ($("#fb-min").value) p.set("min_rating", $("#fb-min").value);
+  if ($("#fb-max").value) p.set("max_rating", $("#fb-max").value);
+  return p;
+}
+// The stats endpoint aggregates over whole ratings, so it takes only
+// the three scoping filters — never the pager or the rating bounds.
+function fbStatsFilters() {
+  const p = new URLSearchParams();
+  const add = (id, name) => { const v = $("#" + id).value.trim(); if (v) p.set(name, v); };
+  add("fb-key", "key_name"); add("fb-model", "model"); add("fb-tenant", "tenant_id");
+  return p;
+}
+
+async function loadFeedback() {
+  if (state.platformAdmin) fillTenantSelect($("#fb-tenant"), "any tenant");
+  const [rows, stats] = await Promise.all([
+    api("/admin/feedback?" + fbFilters().toString()),
+    api("/admin/feedback/stats?" + fbStatsFilters().toString()),
+  ]);
+  state.fb.total = rows.total;
+  const from = rows.total === 0 ? 0 : rows.offset + 1;
+  const to = rows.offset + rows.data.length;
+  $("#fb-pager").textContent = `${from}–${to} of ${rows.total}`;
+  const prev = `<button class="small ghost" ${rows.offset === 0 ? "disabled" : ""} onclick="pageFeedback(-1)">&larr;</button>`;
+  const next = `<button class="small ghost" ${to >= rows.total ? "disabled" : ""} onclick="pageFeedback(1)">&rarr;</button>`;
+  $("#fb-pager").insertAdjacentHTML("afterbegin", prev + " ");
+  $("#fb-pager").insertAdjacentHTML("beforeend", " " + next);
+
+  $("#fb-cards").innerHTML = stats.overall && stats.overall.count
+    ? `<div class="card"><div class="k">Ratings</div><div class="v">${fmtInt(stats.overall.count)}</div><div class="sub">${RATING_BADGE(Math.round(stats.overall.avg_rating))} average</div></div>
+       <div class="card"><div class="k">Positive (4&ndash;5)</div><div class="v">${Math.round(stats.overall.pct_positive)}%</div></div>
+       <div class="card"><div class="k">Negative (1&ndash;2)</div><div class="v">${Math.round(stats.overall.pct_negative)}%</div></div>`
+    : '<div class="muted" style="padding:4px 2px">No feedback reported yet — ratings arrive as clients call POST /feedback.</div>';
+
+  const bucketTable = (obj, name) => {
+    const names = Object.keys(obj || {});
+    return "<thead><tr><th>" + name + "</th><th>Rating</th></tr></thead><tbody>" +
+      (names.length
+        ? names.map(n => `<tr><td class="mono">${esc(n)}</td><td>${fbBucketCell(obj[n])}</td></tr>`).join("")
+        : `<tr><td colspan="2" class="empty">No ratings</td></tr>`) +
+      "</tbody>";
+  };
+  $("#fb-by-model").innerHTML = bucketTable(stats.by_model, "Model");
+  $("#fb-by-key").innerHTML = bucketTable(stats.by_key, "Key");
+
+  const trs = rows.data.map(f => `<tr>
+    <td class="muted" style="font-size:12px;white-space:nowrap">${fmtWhen(f.created_at)}</td>
+    <td>${RATING_BADGE(f.rating)}</td>
+    <td>${esc(f.key_name || "—")}</td>
+    <td class="mono">${esc(f.model || "—")}</td>
+    <td class="mono muted" style="font-size:12px">${esc(f.request_id || "—")}</td>
+    <td style="max-width:420px">${esc(f.comment || "")}</td>
+  </tr>`).join("");
+  $("#feedback-table").innerHTML =
+    "<thead><tr><th>When</th><th>Rating</th><th>Key</th><th>Model</th><th>Request</th><th>Comment</th></tr></thead><tbody>" +
+    (trs || '<tr><td colspan="6" class="empty">No feedback rows match</td></tr>') + "</tbody>";
+}
+function pageFeedback(dir) {
+  const next = state.fb.offset + dir * state.fb.limit;
+  if (next < 0) return;
+  state.fb.offset = next;
+  loadFeedback();
+}
+$("#btn-fb-filter").addEventListener("click", () => { state.fb.offset = 0; loadFeedback(); });
+$("#fb-tenant").addEventListener("change", () => { state.fb.offset = 0; loadFeedback(); });
+$("#btn-fb-clearfilter").addEventListener("click", () => {
+  ["fb-key", "fb-model", "fb-reqid", "fb-min", "fb-max", "fb-tenant"].forEach(id => $("#" + id).value = "");
+  state.fb.offset = 0; loadFeedback();
+});
 
 // ---------- PII / secret scan (tier 57) ----------------------------------
 //
@@ -3143,14 +3459,28 @@ async function loadSystem() {
   if (!state.platformAdmin) {
     $("#btn-reload").style.display = "none";
     $("#btn-backup").style.display = "none";
+    $("#btn-canary-probe").style.display = "none";
     $("#system-reload-result").textContent = "";
     $("#backups-table").innerHTML =
       "<tbody><tr><td class='empty'>" + PLATFORM_ONLY("Config reload and database backups") + "</td></tr></tbody>";
+    // The four live-state panels (tier 63) say the same honest
+    // sentence, naming themselves — no 403 is fired.
+    $("#system-concurrency").innerHTML = "<span class='muted'>" + PLATFORM_ONLY("Concurrency admission control") + "</span>";
+    $("#system-runaway").innerHTML = "<span class='muted'>" + PLATFORM_ONLY("The runaway-agent jail") + "</span>";
+    $("#system-canaries").innerHTML = "<span class='muted'>" + PLATFORM_ONLY("The canary fleet") + "</span>";
+    $("#system-mcp").innerHTML = "<span class='muted'>" + PLATFORM_ONLY("The MCP proxy") + "</span>";
     return;
   }
   $("#btn-reload").style.display = "";
   $("#btn-backup").style.display = "";
-  await refreshBackups();
+  $("#btn-canary-probe").style.display = "";
+  await Promise.all([
+    refreshBackups(),
+    refreshConcurrency(),
+    refreshRunaway(),
+    refreshCanaries(),
+    refreshMCP(),
+  ]);
 }
 
 async function refreshBackups() {
@@ -3164,6 +3494,130 @@ async function refreshBackups() {
   $("#backups-table").innerHTML = "<thead><tr><th>Backup</th><th>Size</th><th>Created</th><th></th></tr></thead><tbody>" +
     (rows || '<tr><td colspan="4" class="empty">No backups yet</td></tr>') + "</tbody>";
 }
+
+// ---------- live fleet state (tier 63) -----------------------------------
+//
+// The four platform-only read surfaces: concurrency admission (who
+// holds in-flight slots / waits for one), the runaway jail (with the
+// release escape hatch), the canary fleet (probe-now costs real
+// provider quota per deployment) and the MCP proxy (header NAMES
+// only — the values are secrets).
+
+async function refreshConcurrency() {
+  const r = await api("/admin/concurrency");
+  const echo = `<div class="muted" style="font-size:12px;padding:0 2px 8px">` +
+    (r.enabled
+      ? (r.wait_seconds
+        ? `admission on · waiters queue up to <span class="mono">${fmtInt(r.wait_seconds)}s</span> for a slot`
+        : `admission on · fail fast when every slot is taken (wait_seconds: 0)`)
+      : `admission off (concurrency.enabled: false) — the caps on key/tenant rows are not enforced`) +
+    `</div>`;
+  const keys = (r.keys || []).map(k => `<tr>
+    <td>${esc(k.key_name || k.key_id)}</td>
+    <td class="num">${fmtInt(k.inflight)}</td>
+    <td class="num">${fmtInt(k.queued)}</td>
+  </tr>`).join("");
+  const tenants = (r.tenants || []).map(t => `<tr>
+    <td>${esc(t.tenant_name || t.tenant_id)}</td>
+    <td class="num">${fmtInt(t.inflight)}</td>
+  </tr>`).join("");
+  $("#system-concurrency").innerHTML = echo +
+    `<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:start">
+      <div style="flex:1;min-width:240px"><div class="muted" style="font-size:12px;padding:0 2px">Keys holding slots</div><table><thead><tr><th>Key</th><th class=num>In-flight</th><th class=num>Queued</th></tr></thead><tbody>` +
+    (keys || `<tr><td colspan="3" class="empty">No key is holding slots or queueing right now</td></tr>`) + "</tbody></table></div>" +
+    `<div style="flex:1;min-width:240px"><div class="muted" style="font-size:12px;padding:0 2px">Tenants holding slots</div><table><thead><tr><th>Tenant</th><th class=num>In-flight</th></tr></thead><tbody>` +
+    (tenants || `<tr><td colspan="2" class="empty">No tenant is holding slots right now</td></tr>`) + "</tbody></table></div>" +
+    `</div><div class="muted" style="font-size:12px;padding:6px 2px">Total waiting for a slot: ${fmtInt(r.queued_total)} · slots free themselves as responses complete; the caps live on the key/tenant rows</div>`;
+}
+
+async function refreshRunaway() {
+  const r = await api("/admin/runaway");
+  const c = r.config || {};
+  const echo = `<div class="muted" style="font-size:12px;padding:0 2px 8px">` +
+    (r.enabled
+      ? `on — <span class="mono">&ge;${fmtInt(c.identical_request_threshold)}</span> identical requests within <span class="mono">${fmtInt(c.identical_request_window_seconds)}s</span> jails the key for <span class="mono">${fmtInt(c.cooldown_seconds)}s</span>, escalating &times;${c.cooldown_multiplier} (max ${fmtInt(c.cooldown_max_seconds)}s)`
+      : `off (runaway.enabled: false) — identical-request loops are not detected`) +
+    `</div>`;
+  const rows = (r.jailed || []).map(j => `<tr>
+    <td>${esc(j.key_name || j.key_id)}</td>
+    <td class="num">${fmtInt(j.retry_after_seconds)}s</td>
+    <td class="num">${fmtInt(j.offenses)}</td>
+    <td><button class="ghost small" data-runaway-release="${esc(j.key_id)}" title="Release now: clears the cooldown, the offense history (a re-trip starts at the first-offense cooldown) and the loop windows. The key serves again immediately; a genuinely still-looping agent re-trips on fresh hits.">Release</button></td>
+  </tr>`).join("");
+  $("#system-runaway").innerHTML = echo +
+    `<table><thead><tr><th>Key</th><th class=num>Cooldown left</th><th class=num>Offenses</th><th></th></tr></thead><tbody>` +
+    (rows || `<tr><td colspan="4" class="empty">No key is jailed — nothing is looping</td></tr>`) + "</tbody></table>";
+}
+
+async function refreshCanaries() {
+  const r = await api("/admin/canaries");
+  const OUTCOME_BADGE = { ok: "b-green", timeout: "b-amber", error: "b-red", unknown: "b-gray" };
+  const echo = `<div class="muted" style="font-size:12px;padding:0 2px 8px">` +
+    (r.enabled
+      ? `probing every <span class="mono">${fmtInt(r.interval_seconds)}s</span> (timeout ${fmtInt(r.timeout_seconds)}s)`
+      : `background probing off (canary.enabled: false) — Probe now runs a wave regardless`) +
+    (r.deployments_filter ? ` · filter: <span class="mono">${esc(r.deployments_filter.join(", "))}</span>` : "") +
+    `</div>`;
+  const rows = (r.data || []).map(c => `<tr>
+    <td class="mono">${esc(c.deployment)}</td>
+    <td class="muted">${esc(c.provider)}</td>
+    <td class="mono">${esc(c.model || "—")}</td>
+    <td><span class="b ${OUTCOME_BADGE[c.outcome] || "b-gray"}"${c.error ? ` title="${esc(c.error)}"` : ""}>${esc(c.outcome)}</span></td>
+    <td class="num">${c.latency_ms == null ? "—" : fmtMs(c.latency_ms)}</td>
+    <td class="muted" style="font-size:12px">${esc(fmtWhen(c.checked_at))}</td>
+  </tr>`).join("");
+  $("#system-canaries").innerHTML = echo +
+    `<table><thead><tr><th>Deployment</th><th>Provider</th><th>Model</th><th>Outcome</th><th class=num>Latency</th><th>Checked</th></tr></thead><tbody>` +
+    (rows || `<tr><td colspan="6" class="empty">No deployments match the canary filter</td></tr>`) + "</tbody></table>";
+}
+
+async function refreshMCP() {
+  const r = await api("/admin/mcp");
+  const echo = `<div class="muted" style="font-size:12px;padding:0 2px 8px">` +
+    (r.enabled
+      ? `proxy on · client sessions live <span class="mono">${fmtInt(r.session_ttl_seconds)}s</span>`
+      : `proxy off (mcp.enabled: false) — the /mcp endpoint is closed`) +
+    `</div>`;
+  const rows = (r.servers || []).map(s => `<tr>
+    <td class="mono">${esc(s.name)}</td>
+    <td class="mono" style="font-size:12px">${esc(s.url)}</td>
+    <td class="num">${fmtInt(s.timeout_seconds)}s</td>
+    <td class="mono muted" style="font-size:12px">${esc((s.header_names || []).join(", ") || "—")}</td>
+    <td class="num">${fmtInt(s.open_sessions)}</td>
+  </tr>`).join("");
+  $("#system-mcp").innerHTML = echo +
+    `<table><thead><tr><th>Server</th><th>URL</th><th class=num>Timeout</th><th>Auth headers (names only)</th><th class=num>Open sessions</th></tr></thead><tbody>` +
+    (rows || `<tr><td colspan="5" class="empty">No MCP servers configured (mcp.servers: [])</td></tr>`) + "</tbody></table>";
+}
+
+$("#system-runaway").addEventListener("click", async e => {
+  const btn = e.target.closest("button[data-runaway-release]");
+  if (!btn) return;
+  const keyId = btn.getAttribute("data-runaway-release");
+  btn.disabled = true;
+  try {
+    await api("/admin/runaway/" + encodeURIComponent(keyId) + "/release", { method: "POST" });
+    toast("Key released from the runaway jail");
+  } catch (err) {
+    toast(err.message, true);  // e.g. key_not_jailed: it expired on its own
+  } finally {
+    await refreshRunaway();
+  }
+});
+
+$("#btn-canary-probe").addEventListener("click", async () => {
+  const btn = $("#btn-canary-probe");
+  btn.disabled = true;
+  try {
+    const r = await api("/admin/canaries/probe", { method: "POST" });
+    toast(`Probed ${r.probed} deployment(s) — ${r.healthy} healthy`);
+    await refreshCanaries();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 async function reloadConfig() {
   const btn = $("#btn-reload");

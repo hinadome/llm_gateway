@@ -19,6 +19,7 @@ async def test_admin_ui_served_without_auth(env):
         'id="tab-vault"',
         'id="tab-prompts"',
         'id="tab-logs"',
+        'id="tab-feedback"',
         'id="tab-routing"',
         'id="tab-guardrails"',
         'id="shadow-diff-table"',
@@ -570,5 +571,113 @@ async def test_admin_ui_pii_panel_surface(env):
         "Bodies not captured",
         "with_findings",
         "bodies_not_captured",
+    ):
+        assert marker in body, marker
+
+
+async def test_admin_ui_replay_surface(env):
+    # Tier 63: the logs tab carries the replay harness — the hot-reload
+    # safety net. The capture (GET /admin/logs/export: the filtered
+    # window as JSONL with recorded baselines) downloads or feeds the
+    # replay (POST /admin/replay: re-executes each line through the
+    # CURRENT request policy — no upstream calls, counters or spend —
+    # and diffs against what was recorded); the report dialog shows
+    # the per-line results with the changed-field tooltips, capped at
+    # 500 rendered rows; a 404 (replay.enabled: false) renders the
+    # honest say-so instead of an error toast. Static-shell
+    # assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="replay-limit"',
+        'id="btn-replay-download"',
+        'id="btn-replay"',
+        'id="replay-status"',
+        'id="dlg-replay"',
+        'id="replay-summary"',
+        'id="replay-report"',
+        "fetchCapture",
+        "/admin/logs/export",
+        "/admin/replay",
+        "REPLAY_BADGE",
+        "e.status === 404",
+        "replay.enabled",
+        "no upstream calls",
+        "Showing the first",
+    ):
+        assert marker in body, marker
+
+
+async def test_admin_ui_feedback_surface(env):
+    # Tier 63: the Feedback tab — client-reported ratings (POST
+    # /feedback on the data plane) become reviewable: quality
+    # aggregates (GET /admin/feedback/stats: overall cards + by-model /
+    # by-key buckets with the 4-5/1-2 sentiment split) and the rows
+    # table (GET /admin/feedback) with rating badges, min/max rating
+    # and key/model/request-id filters, the platform-admin tenant lens
+    # and a pager. Tenant admins see their own rows; the stats query
+    # deliberately carries only the scoping filters (no pager or rating
+    # bounds — the endpoint takes none). Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'data-tab="feedback"',
+        'id="tab-feedback"',
+        'id="fb-cards"',
+        'id="fb-by-model"',
+        'id="fb-by-key"',
+        'id="feedback-table"',
+        'id="fb-pager"',
+        'id="fb-min"',
+        'id="fb-max"',
+        'id="fb-key"',
+        'id="fb-model"',
+        'id="fb-reqid"',
+        'id="fb-tenant"',
+        "loadFeedback",
+        "fbStatsFilters",
+        "RATING_BADGE",
+        "/admin/feedback?",
+        "/admin/feedback/stats",
+        "avg_rating",
+        "pct_positive",
+        "pct_negative",
+        "POST /feedback",
+    ):
+        assert marker in body, marker
+
+
+async def test_admin_ui_live_ops_surface(env):
+    # Tier 63: the System tab gains the four platform-only live-state
+    # panels — concurrency admission (slots held / waiters queued),
+    # the runaway jail (cooldown left, offenses, the Release escape
+    # hatch), the canary fleet (outcome badges + Probe now, with its
+    # real-quota-cost tooltip) and the MCP proxy (header NAMES only —
+    # the values are secrets). A tenant administrator gets the same
+    # honest PLATFORM_ONLY sentence, naming each surface; no 403 is
+    # fired. Static-shell assertions only.
+    body = (await env.client.get("/admin/ui")).text
+    for marker in (
+        'id="system-concurrency"',
+        'id="system-runaway"',
+        'id="system-canaries"',
+        'id="system-mcp"',
+        'id="btn-canary-probe"',
+        "refreshConcurrency",
+        "refreshRunaway",
+        "refreshCanaries",
+        "refreshMCP",
+        "/admin/concurrency",
+        "/admin/runaway/",
+        "/admin/canaries/probe",
+        "/admin/mcp",
+        "data-runaway-release",
+        "queued_total",
+        "retry_after_seconds",
+        "header_names",
+        "open_sessions",
+        "Costs max_tokens of provider quota per deployment",
+        'PLATFORM_ONLY("Concurrency admission control")',
+        'PLATFORM_ONLY("The runaway-agent jail")',
+        'PLATFORM_ONLY("The canary fleet")',
+        'PLATFORM_ONLY("The MCP proxy")',
     ):
         assert marker in body, marker

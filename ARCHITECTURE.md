@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 95 Python files, ~37,200 lines, 1416 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 95 Python files, ~37,200 lines, 1419 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -2444,7 +2444,9 @@ gateway/
                             — and every platform-only tab (tenant
                             management, prompt library, routing/breakers/
                             shadow evidence, guardrail config, playground,
-                            reload/backups) renders the same honest
+                            reload/backups — and, tier 63, the System tab's
+                            live-state panels: concurrency admission,
+                            runaway jail, canaries, MCP proxy) renders the same honest
                             "platform-administrator surface" note for
                             tenant administrators instead of firing a
                             guaranteed-403 request (the connection badge
@@ -2452,7 +2454,7 @@ gateway/
                             per-tenant lenses on the keys and logs tabs
                             (tenant <select>s fed from the tenant name
                             map, riding as ?tenant_id= — the forced
-                            scoping for tenant admins unchanged). 12 tabs: overview stats (+ usage CSV
+                            scoping for tenant admins unchanged). 13 tabs: overview stats (+ usage CSV
                             export for the selected window, by-tenant breakdown
                             when tenants have traffic; tier 42 adds the SLO
                             panel above the traffic tables — one row per
@@ -2500,7 +2502,39 @@ gateway/
                             credential manager, hints only), prompt library
                             (versions, activate/candidate patching, the
                             new-version dialog), request logs (filter,
-                            paginate, expand full bodies), PII scan
+                            paginate, expand full bodies; tier 63 adds
+                            the replay-harness panel beneath the
+                            table — Capture & replay exports the
+                            filtered window via GET /admin/logs/export
+                            (same filters as the table, 100–5000 rows)
+                            and posts the parsed JSONL to POST
+                            /admin/replay in one motion; the report
+                            dialog renders the summary chips and one
+                            row per line — result badge, changed
+                            fields with recorded→predicted tooltips,
+                            skip reasons, the predicted routing
+                            ladder, auth-rejection error codes —
+                            capped at 500 rendered rows with an
+                            honest say-so; Download capture saves the
+                            JSONL for the curl flow; a disabled
+                            harness (replay.enabled: false) renders
+                            the endpoint's 404 as the honest say-so;
+                            tenant admins replay their own tenant's
+                            traffic — the export scopes like the
+                            table), feedback (tier 63: client-reported
+                            ratings — quality cards and by-model /
+                            by-key bucket tables from GET
+                            /admin/feedback/stats (average, count,
+                            the 4–5 / 1–2 sentiment split), plus the
+                            filterable, paginated rows from GET
+                            /admin/feedback with rating badges (1–2
+                            red, 3 amber, 4–5 green), min/max-rating
+                            and key/model/request-id filters and the
+                            platform-admin tenant lens; the stats
+                            query carries only the scoping filters —
+                            the endpoint takes no pager or rating
+                            bounds; tenant admins see their own
+                            rows), PII scan
                             (tier 57: the tier-53 teeth's dashboard
                             surface — loading the tab IS the on-demand
                             scan, a GET /admin/pii-scan of the newest
@@ -2667,7 +2701,28 @@ gateway/
                             as the envelope the real client would
                             receive) —
                             guardrail inventory, system (health/readiness,
-                            config reload, backups). A test enforces the
+                            config reload, backups; tier 63 adds the four
+                            live-state panels, platform admins only —
+                            concurrency (keys/tenants holding in-flight
+                            slots, waiters queued, the wait-seconds
+                            echo) from GET /admin/concurrency, the
+                            runaway jail (cooldown left, offenses, a
+                            Release button per row — POST
+                            /admin/runaway/{key_id}/release, the
+                            key_not_jailed 404 as a toast — and the
+                            config echo) from GET /admin/runaway, the
+                            canary fleet (per-deployment outcome badges
+                            ok/timeout/error/unknown, latency, last
+                            check, and Probe now — POST
+                            /admin/canaries/probe, its real
+                            provider-quota cost warned in the
+                            tooltip) from GET /admin/canaries, and
+                            the MCP proxy (per server url, timeout,
+                            auth-header names, open sessions) from
+                            GET /admin/mcp; a tenant administrator
+                            gets the same honest platform-only note
+                            in each, naming the surface — no 403 is
+                            fired). A test enforces the
                             no-external-resources invariant.
 ```
 
@@ -3615,7 +3670,20 @@ tests/
 │                        (tier 61: the whoami probe + header line,
 │                        the shared PLATFORM_ONLY sentence every
 │                        platform-only tab renders, fillTenantSelect,
-│                        the keys/logs tenant lenses),
+│                        the keys/logs tenant lenses), replay-harness
+│                        markers (tier 63: the logs-tab panel — capture
+│                        select, both buttons, the report dialog,
+│                        fetchCapture over /admin/logs/export → POST
+│                        /admin/replay, REPLAY_BADGE, the honest-
+│                        disabled 404 branch), feedback-tab markers
+│                        (tier 63: the tab + stats cards + bucket
+│                        tables + filterable rows, fbStatsFilters
+│                        carrying only the scoping filters,
+│                        RATING_BADGE, /admin/feedback{,/stats}),
+│                        live-ops markers (tier 63: the System tab's
+│                        four platform-only panels — the refreshers,
+│                        the release/probe actions and tooltips, and
+│                        each surface's PLATFORM_ONLY sentence),
 │                        /admin/logs/{id} full row incl.
 │                        bodies, 404 + admin-only auth on the detail endpoint
 ├── test_native_anthropic.py  /v1/messages: parse/render/stream-renderer units (tools,
