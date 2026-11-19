@@ -8,6 +8,64 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- Per-server MCP circuit breakers + route-scoped SLOs (tier 66) —
+  MCP parity items #1 and #2: tool servers get the deployment
+  breaker's protection, and a tool server becomes a first-class SLO.
+  A dead upstream used to stall every caller for the full upstream
+  timeout *holding a concurrency slot the whole while*; now it fails
+  fast, in-band, holding nothing.
+  - **The breaker** (`mcp.breaker`, same knobs as
+    `routing.breaker`): one circuit per configured SERVER — the same
+    registry, state machine and gauges as the deployment breakers
+    (`provider="mcp"` keeps the Prometheus series apart; the
+    registry class now takes the breaker block directly, so both
+    surfaces share it). MCP-specific accounting: **connect errors
+    and 5xx answers** are consecutive failures; **latency never
+    trips** (read/write timeouts are not recorded — tools
+    legitimately run long); 4xx answers and JSON-RPC error frames in
+    200 bodies are evidence of health (client-caused — the same
+    rule the deployment breaker lives by); a success in between
+    resets the count, so an intermittently erroring tool never
+    takes a working server down.
+  - **An open circuit refuses in-band** — HTTP 200, JSON-RPC
+    `-32004` (new code `CIRCUIT_OPEN`), the client's id echoed —
+    BEFORE the rate limit and the concurrency slot: fail fast, hold
+    nothing, burn no RPM. No all-open bypass (a server is the only
+    upstream for its name) and no retries (the breaker refuses,
+    never replays — none of the side-effect hazards of retrying a
+    tool call exist). `initialize` is gated too and, after the
+    cooldown, is the natural half-open probe: one success closes
+    the circuit, one failure re-opens it.
+  - **Redis backend, own keyspace**: `mcp.breaker.backend: redis`
+    shares trips across the fleet in hashes under the `mcp-cb`
+    namespace — a deployment happening to share a server's name
+    never collides (and the default `cb` keys are byte-identical to
+    before, so an upgraded fleet keeps its state).
+  - **Operator surface**: `GET /admin/mcp` reports each server's
+    breaker snapshot (state / consecutive failures / lifetime trips
+    / cooldown remaining); `POST /admin/mcp/breakers/{server}/reset`
+    force-closes after a fix (audit-logged as `mcp.breaker.reset`);
+    `/readyz` counts open MCP circuits informationally (never fails
+    readiness — the recovery probe needs the pod); `gateway mcp`
+    shows each server's breaker state.
+  - **Honest accounting**: a refusal's row is `status: error` (the
+    client experienced a failure — an error-rate SLO must count it)
+    while `gateway_mcp_requests_total` gains the outcome
+    `circuit_open` — neither a server error nor a block.
+  - **Route-scoped SLOs**: a target may narrow to one inbound
+    surface (`route: "mcp"` measures the tool-server rows, whose
+    model column carries the SERVER name) — `model: jira, route:
+    mcp` promises the tool traffic without sweeping chat rows that
+    happen to share the name, and the same target without the route
+    still sees everything. Both query legs (verdict +
+    error-budget) filter identically, so a budget and its verdict
+    can never disagree about scope; a `ttft_p95_ms` target over the
+    MCP route is honestly `insufficient_evidence` (nothing streams
+    there, never a fabricated number), and the alert/recovered
+    webhook payloads echo the route.
+  - New `tests/test_mcp_breaker.py` (15 tests) + 3 route-scope
+    tests in `tests/test_slos.py`; suite now 1516.
+
 - One-command VM deployment + CI/CD (tier 65) —
   `scripts/deploy_vm.sh` turns a fresh Ubuntu 22.04/24.04 VM (Debian
   works — the bootstrap is apt-based) into a running, HTTPS-capable

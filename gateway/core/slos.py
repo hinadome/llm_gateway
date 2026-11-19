@@ -42,6 +42,15 @@ bad event exhausts the budget, and burn stays None rather than
 inventing an infinity. Windows carry their own sufficiency gates,
 scaled from the target's ``min_requests`` by the window's share of
 the target's own window, floored at 1.
+
+Tier 66 adds ROUTE SCOPING: a target may narrow to one inbound
+surface (``route: "mcp"`` over the tool-server rows whose model
+column carries the server name — or any other surface), so the
+same machinery that verdicts chat now covers tool traffic. Both
+query legs filter identically, so a budget and its verdict can
+never disagree about scope. TTFT over an MCP-scoped target stays
+honestly unmeasurable (nothing streams on that surface) —
+``insufficient_evidence``, never a fabricated number.
 """
 
 from __future__ import annotations
@@ -99,6 +108,12 @@ async def measure(
         RequestLog.created_at >= since,
         *_CLIENT_ROW,
     ]
+    if slo.route is not None:
+        # Route scope (tier 66): only the rows served by this inbound
+        # surface. The MCP shape — model column carries the SERVER
+        # name, route "mcp" — pins a tool server's rows without
+        # sweeping chat rows that share the name.
+        conds.append(RequestLog.route == slo.route)
     if slo.deployment is not None:
         # Deployment scope: attributed rows only — a request that
         # failed before any dispatch completed has no deployment to
@@ -250,6 +265,10 @@ async def measure_bad(
         RequestLog.created_at >= since,
         *_CLIENT_ROW,
     ]
+    if slo.route is not None:
+        # The same route scope as measure() — the budget and the
+        # verdict must never disagree about what counts.
+        conds.append(RequestLog.route == slo.route)
     if slo.deployment is not None:
         conds.append(RequestLog.deployment == slo.deployment)
     if slo.metric == "error_rate":
@@ -496,6 +515,7 @@ async def status(
                 "name": slo.name,
                 "model": slo.model,
                 "deployment": slo.deployment,
+                "route": slo.route,
                 "metric": slo.metric,
                 "target": slo.target,
                 "window_minutes": slo.window_minutes,

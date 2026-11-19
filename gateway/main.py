@@ -215,6 +215,7 @@ def create_app(
         config.cache.backend == "redis"
         or config.rate_limit.backend == "redis"
         or config.routing.breaker.backend == "redis"
+        or config.mcp.breaker.backend == "redis"
         or config.idempotency.backend == "redis"
         or config.vault.backend == "redis"
         or config.semantic_cache.backend == "redis"
@@ -224,7 +225,18 @@ def create_app(
     breakers = None
     if config.routing.breaker.backend == "redis":
         breakers = RedisCircuitBreakerRegistry(
-            redis_client, config.routing, prefix=config.redis.prefix
+            redis_client, config.routing.breaker, prefix=config.redis.prefix
+        )
+    # Per-MCP-server breakers (tier 66): the same Redis registry class
+    # in its own keyspace (namespace "mcp-cb"), so a deployment and an
+    # MCP server sharing a name never share state.
+    mcp_breakers = None
+    if config.mcp.breaker.backend == "redis":
+        mcp_breakers = RedisCircuitBreakerRegistry(
+            redis_client,
+            config.mcp.breaker,
+            prefix=config.redis.prefix,
+            namespace="mcp-cb",
         )
     # BYOK vault (tier 31): enabled iff GATEWAY_VAULT_MASTER_KEY is set
     # and the encryption package is importable — otherwise it sits
@@ -429,6 +441,10 @@ def create_app(
         # same one every outbound webhook/client uses; chat traffic
         # still goes through the router's adapters).
         http_client=client,
+        # Per-MCP-server circuit breakers (tier 66) — the Redis-backed
+        # registry when mcp.breaker.backend: redis, else built in the
+        # pipeline from mcp.breaker (in-process).
+        mcp_breakers=mcp_breakers,
     )
     # Batch API worker: drives /v1/batches lines in waves (app.state so
     # tests can tick it manually; the lifespan loop is the only driver
@@ -1107,6 +1123,21 @@ def create_app(
             )
         except Exception:  # noqa: BLE001 — informational only
             pass
+        # MCP server breakers (tier 66), reported the same way: an open
+        # tool-server circuit is a per-server condition the client sees
+        # as a fast in-band refusal, not an unhealthy gateway.
+        mcp_open = 0
+        mcp_half_open = 0
+        try:
+            mcp_snapshots = await app.state.pipeline.mcp_breakers.snapshots()
+            mcp_open = sum(
+                1 for s in mcp_snapshots.values() if s.get("state") == "open"
+            )
+            mcp_half_open = sum(
+                1 for s in mcp_snapshots.values() if s.get("state") == "half_open"
+            )
+        except Exception:  # noqa: BLE001 — informational only
+            pass
         ready = started and db_ok
         payload = {
             "ready": ready,
@@ -1116,6 +1147,7 @@ def create_app(
             "circuit_breakers": {
                 "open": breakers_open,
                 "half_open": breakers_half_open,
+                "mcp": {"open": mcp_open, "half_open": mcp_half_open},
             },
         }
         if db_error is not None:
@@ -1128,8 +1160,10 @@ def create_app(
     async def prometheus_metrics():
         # Circuit gauges: OPEN → HALF_OPEN happens on the clock without a
         # transition event, so re-sync before every scrape (with the Redis
-        # backend this also picks up other replicas' trips).
+        # backend this also picks up other replicas' trips) — both breaker
+        # families: deployments and MCP servers (tier 66).
         await app.state.pipeline.router.breakers.refresh_gauges()
+        await app.state.pipeline.mcp_breakers.refresh_gauges()
         return PlainTextResponse(
             generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST
         )

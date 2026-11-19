@@ -454,7 +454,7 @@ class RedisCircuitBreakerRegistry:
     ``routing.breaker.backend: redis``: one replica tripping a deployment's
     circuit opens it for the whole fleet, and a recovery closes it
     everywhere. State lives in one small hash per deployment
-    (``{prefix}:cb:{name}``):
+    (``{prefix}:{namespace}:{name}``):
 
     - ``state``      — raw state (closed / open; half-open is *derived*
       from ``opened_at`` + cooldown, exactly like the in-memory breaker,
@@ -474,20 +474,27 @@ class RedisCircuitBreakerRegistry:
     record calls are dropped with a warning: the breaker is protection,
     not correctness. Admin operations (snapshots / reset) surface the
     error instead.
+
+    Tier 66: the MCP proxy's per-SERVER breakers use this same class
+    with ``namespace="mcp-cb"`` (knobs from ``mcp.breaker``), so a
+    deployment and an MCP server that happen to share a name keep
+    separate hashes and separate gauges — the provider label
+    ("mcp") keeps the Prometheus series apart the same way.
     """
 
     def __init__(
         self,
         client: aioredis.Redis,
-        routing,
+        breaker,
         prefix: str = "llm-gateway",
         clock: Callable[[], float] = time.time,
+        namespace: str = "cb",
     ) -> None:
-        self.enabled = routing.breaker.enabled
-        self._threshold = routing.breaker.failure_threshold
-        self._cooldown = routing.breaker.cooldown_seconds
+        self.enabled = breaker.enabled
+        self._threshold = breaker.failure_threshold
+        self._cooldown = breaker.cooldown_seconds
         self._client = client
-        self._prefix = f"{prefix}:cb"
+        self._prefix = f"{prefix}:{namespace}"
         self._clock = clock
         self._providers: dict[str, str] = {}
         # Generous TTL: an OPEN hash must outlive the cooldown by far;

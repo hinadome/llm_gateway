@@ -58,7 +58,11 @@ async def test_readyz_ready(env):
     assert body["ready"] is True
     assert body["draining"] is False
     assert body["db"] is True
-    assert body["circuit_breakers"] == {"open": 0, "half_open": 0}
+    assert body["circuit_breakers"] == {
+        "open": 0,
+        "half_open": 0,
+        "mcp": {"open": 0, "half_open": 0},
+    }
 
 
 async def test_readyz_503_while_draining(env):

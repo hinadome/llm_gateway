@@ -125,9 +125,7 @@ def test_snapshot_reports_cooldown_remaining():
 
 
 async def test_registry_disabled_never_blocks():
-    registry = CircuitBreakerRegistry(
-        RoutingConfig(breaker=BreakerConfig(enabled=False)), clock=Clock()
-    )
+    registry = CircuitBreakerRegistry(BreakerConfig(enabled=False), clock=Clock())
     registry.register("d", "openai")
     for _ in range(10):
         await registry.record_failure("d")

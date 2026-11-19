@@ -74,6 +74,7 @@ from .shadow_diff import extract_content_text, score_pair
 from .forecasts import run_rate_month_end
 from .cost import CostCalculator, cached_tokens_from_usage
 from .mcp import (
+    CIRCUIT_OPEN,
     GUARDRAIL_BLOCKED,
     MCP_CONTENT_METHODS,
     MCPToolBlocked,
@@ -90,6 +91,7 @@ from .mcp import (
     sse_frame,
     upstream_headers,
 )
+from .breaker import CircuitBreakerRegistry
 from .realtime import RealtimeRelay
 from .runaway import RunawayProtector
 from .concurrency import ConcurrencyLimiter
@@ -217,6 +219,11 @@ class GatewayPipeline:
         # time needs direct upstream reach (chat/embeddings/images/audio
         # go through the router's adapters, which hold their own).
         http_client: httpx.AsyncClient | None = None,
+        # Per-MCP-server circuit breakers (tier 66). None = built here
+        # from ``mcp.breaker`` (in-process); create_app passes the
+        # Redis-backed registry when ``mcp.breaker.backend: redis`` —
+        # same interface, fleet-shared trips (router's pattern).
+        mcp_breakers: CircuitBreakerRegistry | None = None,
     ) -> None:
         self.config = config
         # Per-key metric series (metrics.per_key — opt-in; the labeler's
@@ -272,6 +279,20 @@ class GatewayPipeline:
         # None = standalone constructions, where the MCP surface refuses
         # with a clear 503 rather than pretending to work).
         self._http_client = http_client
+        # Per-server MCP circuit breakers (tier 66): the same registry
+        # class the router runs per deployment, keyed by SERVER name
+        # with provider "mcp" (the gauge family is shared — one
+        # dashboard panel for every circuit, the provider label keeps
+        # the series apart). An injected registry (Redis) wins, exactly
+        # like the router's. Registering on construction creates the
+        # gauge series from boot; apply_config re-registers so servers
+        # added by a reload get breakers (existing ones keep their
+        # state — a reload is not a health event).
+        self.mcp_breakers = mcp_breakers or CircuitBreakerRegistry(
+            config.mcp.breaker
+        )
+        for _server in config.mcp.servers:
+            self.mcp_breakers.register(_server.name, "mcp")
         # OTel API is a no-op until a provider is installed (spans are then
         # invalid and cost ~nothing), so this is safe unconditionally.
         self._tracer = tracer or trace.get_tracer("gateway")
@@ -1231,6 +1252,29 @@ class GatewayPipeline:
                 if server is None:
                     raise MCPServerNotAllowedError(server_name)
                 self._check_mcp_server_policy(ctx, server_name)
+                # Per-server circuit breaker (tier 66): refuse BEFORE
+                # the rate limit and the concurrency slot — an open
+                # circuit fails fast and holds nothing. Every message
+                # is gated, initialize included (after the cooldown it
+                # is the natural probe). The refusal is in-band — HTTP
+                # 200 with a JSON-RPC error — the same rationale as a
+                # guardrail denial: the client's JSON-RPC layer must
+                # see it. No all-open bypass here: this server is the
+                # only upstream for its name.
+                if not await self.mcp_breakers.allow(server_name):
+                    ctx.status = "error"
+                    ctx.error_message = "circuit breaker open"
+                    ctx.mcp_circuit_refused = True
+                    return JSONResponse(
+                        jsonrpc_error(
+                            message.get("id"),
+                            CIRCUIT_OPEN,
+                            f"MCP server '{server_name}' refused: its "
+                            "circuit breaker is open after consecutive "
+                            "connect failures or 5xx answers. Retry "
+                            "after the cooldown.",
+                        )
+                    )
                 await self._check_rate_limit(ctx, 0)
                 await self._acquire_slot(ctx)
 
@@ -2184,7 +2228,19 @@ class GatewayPipeline:
         chunks; a plain awaited post would buffer the whole stream
         first. Connection failures become the gateway's 502 envelope
         (the documented split: talking-to-the-server is ours, the
-        protocol above it is the server's)."""
+        protocol above it is the server's).
+
+        Breaker accounting (tier 66) happens here — every upstream POST
+        funnels through this one method, initialize included. A
+        CONNECT failure (ConnectError/ConnectTimeout — the server is
+        unreachable) or a 5xx answer (up and broken) is one failure; a
+        sub-500 answer is a SUCCESS (4xx and JSON-RPC error frames in
+        200 bodies are the server answering fine — client-caused, the
+        same rule the deployment breaker lives by); latency is NEVER
+        evidence (read/write/pool timeouts are not recorded — tools
+        legitimately run long). Streaming answers record at header
+        time: the connect succeeded, the server spoke — a mid-stream
+        death is the relay's problem, not the breaker's."""
         request = self._http_client.build_request(
             "POST",
             server.url,
@@ -2195,8 +2251,10 @@ class GatewayPipeline:
         if server.timeout_seconds is not None:
             kwargs["timeout"] = httpx.Timeout(server.timeout_seconds)
         try:
-            return await self._http_client.send(request, stream=stream, **kwargs)
-        except httpx.HTTPError as exc:
+            response = await self._http_client.send(request, stream=stream, **kwargs)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Unreachable — the breaker's evidence.
+            await self.mcp_breakers.record_failure(server.name)
             ctx.status = "error"
             ctx.error_message = f"mcp upstream unreachable: {exc}"
             raise ProviderError(
@@ -2204,6 +2262,24 @@ class GatewayPipeline:
                 f"MCP server '{server.name}' is unreachable: {exc}",
                 "api_error",
             ) from exc
+        except httpx.HTTPError as exc:
+            # Timeout mid-request, pool exhaustion, protocol quirks —
+            # latency and local limits, not server health. Never trip
+            # on these (the client still gets its 502 envelope).
+            ctx.status = "error"
+            ctx.error_message = f"mcp upstream unreachable: {exc}"
+            raise ProviderError(
+                502,
+                f"MCP server '{server.name}' is unreachable: {exc}",
+                "api_error",
+            ) from exc
+        # The server answered: 5xx is evidence it is broken, anything
+        # less is evidence it is alive.
+        if response.status_code >= 500:
+            await self.mcp_breakers.record_failure(server.name)
+        else:
+            await self.mcp_breakers.record_success(server.name)
+        return response
 
     async def _mcp_delete_upstream(
         self, server: MCPServerConfig, session: MCPSession
@@ -2241,6 +2317,11 @@ class GatewayPipeline:
         outcome = "success"
         if ctx.status == "blocked":
             outcome = "blocked"
+        elif ctx.mcp_circuit_refused:
+            # Tier 66: refused by the per-server breaker — nothing went
+            # upstream, and neither "error" (nothing was attempted) nor
+            # "relayed" says what happened.
+            outcome = "circuit_open"
         elif kind in ("notification", "response") and ctx.status == "success":
             outcome = "relayed"
         elif ctx.status == "error" or (ctx.status == "success" and ctx.error_message):
@@ -3806,6 +3887,12 @@ class GatewayPipeline:
         # its provider adapters (they hold the HTTP client); the groups,
         # routing policy and pricing are swapped in place.
         self.router.apply_config(config)
+        # MCP breakers (tier 66): same shared-state rule — the registry
+        # (possibly Redis) survives; re-registering creates breakers for
+        # servers the reload ADDED (state preserved for the rest — a
+        # reload is not a health event).
+        for _server in config.mcp.servers:
+            self.mcp_breakers.register(_server.name, "mcp")
         self.cost_calculator = CostCalculator(config.pricing)
         self._model_names = {m.name for m in config.models}
         self._model_windows = {m.name: m.context_window for m in config.models}

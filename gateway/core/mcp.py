@@ -47,6 +47,7 @@ SESSION_REQUIRED = -32000  # post-initialize message without a session header
 TOOL_NOT_ALLOWED = -32001  # tools/call outside the key's tool policy
 GUARDRAIL_BLOCKED = -32002  # a guardrail blocked the call's args or result
 SESSION_TERMINATED = -32003  # unknown/expired Mcp-Session-Id (404)
+CIRCUIT_OPEN = -32004  # the server's circuit breaker is open (tier 66)
 
 # The JSON-RPC methods that move content worth guarding (tier 49):
 # caller-controlled text in (a URI, prompt arguments, a completion

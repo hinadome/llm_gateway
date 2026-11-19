@@ -139,7 +139,7 @@ class Router:
         self.config = config
         self.providers = providers
         # Per-deployment circuit breakers (health-aware routing).
-        self.breakers = breakers or CircuitBreakerRegistry(config.routing, clock=clock)
+        self.breakers = breakers or CircuitBreakerRegistry(config.routing.breaker, clock=clock)
         # BYOK vault (optional — main.py always passes one; it is
         # disabled unless GATEWAY_VAULT_MASTER_KEY is set).
         self.vault = vault

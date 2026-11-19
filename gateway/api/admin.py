@@ -3434,14 +3434,23 @@ async def mcp_status(
     /admin/routing): the config surface (enabled, TTL) and each
     configured server — url, timeout, the NAMES of its auth headers
     (never the values — they are secrets, possibly env-resolved) and
-    how many gateway sessions are currently open against it."""
+    how many gateway sessions are currently open against it. Tier 66
+    adds the per-server circuit-breaker snapshot (state, consecutive
+    failures, lifetime trips, cooldown remaining — the same shape the
+    deployment breakers report)."""
     config = raw_request.app.state.config.mcp
     registry = raw_request.app.state.mcp_registry
+    breakers = raw_request.app.state.pipeline.mcp_breakers
     counts = registry.live_counts()
+    snapshots = await breakers.snapshots()
     return {
         "object": "mcp_status",
         "enabled": config.enabled,
         "session_ttl_seconds": config.session_ttl_seconds,
+        "circuit_breaker": {
+            "enabled": breakers.enabled,
+            "servers": snapshots,
+        },
         "servers": [
             {
                 "name": server.name,
@@ -3449,9 +3458,38 @@ async def mcp_status(
                 "timeout_seconds": server.timeout_seconds,
                 "header_names": sorted({**server.headers, **server.headers_env}),
                 "open_sessions": counts.get(server.name, 0),
+                "breaker": snapshots.get(server.name),
             }
             for server in config.servers
         ],
+    }
+
+
+@router.post("/admin/mcp/breakers/{server_name:path}/reset")
+async def reset_mcp_circuit(
+    server_name: str,
+    raw_request: Request,
+    admin: Annotated[AuthContext, Depends(require_platform_admin)],
+) -> dict:
+    """Force-close an MCP server's circuit (the next message probes it
+    again — initialize is the natural probe after an operator has fixed
+    the server). The per-server twin of the deployment reset."""
+    breakers = raw_request.app.state.pipeline.mcp_breakers
+    try:
+        await breakers.reset(server_name)
+    except KeyError:
+        raise GatewayError(
+            404,
+            f"MCP server '{server_name}' does not exist.",
+            "invalid_request_error",
+            code="mcp_server_not_found",
+        )
+    raw_request.app.state.audit.record(
+        "mcp.breaker.reset", actor=admin, mcp_server=server_name
+    )
+    return {
+        "server": server_name,
+        "breaker": (await breakers.snapshots())[server_name],
     }
 
 

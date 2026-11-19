@@ -700,11 +700,25 @@ class SLOTargetConfig(BaseModel):
     the dispatch to blame). A deployment-scoped target measures only
     the rows attributed to that deployment — the same honesty the
     post-promotion watch uses.
+
+    ``route`` (tier 66) narrows the scope to one inbound surface
+    (``chat`` | ``responses`` | ``messages`` | ``gemini`` |
+    ``realtime`` | ``mcp``) — None measures every row for the model.
+    The MCP use: a target ``model: "jira", route: "mcp"`` measures the
+    tool server's rows (whose model column carries the SERVER name),
+    so error-rate and latency promises cover tool calls without
+    sweeping chat rows that happen to share the name — and a
+    no-``route`` target over the same name sees everything, the
+    client's whole experience of that name. TTFT over an MCP-scoped
+    target is honestly unmeasurable (MCP answers are complete
+    JSON-RPC frames, nothing streams), which the verdict says as
+    ``insufficient_evidence`` — never a fabricated number.
     """
 
     name: str
     model: str  # public model name, exact
     deployment: str | None = None  # narrow to one deployment's attributed rows
+    route: str | None = None  # narrow to one inbound surface (see above)
     metric: Literal[
         "error_rate",
         "latency_p50_ms",
@@ -1372,11 +1386,33 @@ class MCPConfig(BaseModel):
     ``initialize`` and maps it to the upstream session + the negotiated
     protocol version; idle sessions are swept after
     ``session_ttl_seconds`` (a client that comes back re-initializes,
-    per the transport spec)."""
+    per the transport spec).
+
+    ``breaker`` (tier 66): one circuit breaker per configured SERVER —
+    the same state machine the router runs per deployment
+    (``core/breaker.py``; ``backend: redis`` shares trips across the
+    fleet, in its own keyspace), but with MCP-specific accounting: a
+    failure is an upstream CONNECT error (``httpx.ConnectError`` /
+    ``ConnectTimeout`` — the server is unreachable) or an HTTP 5xx
+    answer (the server is up and broken). NEVER latency: tools
+    legitimately run long, so read/write timeouts and slow answers are
+    not evidence of anything. 4xx answers and JSON-RPC error frames in
+    200 bodies are the server answering fine — evidence of health, and
+    a success in between resets the consecutive count, so an
+    intermittently erroring tool never trips anything. There is no
+    all-open bypass here: a deployment has a failover ladder, an MCP
+    server is the only upstream for its name, so an open circuit
+    REFUSES the message in-band (JSON-RPC ``-32004``, HTTP 200) —
+    failing fast instead of stalling a concurrency slot for the whole
+    upstream timeout. The breaker refuses, never retries: no call is
+    ever replayed, so none of the side-effect hazards of retrying a
+    tool call exist. ``initialize`` is gated too — after the cooldown it
+    is the natural probe (one success closes the circuit)."""
 
     enabled: bool = False
     session_ttl_seconds: float = 3600.0
     servers: list[MCPServerConfig] = Field(default_factory=list)
+    breaker: BreakerConfig = Field(default_factory=BreakerConfig)
 
     def server(self, name: str) -> MCPServerConfig | None:
         for server in self.servers:

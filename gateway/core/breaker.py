@@ -31,6 +31,16 @@ The clock is injectable for deterministic tests (monotonic by default);
 the ``CircuitBreaker`` state machine itself is synchronous — only the
 registry facade is async, so the in-memory and Redis backends are
 interchangeable at the router (like the rate limiter and cache backends).
+
+Tier 66: the same state machine and the same registry class now also
+serve the MCP proxy's per-SERVER breakers — a second registry built
+from ``mcp.breaker`` and registered with ``provider="mcp"``. The state
+machine is failure-agnostic; what counts as a failure is the caller's
+classification (the router counts exhausted retry budgets, the MCP
+pipeline counts connect errors and 5xx — see ``_mcp_post``), so both
+surfaces share the CLOSED/OPEN/HALF_OPEN logic, the gauges and the
+admin snapshot shape without sharing STATE: deployments and MCP
+servers key different registries (and different Redis namespaces).
 """
 
 from __future__ import annotations
@@ -39,7 +49,7 @@ import time
 from enum import IntEnum
 from typing import Callable
 
-from ..config import RoutingConfig
+from ..config import BreakerConfig
 from ..observability import metrics
 
 
@@ -167,10 +177,16 @@ class CircuitBreakerRegistry:
     interchangeably (selected by ``routing.breaker.backend``).
     """
 
-    def __init__(self, routing: RoutingConfig, clock: Callable[[], float] = time.monotonic) -> None:
-        self.enabled = routing.breaker.enabled
-        self._threshold = routing.breaker.failure_threshold
-        self._cooldown = routing.breaker.cooldown_seconds
+    def __init__(
+        self, breaker: BreakerConfig, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        """``breaker``: the breaker block this registry's knobs come
+        from — ``routing.breaker`` for the router's per-deployment
+        registry, ``mcp.breaker`` for the pipeline's per-server one
+        (tier 66). One registry instance per surface; names never mix."""
+        self.enabled = breaker.enabled
+        self._threshold = breaker.failure_threshold
+        self._cooldown = breaker.cooldown_seconds
         self._clock = clock
         self._breakers: dict[str, CircuitBreaker] = {}
         self._providers: dict[str, str] = {}

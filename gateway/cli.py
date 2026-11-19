@@ -941,18 +941,22 @@ async def cmd_mcp(api: Api, args) -> None:
     payload = await api.get("/admin/mcp")
     if _maybe_json(args, payload):
         return
+    cb = payload.get("circuit_breaker") or {}
     print(f"mcp proxy: {'on' if payload.get('enabled') else 'off'} · "
-          f"session ttl {payload.get('session_ttl_seconds')}s")
+          f"session ttl {payload.get('session_ttl_seconds')}s · "
+          f"circuit breakers: {'on' if cb.get('enabled') else 'off'}")
     servers = payload.get("servers") or []
     if not servers:
         print("no MCP servers configured.")
         return
     for server in servers:
         headers = ", ".join(server.get("header_names") or []) or "—"
+        breaker = (server.get("breaker") or {}).get("state") or "—"
         print(f"  {server.get('name')}: {server.get('url')} "
               f"(timeout {server.get('timeout_seconds')}s, "
               f"auth headers: {headers}, "
-              f"open sessions: {server.get('open_sessions')})")
+              f"open sessions: {server.get('open_sessions')}, "
+              f"breaker: {breaker})")
 
 
 async def cmd_slos(api: Api, args) -> None:

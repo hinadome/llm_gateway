@@ -39,10 +39,8 @@ class Clock:
 def _registry(redis, clock, **breaker_kwargs) -> RedisCircuitBreakerRegistry:
     reg = RedisCircuitBreakerRegistry(
         redis,
-        RoutingConfig(
-            breaker=BreakerConfig(
-                failure_threshold=THRESHOLD, cooldown_seconds=COOLDOWN, **breaker_kwargs
-            )
+        BreakerConfig(
+            failure_threshold=THRESHOLD, cooldown_seconds=COOLDOWN, **breaker_kwargs
         ),
         prefix="t",
         clock=clock,

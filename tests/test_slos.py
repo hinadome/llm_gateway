@@ -1008,3 +1008,176 @@ async def test_budget_burn_rules_disabled(tmp_path):
         assert row["budget"]["measured"] == 40
         assert (await _slos(env.client)).json()["config"]["burn"] == []
         break
+
+
+# ----------------------------------------------------------------------
+# Route scoping (tier 66): targets narrowed to one inbound surface —
+# the MCP server rows (model = the server name, route "mcp") can be
+# promised separately from chat rows that share the name.
+# ----------------------------------------------------------------------
+
+
+def _seed_routed(session, *, route: str, model: str, rows: list[dict]) -> None:
+    """Rows on one inbound surface (route set), controlled status and
+    latency — MCP-shaped when route="mcp": never streamed (ttft NULL),
+    no deployment attribution."""
+    now = datetime.now(timezone.utc)
+    for i, spec in enumerate(rows):
+        session.add(
+            RequestLog(
+                request_id=f"t66-{route}-{i}",
+                model=model,
+                route=route,
+                deployment=spec.get("deployment"),
+                status=spec["status"],
+                latency_ms=spec.get("latency_ms"),
+                created_at=now - timedelta(minutes=spec.get("minutes_ago", 0)),
+                shadow=False,
+                cache_hit=False,
+            )
+        )
+
+
+async def test_route_scope_measures_only_that_surface(tmp_path):
+    """A target with route="mcp" sees ONLY the tool-server rows; the
+    same model name without a route sees everything (the client's whole
+    experience of the name). Here: 10 healthy MCP rows beside 5 chat
+    rows carrying 2 errors — the scoped target is met on its own rows,
+    the unscoped one is breached on all 15."""
+    config = make_config(
+        slos=SLOsConfig(
+            targets=[
+                _target(
+                    name="tool-server",
+                    model="jira",
+                    route="mcp",
+                    metric="error_rate",
+                    target=0.05,
+                    min_requests=5,
+                ),
+                _target(
+                    name="everything",
+                    model="jira",
+                    metric="error_rate",
+                    target=0.05,
+                    min_requests=5,
+                ),
+            ]
+        )
+    )
+    async for env in _make_env(tmp_path, config=config):
+        async with get_sessionmaker()() as session:
+            _seed_routed(
+                session,
+                route="mcp",
+                model="jira",
+                rows=[{"status": "success", "latency_ms": 100 + i * 10} for i in range(10)],
+            )
+            _seed_routed(
+                session,
+                route="chat",
+                model="jira",
+                rows=[
+                    {"status": "success", "latency_ms": 300},
+                    {"status": "success", "latency_ms": 320},
+                    {"status": "success", "latency_ms": 340},
+                    {"status": "error"},
+                    {"status": "error"},
+                ],
+            )
+            await session.commit()
+
+        data = (await _slos(env.client)).json()["data"]
+        scoped = _by_name(data, "tool-server")
+        assert scoped["route"] == "mcp"  # the scope echoes beside the verdict
+        assert scoped["measured"]["requests"] == 10
+        assert scoped["measured"]["errors"] == 0
+        assert scoped["verdict"] == "met"
+
+        unscoped = _by_name(data, "everything")
+        assert unscoped["route"] is None
+        assert unscoped["measured"]["requests"] == 15  # both surfaces
+        assert unscoped["measured"]["errors"] == 2
+        assert unscoped["verdict"] == "breached"  # 2/15 > the 5% bar
+        break
+
+
+async def test_route_scoped_budget_counts_the_same_rows(tmp_path):
+    """The error-budget lens uses the SAME scope as the verdict (both
+    query legs filter identically): the scoped target's budget is
+    computed over the tool-server rows only, so a budget and its
+    verdict can never disagree about what counts."""
+    config = make_config(
+        slos=SLOsConfig(
+            targets=[
+                _target(
+                    name="tool-budget",
+                    model="jira",
+                    route="mcp",
+                    metric="latency_p95_ms",
+                    target=150.0,
+                    min_requests=5,
+                )
+            ]
+        )
+    )
+    async for env in _make_env(tmp_path, config=config):
+        async with get_sessionmaker()() as session:
+            _seed_routed(
+                session,
+                route="mcp",
+                model="jira",
+                rows=[{"status": "success", "latency_ms": 500} for _ in range(8)],
+            )
+            _seed_routed(
+                session,
+                route="chat",
+                model="jira",
+                rows=[{"status": "success", "latency_ms": 50} for _ in range(8)],
+            )
+            await session.commit()
+
+        row = _by_name((await _slos(env.client)).json()["data"], "tool-budget")
+        assert row["measured"]["latency_p95_ms"] == 500  # mcp rows only
+        assert row["verdict"] == "breached"  # 500 against a 150 bar
+        assert row["budget"]["measured"] == 8  # the SAME rows, not 16
+        assert row["budget"]["bad"] == 8  # every mcp row is over the bar
+        assert row["budget"]["burn_rate"] == 8 / 8 / 0.05  # observed / allowed
+        break
+
+
+async def test_route_scoped_ttft_is_honestly_unmeasurable(tmp_path):
+    """A TTFT target over the MCP route has nothing to measure — MCP
+    answers are complete JSON-RPC frames, nothing streams — and the
+    verdict says so (insufficient_evidence, "nothing streamed"),
+    never a fabricated number."""
+    config = make_config(
+        slos=SLOsConfig(
+            targets=[
+                _target(
+                    name="tool-ttft",
+                    model="jira",
+                    route="mcp",
+                    metric="ttft_p95_ms",
+                    target=800.0,
+                    min_requests=5,
+                )
+            ]
+        )
+    )
+    async for env in _make_env(tmp_path, config=config):
+        async with get_sessionmaker()() as session:
+            _seed_routed(
+                session,
+                route="mcp",
+                model="jira",
+                rows=[{"status": "success", "latency_ms": 120} for _ in range(9)],
+            )
+            await session.commit()
+
+        row = _by_name((await _slos(env.client)).json()["data"], "tool-ttft")
+        assert row["measured"]["requests"] == 9  # volume is real...
+        assert row["measured"]["ttft_p95_ms"] is None  # ...the metric is not
+        assert row["verdict"] == "insufficient_evidence"
+        assert "nothing streamed" in row["reason"]
+        break

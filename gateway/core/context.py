@@ -257,6 +257,13 @@ class RequestContext:
     # gateway_byok_requests_total metric. Observability only: the key
     # itself is never recorded anywhere.
     byok_provider: str | None = None
+    # MCP circuit breaker (tier 66): this message was REFUSED because the
+    # server's circuit is open (nothing went upstream). Carries the
+    # gateway_mcp_requests_total outcome "circuit_open" — a refusal is
+    # neither a server error nor a block, and the dashboards should say
+    # what actually happened. The row's status stays "error" (the client
+    # experienced a failure, and the SLO error-rate must count it).
+    mcp_circuit_refused: bool = False
     # Cached *input* tokens the upstream reported (provider-side
     # prompt caching) — a subset of prompt_tokens, billed at the
     # cached_input price. None when the upstream reports no detail

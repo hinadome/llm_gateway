@@ -209,6 +209,7 @@ def test_alert_payload_carries_the_numbers():
         "name": "svc",
         "model": "gpt-4o",
         "deployment": None,
+        "route": None,
         "metric": "error_rate",
         "target": 0.05,
         "value": 0.2,
@@ -242,12 +243,20 @@ def test_alert_payload_carries_the_numbers():
     assert payload["burn_rules"][0]["long_burn_rate"] == 15.2
     assert "against the 0.05 bar" in payload["message"]
     assert payload["fired_at"] == "2026-11-18T00:00:00+00:00"
+    # Route scope (tier 66) rides along so the receiving end can tell a
+    # tool-server breach from a chat one without calling back.
+    assert payload["route"] is None
+    mcp_payload = alert_payload(
+        {**row, "route": "mcp"}, "breached", "2026-11-18T00:00:00+00:00"
+    )
+    assert mcp_payload["route"] == "mcp"
 
     recovered = recovered_payload(
         {
             "name": "svc",
             "model": "gpt-4o",
             "deployment": None,
+            "route": "mcp",
             "metric": "error_rate",
             "target": 0.05,
             "verdict": "met",
@@ -258,6 +267,7 @@ def test_alert_payload_carries_the_numbers():
     assert recovered["type"] == "slo_recovered"
     assert "has recovered" in recovered["message"]
     assert recovered["budget_state"] == "on_track"
+    assert recovered["route"] == "mcp"
 
 
 async def test_delivery_outcomes_no_url_retry_then_fail():
