@@ -68,7 +68,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Cost tracking** | Per-1M-token pricing table (configurable), cost per request/key/model — including **provider prompt-cache discounts**: cached input tokens (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, Gemini `cachedContentTokenCount`) bill at the `cached_input` price, default 50% of input |
 | **Background queued logging** | Opt-in `logging.background_write` moves the request-log INSERT off the response path — the last DB round trip a response pays — behind a bounded queue drained by a background consumer; a full queue drops rows (counted on `gateway_logs_dropped_total`) rather than blocking, and shutdown drains everything pending |
 | **Per-key metrics** | Opt-in `metrics.per_key` splits request/token/cost counters by virtual key (`gateway_key_*_total`) for per-team dashboards; cardinality capped — keys beyond `per_key_max_series` collapse into one `__overflow__` label, and shadow mirrors are excluded |
-| **Operations** | Liveness (`/healthz`) separate from readiness (`/readyz` — 503 while starting, draining on shutdown, or DB-down; circuit-breaker state reported informationally); **config hot-reload** (`POST /admin/reload` or SIGHUP) swaps guardrails/models/routing/pricing without dropping traffic, refuses a bad config, and tells you what needs a restart; **SQLite backups** (`POST /admin/backup` — online `VACUUM INTO`, list/delete via `/admin/backups`; on PostgreSQL the endpoint refuses and points at `pg_dump`); graceful shutdown drains in-flight requests, background spend/shadow work and the log queue; hardened Docker image (non-root, HEALTHCHECK on readiness) + standalone `deploy/docker-compose.yml` (volumes for DB + backups, optional Redis profile) |
+| **Operations** | Liveness (`/healthz`) separate from readiness (`/readyz` — 503 while starting, draining on shutdown, or DB-down; circuit-breaker state reported informationally); **config hot-reload** (`POST /admin/reload` or SIGHUP) swaps guardrails/models/routing/pricing without dropping traffic, refuses a bad config, and tells you what needs a restart; **SQLite backups** (`POST /admin/backup` — online `VACUUM INTO`, list/delete via `/admin/backups`; on PostgreSQL the endpoint refuses and points at `pg_dump`); graceful shutdown drains in-flight requests, background spend/shadow work and the log queue; hardened Docker image (non-root, HEALTHCHECK on readiness) + standalone `deploy/docker-compose.yml` (volumes for DB + backups, optional Redis profile); **one-command VM deploy** — `scripts/deploy_vm.sh` bootstraps a fresh Ubuntu VM (Docker from the official apt repo), builds the image, serves HTTPS via the Caddy overlay (self-signed or Let's Encrypt, auto-renewed), installs the `llm-gateway.service` systemd unit and gates on `/readyz`; `.github/workflows/deploy.yml` runs the same script from CI on push to `main` (dormant until enabled, like `ci.yml`) (see [Deployment & CI/CD](#deployment--cicd)) |
 
 ## Quick start
 
@@ -193,6 +193,32 @@ Serve TLS with `python -m gateway` (or its wrapper `scripts/gateway.sh`) and one
 With HTTPS on, add `--redirect-http [PORT]` to also listen on plain HTTP (default port 80 — may need `sudo`/`CAP_NET_BIND_SERVICE`) and answer every request there with a **308 Permanent Redirect** to the same URL on HTTPS — browsers and SDKs that default to `http://` get bounced to the encrypted listener instead of a connection error, and POST bodies survive the hop (308 preserves the method).
 
 To terminate TLS in front of the gateway instead (nginx, Caddy, a load balancer), leave it on HTTP — only one TLS layer is needed; clients then send `https://` to the proxy.
+
+## Deployment & CI/CD
+
+`scripts/deploy_vm.sh` turns a fresh Ubuntu 22.04/24.04 VM (Debian works — the bootstrap is apt-based) into a running, HTTPS-capable gateway with one command. It bootstraps Docker from the official apt repo, syncs the repo, builds the image, merges the TLS overlay, installs a systemd unit, and polls `/readyz` through the proxy before reporting success. Every step is idempotent — re-run the script to redeploy.
+
+```bash
+# plain HTTP — behind your own load balancer, or for a quick look
+scripts/deploy_vm.sh --host root@203.0.113.5
+
+# HTTPS with a self-signed dev certificate (Caddy `tls internal`)
+scripts/deploy_vm.sh --host root@203.0.113.5 --tls self-signed
+
+# HTTPS with Let's Encrypt — Caddy issues and renews automatically (ACME)
+scripts/deploy_vm.sh --host root@203.0.113.5 \
+    --tls letsencrypt --domain api.example.com --email ops@example.com
+```
+
+- `--dry-run` prints every remote command and every rendered file (the Caddyfile, `deploy/vm.env`, the systemd unit) and changes nothing.
+- No `--host` deploys the machine the script runs on — its own cloud-init: `git clone && scripts/deploy_vm.sh`.
+- `--image ghcr.io/you/llm-gateway:tag` runs a prebuilt image instead of building on the VM.
+
+**HTTPS terminates at Caddy** (`deploy/docker-compose.tls.yml`) — exactly the front-proxy pattern above, automated. The gateway container stays plain HTTP (no certificates inside the image); Caddy serves `:443` (HTTP/3 included) and `:80` (ACME challenges + a permanent redirect to HTTPS); the gateway's published port is pinned to `127.0.0.1:8000` (`GATEWAY_HTTP_PORT` in `deploy/vm.env`), so the proxy is the only public entry point. Self-signed mode issues a dev certificate for `--domain` (default: the `--host` address); letsencrypt mode needs a public DNS name + `--email` and renews forever without certbot. Certificates and the ACME account live in the `caddy-data` volume — keep it across redeploys or Let's Encrypt rate limits bite.
+
+The stack runs as **`llm-gateway.service`**: systemd starts it on boot and waits for the healthcheck (`up -d --wait`); `systemctl status llm-gateway` and `journalctl -u llm-gateway` are the operational levers. Config changes are redeploys — edit `config.yaml` in the repo and re-run the script (it re-syncs).
+
+**GitHub Actions.** `.github/workflows/deploy.yml` deploys on every push to `main` by running the same script over SSH. Like `ci.yml`, it is dormant until the repository is on GitHub; opt in with the repository variable `DEPLOY_ENABLED=true` plus `DEPLOY_HOST` (variable) and `DEPLOY_SSH_KEY` (secret — the private half of a dedicated passphrase-less deploy key). Every other knob — user, TLS mode, domain, email, image — is a variable; the workflow header lists them all. `ci.yml` runs the full test suite on the same push.
 
 ## API surface
 

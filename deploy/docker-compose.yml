@@ -14,6 +14,10 @@
 # backends to `redis` in your config.yaml (see config.yaml's `redis:`
 # block for the URL — it defaults to localhost, so point it at
 # `redis://redis:6379/0` when running in compose).
+#
+# HTTPS on a VM: scripts/deploy_vm.sh --tls self-signed|letsencrypt merges
+# docker-compose.tls.yml (Caddy on :80/:443) and sets GATEWAY_HTTP_PORT
+# below to 127.0.0.1:8000, so the proxy is the only public entry point.
 
 name: llm-gateway
 
@@ -22,8 +26,18 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    # Default tag matches compose's own <project>-<service> naming, so
+    # local builds are identical with or without this line; set
+    # GATEWAY_IMAGE (deploy/vm.env via scripts/deploy_vm.sh --image) to
+    # run a prebuilt registry image instead — pair it with
+    # `docker compose pull` and `up --no-build`.
+    image: ${GATEWAY_IMAGE:-llm-gateway-gateway}
+    # Plain HTTP is the container's whole TLS story — certificates are
+    # terminated in front (Caddy from docker-compose.tls.yml, or your own
+    # load balancer). Any [HOST:]PORT spec works; the deploy script pins
+    # it to 127.0.0.1:8000 in TLS mode.
     ports:
-      - "8000:8000"
+      - "${GATEWAY_HTTP_PORT:-8000}:8000"
     env_file:
       # Optional (compose >= 2.24): GATEWAY_* settings from .env when present.
       - path: ../.env

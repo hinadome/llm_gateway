@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 96 Python files, ~39,100 lines, 1477 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 96 Python files, ~39,100 lines, 1498 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -4635,6 +4635,19 @@ tests/
 │                        (tenant-admin 403 verbatim, the no-credential 401
 │                        hint, the unreachable transport) and the parser/
 │                        env/entry-point smokes
+├── test_deploy.py        VM deployment tier (tier 65): bash -n + the script's
+│                        --help/--dry-run surface — the printed plan (compose
+│                        files per TLS mode, the 127.0.0.1:8000 port pin,
+│                        build-vs-pull per --image, the /readyz health URL)
+│                        and every rendered file (vm.env, Caddyfile, the
+│                        systemd unit; `tls internal` present/absent per
+│                        mode), the validation matrix (letsencrypt needs
+│                        domain+email; malformed flags), parse-level YAML
+│                        shape of the compose TLS overlay + the dormant
+│                        deploy workflow (the DEPLOY_ENABLED gate), and the
+│                        cross-artifact contracts: unit TimeoutStopSec >
+│                        compose stop_grace_period, Dockerfile stays
+│                        plain-HTTP behind the proxy
 └── test_core.py         CostCalculator (prefix pricing + modality unit prices) + RateLimiter windows
 ```
 
@@ -4717,7 +4730,22 @@ The compose gateway deliberately sets per-signal OTLP endpoints for traces and l
 
 ---
 
-## 11. Related reading
+## 11. Deployment & CI/CD (the VM path)
+
+Tier 65 ships the container-and-VM story as testable artifacts — no deploy logic lives in prose, in a wiki or in an operator's memory. The CI/CD half follows the same honest-dormancy rule as `ci.yml`: nothing fires until a remote exists *and* an operator opts in.
+
+- **`scripts/deploy_vm.sh`** — the one-command deploy: bootstrap (Docker CE + the compose plugin from the official `download.docker.com` apt repo — Ubuntu 22.04/24.04 target, Debian tolerated; `curl`/`rsync` ensured; every step skipped when already present), rsync the repo to `/opt/llm-gateway` (never `--delete` — state lives in volumes; `.env` and `deploy/certs/` never leave the machine), build the image on the VM or `--image REF` to pull a prebuilt one, merge the TLS overlay, install the systemd unit, then poll `/readyz` through the proxy before reporting success. Without `--host` it deploys the machine it runs on (its own cloud-init); `--dry-run` prints every remote command **and** every rendered file, changing nothing. Every flag value is allowlist-validated before it can reach an SSH command string; SSH is `BatchMode` + `StrictHostKeyChecking=accept-new` only.
+- **`deploy/docker-compose.tls.yml`** — the HTTPS overlay: Caddy 2 on `:80` (ACME HTTP-01 challenges + the redirect to HTTPS) and `:443` (tcp+udp, HTTP/3), proxying `gateway:8000` over the compose network and waiting on the gateway's compose healthcheck before accepting traffic. TLS terminates once, in front — the gateway container stays plain HTTP, so the image carries no certificates and no TLS code. In TLS mode the script pins the gateway's published port to `127.0.0.1:8000` (`GATEWAY_HTTP_PORT` in `deploy/vm.env`), making the proxy the only public entry point; certificates + the ACME account ride the `caddy-data` volume across redeploys.
+- **`deploy/Caddyfile.template`** — rendered by the script into `deploy/Caddyfile`: `tls internal` (self-signed dev certificate) or automatic ACME issuance **and renewal** (Let's Encrypt — no certbot, no deploy hooks, no restart-on-renewal; Caddy reloads certificates in-process), with `default_sni` so no-SNI clients (curl against an IP literal) still reach the site.
+- **`deploy/gateway.service.template`** — rendered into `/etc/systemd/system/llm-gateway.service`: a oneshot lifecycle wrapper (`RemainAfterExit`) whose ExecStart is `docker compose <files> up -d --wait --wait-timeout 180` — a boot that cannot serve fails loudly — and whose ExecStop is `down`, inside `TimeoutStopSec=90`, comfortably over the compose `stop_grace_period: 35s` drain window. The compose file list is baked in at render time so boot never re-reads the deploy flags; `deploy/vm.env` (the unit's EnvironmentFile) carries the interpolation variables to every invocation.
+- **`.github/workflows/deploy.yml`** — the CD half: on push to `main` (plus `workflow_dispatch`), install the `DEPLOY_SSH_KEY` secret and run the **same script** over SSH with every deploy-time choice a repository variable (`DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_TLS`, `DEPLOY_DOMAIN`, `DEPLOY_EMAIL`, `DEPLOY_IMAGE`). The workflow holds zero deploy logic — it is credential plumbing plus the trigger — and stays dormant until `DEPLOY_ENABLED=true` is set; a concurrency group serializes deploys and never cancels a half-finished one.
+- **`docker-compose.yml`** grew two interpolation knobs with unchanged defaults: `ports: "${GATEWAY_HTTP_PORT:-8000}:8000"` (the port pin above; everyone else keeps the old behavior) and `image: ${GATEWAY_IMAGE:-llm-gateway-gateway}` (the default *is* compose's own `<project>-<service>` naming, so local builds are identical with or without the line).
+
+`tests/test_deploy.py` (21 tests) pins the tier without a VM, an SSH connection or a docker daemon: `bash -n` and the `--help` surface; the `--dry-run` plan (compose file list per mode, the port pin, build-vs-pull per `--image`, the health URL through the proxy) and every rendered file (`tls internal` present/absent per mode, the ACME email, the unit's baked-in compose files); the validation matrix; parse-level YAML shape of the overlay and the workflow (including the `DEPLOY_ENABLED` gate); and the cross-artifact contracts — the unit's stop timeout must exceed the compose drain window, the Dockerfile must stay plain HTTP behind the proxy, and the script must reference every artifact by name.
+
+---
+
+## 12. Related reading
 
 - [README.md](README.md) — quick start, configuration reference, endpoint list
 - `gateway/guardrails/base.py` — the guardrail contract (docstrings are the spec)

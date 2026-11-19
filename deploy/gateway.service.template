@@ -1,0 +1,43 @@
+# systemd unit for the LLM Gateway VM deployment.
+#
+# TEMPLATE — scripts/deploy_vm.sh renders this file (substituting the app
+# dir and the compose file list) and installs it as
+# /etc/systemd/system/llm-gateway.service on the VM; the rendered copy
+# stays in the deploy directory for inspection. Edits are overwritten by
+# the next deploy.
+#
+# The unit is a thin lifecycle wrapper around `docker compose`: on boot it
+# brings the stack up and blocks until the gateway container reports
+# healthy (--wait, the compose /readyz healthcheck); on stop it tears the
+# stack down inside the compose stop_grace_period (the in-app drain
+# window). Container-level crashes are handled by the compose file's
+# `restart: unless-stopped` — this unit covers reboots and gives operators
+# one obvious lever: `systemctl status|restart llm-gateway`.
+#
+# The compose file list is baked in at deploy time (base only, or base +
+# the TLS overlay), so the unit never re-reads the deploy flags.
+# deploy/vm.env — rendered by the same script — carries the compose
+# interpolation variables (GATEWAY_HTTP_PORT, GATEWAY_IMAGE) and is read by
+# every compose invocation below via EnvironmentFile.
+
+[Unit]
+Description=LLM Gateway — OpenAI-compatible proxy (docker compose)
+Documentation=file://@APP_DIR@/README.md
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@APP_DIR@
+EnvironmentFile=-@APP_DIR@/deploy/vm.env
+# -d --wait: detached, then block until every container with a healthcheck
+# reports healthy (/readyz) — a boot that cannot serve fails loudly.
+ExecStart=/usr/bin/docker compose @COMPOSE_FILES@ up -d --wait --wait-timeout 180
+# `down` stops inside the compose stop_grace_period (35s — in-flight
+# requests drain); TimeoutStopSec gives systemd headroom on top of it.
+ExecStop=/usr/bin/docker compose @COMPOSE_FILES@ down
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

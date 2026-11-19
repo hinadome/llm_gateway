@@ -1,0 +1,58 @@
+# LLM Gateway — TLS overlay: a Caddy reverse proxy in front of the gateway.
+#
+# Merged on top of docker-compose.yml, either by scripts/deploy_vm.sh
+# (--tls self-signed | --tls letsencrypt) or manually:
+#
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/docker-compose.tls.yml up -d --build
+#
+# Caddy terminates TLS on :443 (HTTP/3 included), answers Let's Encrypt's
+# ACME HTTP-01 challenges on :80, permanently redirects every other :80
+# request to the https:// URL, and proxies the gateway over the compose
+# network — the gateway container itself keeps serving plain HTTP on 8000,
+# so the image needs no certificates, keys or TLS code. (The same "one TLS
+# layer, in front" rule as scripts/gateway.sh's bare-metal proxy note.)
+#
+# Caddy reads deploy/Caddyfile, rendered from deploy/Caddyfile.template by
+# the deploy script: `tls internal` = self-signed dev certificate;
+# otherwise certificates are issued and renewed automatically via ACME
+# (Let's Encrypt) — point --domain at a public DNS name that resolves here.
+#
+# With this overlay the deploy script also pins the gateway's published
+# port to the VM loopback (GATEWAY_HTTP_PORT=127.0.0.1:8000 in
+# deploy/vm.env — see the interpolation in docker-compose.yml), making
+# Caddy the only public entry point. Merging the overlay manually without
+# that variable leaves :8000 published on all interfaces.
+#
+# Certificates + the ACME account live in the `caddy-data` volume: keep it
+# across redeploys (`docker compose down` leaves volumes; only `down -v`
+# removes them) or Let's Encrypt rate limits bite on re-issuance.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"        # ACME HTTP-01 challenges + the redirect to HTTPS
+      - "443:443"      # HTTPS
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      # Rendered by scripts/deploy_vm.sh from deploy/Caddyfile.template.
+      # Relative host paths resolve against deploy/ — with -f flags the
+      # project directory is the first compose file's folder — so this is
+      # deploy/Caddyfile in every invocation style (script, systemd unit,
+      # manual).
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data     # certificates + ACME account (keep across redeploys)
+      - caddy-config:/config
+    depends_on:
+      gateway:
+        # The proxy only accepts traffic once the gateway reports ready
+        # (/readyz — the compose healthcheck in docker-compose.yml).
+        condition: service_healthy
+    # No profiles gate here: the overlay file itself is the opt-in —
+    # without `-f docker-compose.tls.yml` none of this exists.
+
+volumes:
+  caddy-data:
+  caddy-config:

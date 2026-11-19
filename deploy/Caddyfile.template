@@ -1,0 +1,32 @@
+# Caddy reverse proxy in front of the LLM Gateway container.
+#
+# TEMPLATE — scripts/deploy_vm.sh renders this into the deploy directory's
+# Caddyfile on the VM (and prints the render on --dry-run). Edits are
+# overwritten by the next deploy; change the site settings by re-running
+# the script with different flags, not by editing the output.
+#
+# The render substitutes three things: the site address (a public DNS name
+# in letsencrypt mode, or the VM's hostname / IP / localhost in
+# self-signed mode), the ACME account email, and the TLS directive
+# (`tls internal` = self-signed dev certificate, otherwise certificates
+# are issued and renewed automatically via ACME / Let's Encrypt).
+#
+# What Caddy does with the rendered file:
+#   - proxies https://<site> to the gateway over the compose network
+#     (gateway:8000, plain HTTP inside — TLS terminates here, once)
+#   - issues and renews certificates automatically (ACME HTTP-01 via :80;
+#     no certbot, no renewal hooks, no restarts)
+#   - permanently redirects every other :80 request to the https:// URL
+#   - default_sni makes the site answer clients that send no SNI at all
+#     (old TLS libraries, curl against an IP literal)
+
+{
+	default_sni @DOMAIN@
+	# ACME account contact; only used for public certificate issuance.
+	email @EMAIL@
+}
+
+@DOMAIN@ {
+	@TLS@
+	reverse_proxy gateway:8000
+}

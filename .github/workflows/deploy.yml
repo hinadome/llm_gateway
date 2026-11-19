@@ -1,0 +1,76 @@
+# CD: deploy to the VM over SSH on every push to main.
+#
+# This workflow is a thin trigger around scripts/deploy_vm.sh — the same
+# script an operator runs by hand. All the logic lives in the script
+# (bootstrap, sync, image, TLS, systemd, readiness check); the workflow is
+# only the credential plumbing: write the SSH key, call the script with
+# repository variables.
+#
+# Dormant by design, exactly like ci.yml: it stays inert until the
+# repository is pushed to GitHub AND an operator opts in —
+#
+#   1. Set the repository variable DEPLOY_ENABLED=true
+#      (Settings → Secrets and variables → Actions → Variables).
+#   2. Set DEPLOY_HOST (the VM's address) and, optionally: DEPLOY_USER
+#      (default root), DEPLOY_TLS (none|self-signed|letsencrypt),
+#      DEPLOY_DOMAIN, DEPLOY_EMAIL (both required by letsencrypt) and
+#      DEPLOY_IMAGE (a prebuilt image ref; default: build on the VM).
+#   3. Add the repository secret DEPLOY_SSH_KEY — the PRIVATE half of a
+#      dedicated deploy key (public half in the VM's authorized_keys),
+#      passphrase-less: the deploy must run unattended. Give this key a
+#      deploy user with nothing else; the script needs root on the VM.
+#
+# ci.yml runs the full test suite on the same push; this workflow deploys
+# alongside it. Deployments never overlap (concurrency group, no
+# cancellation) — a half-finished deploy must finish before the next.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VM (SSH)
+    runs-on: ubuntu-latest
+    # Dormant until the operator opts in via the DEPLOY_ENABLED variable.
+    if: vars.DEPLOY_ENABLED == 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the deploy SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Fail fast on a malformed/passphrase-protected key.
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
+
+      - name: Deploy (scripts/deploy_vm.sh)
+        env:
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_TLS: ${{ vars.DEPLOY_TLS }}
+          DEPLOY_DOMAIN: ${{ vars.DEPLOY_DOMAIN }}
+          DEPLOY_EMAIL: ${{ vars.DEPLOY_EMAIL }}
+          DEPLOY_IMAGE: ${{ vars.DEPLOY_IMAGE }}
+        run: |
+          scripts/deploy_vm.sh \
+            --host "${DEPLOY_USER:-root}@${DEPLOY_HOST}" \
+            --ssh-key ~/.ssh/id_ed25519 \
+            --tls "${DEPLOY_TLS:-none}" \
+            --domain "${DEPLOY_DOMAIN:-}" \
+            --email "${DEPLOY_EMAIL:-}" \
+            --image "${DEPLOY_IMAGE:-}"

@@ -8,6 +8,52 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- One-command VM deployment + CI/CD (tier 65) —
+  `scripts/deploy_vm.sh` turns a fresh Ubuntu 22.04/24.04 VM (Debian
+  works — the bootstrap is apt-based) into a running, HTTPS-capable
+  gateway: Docker CE + the compose plugin from the official apt repo,
+  rsync, image build on the VM (or `--image REF` to pull a prebuilt
+  one), Caddy TLS overlay, systemd unit, readiness-gated — idempotent
+  (redeploy = re-run), `--dry-run`-able (prints every remote command
+  and every rendered file, changes nothing), and with no `--host` it
+  deploys the machine it runs on (its own cloud-init). Flag values are
+  allowlist-validated before they can reach an SSH command string.
+  - **HTTPS terminates at Caddy** (`deploy/docker-compose.tls.yml`),
+    once, in front — the gateway container stays plain HTTP (the image
+    carries no certificates; the Dockerfile's uvicorn CMD is the
+    contract and a test pins it). Caddy serves `:443` (HTTP/3
+    included) and `:80` (ACME HTTP-01 challenges + the redirect to
+    HTTPS); the gateway's published port is pinned to `127.0.0.1:8000`
+    (`GATEWAY_HTTP_PORT` in `deploy/vm.env`), so the proxy is the only
+    public entry point. `deploy/Caddyfile.template` renders the site:
+    `tls internal` (self-signed dev certificate) or automatic ACME
+    issuance **and renewal** (Let's Encrypt — no certbot, no hooks, no
+    restart-on-renewal), `default_sni` for no-SNI clients.
+    Certificates + the ACME account ride the `caddy-data` volume.
+  - **Boot persistence**: `deploy/gateway.service.template` renders to
+    `/etc/systemd/system/llm-gateway.service` — a oneshot lifecycle
+    wrapper: `up -d --wait --wait-timeout 180` on boot (a boot that
+    cannot serve fails loudly), `down` within `TimeoutStopSec=90`,
+    comfortably over the compose `stop_grace_period: 35s` drain window
+    (pinned by a cross-artifact test). The compose file list is baked
+    in at render time; `deploy/vm.env` carries the interpolation
+    variables to every compose invocation.
+  - **CD**: `.github/workflows/deploy.yml` runs the same script over
+    SSH on push to `main` — dormant exactly like `ci.yml` until the
+    repository is on GitHub and an operator opts in (variable
+    `DEPLOY_ENABLED=true`, `DEPLOY_HOST`; secret `DEPLOY_SSH_KEY`;
+    every other knob is a variable). Zero deploy logic in the
+    workflow; a concurrency group serializes deploys and never cancels
+    a half-finished one.
+  - `deploy/docker-compose.yml` grew two interpolation knobs with
+    unchanged defaults: `ports: "${GATEWAY_HTTP_PORT:-8000}:8000"` and
+    `image: ${GATEWAY_IMAGE:-llm-gateway-gateway}` (the default *is*
+    compose's own `<project>-<service>` naming).
+  - New `tests/test_deploy.py` (21 tests) pins the tier without a VM,
+    SSH or a docker daemon — the dry-run plan + rendered files, the
+    validation matrix, parse-level YAML shape of the overlay and the
+    workflow, and the cross-artifact contracts; suite now 1498.
+
 - `gateway` CLI console script (tier 64) — the admin API's terminal
   client, the scripted sibling of the dashboard: keys and tenants
   from a shell, a capture/replay check from cron, fleet state from an
