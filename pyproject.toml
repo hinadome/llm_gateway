@@ -38,6 +38,11 @@ vault = [
     "cryptography>=42.2",
 ]
 
+# The ``gateway`` console script is the admin-API *client* (gateway/cli.py);
+# the server entry point remains ``python -m gateway``.
+[project.scripts]
+gateway = "gateway.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",

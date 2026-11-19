@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 95 Python files, ~37,200 lines, 1419 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 96 Python files, ~39,100 lines, 1477 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -156,6 +156,43 @@ gateway/
 ├── utils.py                Content flattening (text + [image]/[audio] part
 │                           placeholders), token estimation, truncation,
 │                           audio format<->MIME mapping helpers
+│
+├── cli.py                  The ``gateway`` console script (tier 64): the admin
+│                           API's terminal client — a thin HTTP client of the
+│                           same JSON admin API as the dashboard (same
+│                           --key/GATEWAY_ADMIN_KEY credential, same scoping;
+│                           every error is the API's own envelope message,
+│                           rendered "gateway: <message>" on stderr, exit 1)
+│                           that imports nothing from the gateway package and
+│                           adds zero dependencies (argparse + httpx, both
+│                           already required). Command groups cover every
+│                           admin surface except the playground chat and the
+│                           promotion applies (all evidence reads included):
+│                           keys (create/show/edit/rotate/revoke — the API's
+│                           DELETE is a revoke, so the CLI exposes one honest
+│                           word), tenants, BYOK vault (interactive-TTY stdin
+│                           refused — shell history), prompt library, logs +
+│                           capture/replay, feedback, fleet state (routing,
+│                           breakers reset, guardrails, canaries, runaway,
+│                           concurrency, MCP, SLOs, PII scan), billing
+│                           (invoices incl. --csv, anomalies, forecasts,
+│                           usage-export) and migration evidence (shadow-diff,
+│                           verdicts, watch, pairs, trials), reload, backups.
+│                           Conventions: aligned plain-text tables; --json
+│                           prints the EXACT response payload; single objects
+│                           as key-value dumps; exports to stdout or --out
+│                           FILE; absent flags are absent body fields (a
+│                           patch touches only what the operator named), with
+│                           dedicated flags where a plain --flag cannot carry
+│                           a tri-state: --cache-bypass sends cache_enabled:
+│                           false, --cache-inherit an explicit null (reset to
+│                           the global policy), --expires null clears the
+│                           deadline. Async core run(argv, client, key) so
+│                           tests drive it against the in-process app; the
+│                           console-script shim main() wraps it in asyncio.run
+│                           with its own client (--url/GATEWAY_URL). The
+│                           SERVER entry point remains python -m gateway —
+│                           the console script only operates a running gateway
 │
 ├── api/                    ── HTTP layer (thin: parse → authenticate → delegate) ──
 │   ├── deps.py             require_api_key: extract credential (Bearer,
@@ -4578,6 +4615,26 @@ tests/
 │                        mcp introspection (header NAMES only), key field
 │                        round-trip, hot-reload removal, mcp.* events
 │                        via a Recorder handler
+├── test_cli.py          The ``gateway`` console script (tier 64): the async
+│                        core (cli.run) driven against the in-process app —
+│                        output conventions (tables, --json = the exact
+│                        payload, the raw key printed exactly once, exports
+│                        to stdout or --out), flag marshaling through a
+│                        body-recording MockTransport client (absent flags
+│                        are absent fields; the tri-state cache flags send
+│                        explicit false/null; --expires null clears; JSON-
+│                        object flags, garbage = a clean exit 1), keys/
+│                        tenants/vault/prompts lifecycle round trips (incl.
+│                        tenants are id-addressed, the vault TTY refusal),
+│                        capture→replay ("nothing would change"), feedback
+│                        list/stats, fleet state + breaker reset, billing
+│                        surfaces, migration reads, trials incl. the mid-run
+│                        cancel and the finished-409, reload from a
+│                        tmp_path config (never the repo's config.yaml)
+│                        + the bad-path 400, backups, scoping passthrough
+│                        (tenant-admin 403 verbatim, the no-credential 401
+│                        hint, the unreachable transport) and the parser/
+│                        env/entry-point smokes
 └── test_core.py         CostCalculator (prefix pricing + modality unit prices) + RateLimiter windows
 ```
 

@@ -8,6 +8,47 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- `gateway` CLI console script (tier 64) — the admin API's terminal
+  client, the scripted sibling of the dashboard: keys and tenants
+  from a shell, a capture/replay check from cron, fleet state from an
+  SSH session. A thin HTTP client of the same JSON admin API — same
+  credential (`--key` / `GATEWAY_ADMIN_KEY`, same for `--url` /
+  `GATEWAY_URL`), same scoping, every 403/404 the API would return
+  printed verbatim — importing nothing from the gateway package, zero
+  new dependencies (argparse + httpx). The **server** entry point
+  remains `python -m gateway`; the console script only operates a
+  running gateway.
+  - **Command groups** cover every admin surface except the playground
+    chat and the promotion applies (all their evidence reads
+    included): `status` / `stats`, `keys` (create/show/edit/rotate/
+    revoke — the API's DELETE is a revoke, so the CLI exposes exactly
+    one honest word for it), `tenants`, `vault` (put refuses
+    interactive-TTY stdin — shell history), `prompts`, `logs` +
+    `replay`, `feedback`, `routing` / `breakers` / `guardrails` /
+    `canaries` / `runaway` / `concurrency` / `mcp` / `slos` /
+    `pii-scan`, `invoices` (incl. `--csv`) / `anomalies` / `forecasts`
+    / `usage-export`, `shadow-diff` / `verdicts` / `watch` / `pairs`
+    / `trials`, `reload`, `backups`.
+  - **Conventions**: aligned plain-text tables (pipe-friendly);
+    `--json` prints the exact response payload; single objects as
+    key-value dumps; the raw credential from create/rotate prints
+    exactly once, prominently; exports to stdout or `--out FILE`;
+    errors as `gateway: <message>` on stderr, exit 1 — the API's own
+    envelope message, verbatim, with a pass-`--key` hint appended to
+    a credential-less 401.
+  - **Honest flag marshaling**: absent flags are absent request-body
+    fields, so a patch touches only what the operator named — with
+    dedicated flags where a plain `--flag` cannot carry a tri-state
+    (`--cache-bypass` sends `cache_enabled: false`, `--cache-inherit`
+    an explicit null resetting to the global policy, `--expires null`
+    clears a deadline), `--admin` defaulting to absent (never a
+    false), and JSON-object flags (`--prompt-vars`,
+    `--model-mappings`, `--metadata`) whose garbage is a clean exit 1.
+  - New `tests/test_cli.py` (58 tests) drives the async core against
+    the in-process app, including a body-recording transport that
+    pins the marshaling rule with teeth (absent flags absent,
+    tri-state explicit); suite now 1477.
+
 - Dashboard UI for the eight API-only admin surfaces (tier 63) —
   the admin dashboard at `/admin/ui` now covers every admin endpoint
   that had no visual surface; no backend changes — the endpoints

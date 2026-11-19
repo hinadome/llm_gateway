@@ -34,6 +34,7 @@ From the client's point of view it *is* the OpenAI API — same request schema, 
 | **Prompt library (prompt ops)** | Versioned named prompts in the DB (`POST /admin/prompts` + the admin UI's Prompts tab): a key can reference one by name (`system_prompt_ref`) instead of inline text — its **active** version serves, so editing a prompt is a version bump + activate (no key change, no restart, instant rollback). A second **candidate** version A/B-mirrors in the background (a fraction of successful traffic, own log rows flagged with the variant, `gateway_prompt_mirror_*` metrics — never client-facing, never in stats or spend) |
 | **Inspection** | Every request/response stored with guardrail decisions, tokens, cost, latency; queryable via `/admin/logs` (filterable by trace id); Prometheus metrics at `/metrics`; OpenTelemetry tracing + logs with trace correlation (opt-in); full Grafana/collector stack in `deploy/`; PII-safe mode stores no bodies (`store_bodies: false`) and old rows are pruned automatically (`retention_days`) |
 | **Admin UI** | Built-in dashboard at `/admin/ui`: key management (create/edit/**rotate/revoke**, budget bars, alert badges, tenant placement, admin-key grants), tenant management (create/edit/delete with pooled budget bars and the kill switch; platform admins only — tenant admins land on a scoped note), request-log browsing with full request/response inspection, a **replay-harness panel** on the logs tab (capture the filtered window, replay it against the current config, read the diff — see [Capture-replay harness](#capture-replay-harness)), a **Feedback tab** (client ratings: quality stats + reviewable rows — see [Feedback](#feedback)), routing table with live circuit-breaker state, guardrail inventory, a **Playground tab** (tier 41: send a chat through the real pipeline as the admin or any key — model/key dropdowns, multi-turn conversation, and the request-log row's diagnostics beside it; see [Admin playground](#admin-playground)), and a System tab (health, config reload, backups, plus the live-state panels: concurrency slots, the runaway jail with release, the canary fleet with probe-now, and the MCP proxy — platform admins only) — one self-contained HTML file, no build step, no external resources (works offline) |
+| **CLI** | The `gateway` console script — the admin API's terminal client, the scripted sibling of the dashboard: keys/tenants CRUD, BYOK vault, prompt library, logs/capture/replay, feedback, fleet state (routing, breakers, guardrails, canaries, runaway, concurrency, MCP, SLOs, PII scan), billing (invoices, anomalies, forecasts, usage exports), migration evidence (shadow-diff, verdicts, watch, pairs, trials), reload and backups. A thin HTTP client of the same JSON admin API — same credential (`--key` / `GATEWAY_ADMIN_KEY`), same scoping, zero new dependencies; `--json` prints the exact payload, exports pipe to stdout or `--out FILE`, errors are the API's own messages verbatim (see [CLI](#cli)) |
 | **Virtual keys** | Per-key model allowlists (fnmatch patterns), **tool allowlists** (`allowed_tools`, fnmatch patterns over the tool *names* a request may declare — see [Design notes](#design-notes--limitations-mvp)), **MCP server allowlists** (`allowed_mcp_servers`, fnmatch patterns over the proxied server names — see [MCP proxy](#mcp-proxy)), RPM/TPM rate limits, **in-flight concurrency caps with priority queueing** (QoS: max simultaneous upstream requests per key — cache hits and idempotent replays bypass; waiters queue highest-priority-first, then 429 + `Retry-After`), USD budgets with spend tracking — total plus **daily / monthly windows** (UTC calendar caps, e.g. "no more than $5/day"), an opt-in **projected stance** (`budget_enforcement:`) that denies on the month-end run-rate trend before the money is spent, and **credential rotation with a grace window** — `POST /admin/keys/{id}/rotate` replaces the secret while the row keeps its identity, the old credential working until its window ends (see [Key rotation & grace windows](#key-rotation--grace-windows)) |
 | **Multi-tenancy** | Tenants (organizations) group virtual keys under a shared policy ceiling — model allowlist, RPM/TPM, and total/daily/monthly budgets that apply to *every* member key, tenant admins included (they manage their own tenant's keys, not its policy; a member must pass both its own checks and the tenant's — the tenant can only narrow). **`pricing_markup_pct`** bills member traffic at cost-plus (20.0 = +20% on provider cost): spend, budgets, logs, exports and the per-key metrics record the *billed* cost while `gateway_cost_usd_total{model}` keeps the actual, and `gateway_markup_usd_total{tenant}` counts the revenue (see [Tenant pricing markup](#tenant-pricing-markup)). **Tenant admins** (`is_admin` key inside a tenant) see only their tenant's keys/logs/stats/usage (a cross-tenant id is a 404, not a 403 — no existence leaks) and are 403 on platform endpoints (tenants, prompts, routing, guardrails, reload, backups). The dashboard knows the difference: `GET /admin/whoami` identifies the signed-in principal (name, auth method, tenancy), platform-only tabs render an honest "platform-administrator surface" note instead of firing 403s, and platform admins get per-tenant lenses on the keys and logs tabs. `is_active: false` is a kill switch for every member key (re-enable restores them); pooled spend and budget alerts fire per tenant too (`kind: "tenant"` in the payload); responses carry `X-Gateway-Tenant`; caches are isolated per tenant |
 | **BYOK vault** | Tenants bring their **own provider credentials**: store one encrypted key per (tenant, provider) — `PUT /admin/tenants/{id}/provider-keys/{provider}` — and every request from that tenant rides *their* provider account instead of the platform's configured key, through every retry and fallback leg (per-candidate resolution; with `vault.strict: true` the ladder only ever contains providers the tenant keyed — an unkeyed model refuses 403 `byok_key_required`). Fernet-encrypted at rest under `GATEWAY_VAULT_MASTER_KEY` (MultiFernet list = rotation), the raw key exists only in the PUT body and the upstream auth header — the API speaks a hint (`…1234`), audit records the same, log rows record only the provider name (`byok_provider`) plus `X-Gateway-Byok-Provider` and `gateway_byok_requests_total`. Undecryptable entries fail closed (`byok_key_unreadable` — never a silent platform-key fallback); without a master key the vault is off and every caller is served exactly as before. `vault.backend: redis` fans admin-write invalidations out to every replica (the TTL is the backstop); the admin UI's Vault tab manages credentials for both admin kinds (see [BYOK vault](#byok-vault)) |
@@ -105,6 +106,70 @@ print(resp.choices[0].message.content)
 ```
 
 Streaming works exactly like OpenAI (`stream=True`, `stream_options={"include_usage": True}`).
+
+## CLI
+
+The `gateway` console script is the admin API's terminal client — the scripted sibling of the dashboard: keys and tenants from a shell, a capture/replay check from cron, fleet state from an SSH session. It is a thin HTTP client of the same JSON admin API — same credential (`--key` or `GATEWAY_ADMIN_KEY`, same for `--url`/`GATEWAY_URL`), same scoping, every 403/404 the dashboard would get, the CLI prints — and imports nothing from the gateway package. The **server** entry point remains `python -m gateway` (or `scripts/gateway.sh`); the console script only *operates* a running gateway.
+
+```bash
+export GATEWAY_URL=http://localhost:8000
+export GATEWAY_ADMIN_KEY=sk-gw-...
+
+gateway status                          # whoami, uptime, ready (with the WHY when not)
+gateway stats --hours 1
+
+# keys — the raw credential prints exactly once, prominently
+gateway keys create svc --rpm 120 --monthly 5
+gateway keys list                        # aligned, pipe-friendly tables
+gateway keys edit <id> --cache-bypass    # absent flags = absent body fields
+gateway keys rotate <id> --grace-seconds 60
+gateway keys revoke <id>                 # the row and its history stay
+
+gateway tenants create acme --monthly 50 --markup 20   # tenants are id-addressed
+gateway vault put <tenant-id> openai --value "$OPENAI_KEY"   # or pipe stdin
+
+# traffic: logs, capture/replay, feedback
+gateway logs list --status error
+gateway logs export --out capture.jsonl
+gateway replay capture.jsonl            # "replayed 3 · changed 0 … nothing would change"
+gateway feedback stats
+
+# fleet state
+gateway routing
+gateway breakers reset openai/primary
+gateway canaries probe
+gateway runaway list
+gateway concurrency
+gateway mcp
+gateway slos
+gateway pii-scan
+
+# billing & migration evidence
+gateway invoices --csv --out nov.csv
+gateway forecasts
+gateway anomalies
+gateway usage-export --format json
+gateway shadow-diff
+gateway verdicts
+gateway watch
+gateway pairs --trial-id <id>
+gateway trials create --model test-model --deployment openai/fallback
+
+# operations
+gateway reload
+gateway backups create
+```
+
+Conventions:
+
+- Lists print as aligned plain-text tables; `--json` prints the **exact** response payload for everything else (tables deliberately abbreviate); single objects print as key–value dumps.
+- Exports (`logs export`, `invoices --csv`, `usage-export`) write to stdout — pipe-friendly — or to a file with `--out`.
+- Errors print as `gateway: <message>` on stderr, exit code 1 — the API's own error-envelope message, verbatim. A 401 without any credential appends a hint to pass `--key` or set `GATEWAY_ADMIN_KEY`.
+- Absent flags are absent request-body fields: a patch touches only what the operator named. Boolean tri-state fields (per-key cache policy) get dedicated flags, because a plain `--flag` can only mean "present": `--cache-bypass` sends an explicit `cache_enabled: false`, `--cache-inherit` an explicit `null` (reset to the global policy), and `--expires null` clears a deadline.
+- `vault put` refuses to read a secret from an interactive terminal (shell history, scrollback): pass `--value` (env expansion) or pipe the credential on stdin.
+- Zero new dependencies: argparse (stdlib) + httpx (already required by the app).
+
+Deliberately absent: `playground` (an interactive chat is the dashboard's job) and the promotion applies (`plan` / `promote` / `rollback` — confirmation dialogs by design; all of their *evidence* reads are here). There is also no `keys delete`: the API's DELETE is a revoke, so the CLI exposes exactly one honest word for it.
 
 ## HTTPS
 
