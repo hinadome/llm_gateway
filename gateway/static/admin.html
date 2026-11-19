@@ -2221,9 +2221,11 @@ function replayLine(r) {
   // Predicted carries the *current* routing ladder (deployments), the
   // recording the single deployment that served; an auth rejection
   // carries its error — the finding the operator most needs to see.
+  // MCP lines carry the JSON-RPC method instead of a ladder (no
+  // routing on that surface — the model shown is the server).
   const outcome = o => {
     if (!o) return "—";
-    const dep = o.deployment || (o.deployments || []).join(", ") || "—";
+    const dep = o.method || o.deployment || (o.deployments || []).join(", ") || "—";
     const err = o.error
       ? ` · <span class="b b-red" title="${esc(o.error.message || "")}">${esc(o.error.code || "error")}</span>`
       : "";

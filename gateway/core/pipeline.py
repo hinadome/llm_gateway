@@ -477,6 +477,157 @@ class GatewayPipeline:
             "deployments": ladder,
         }
 
+    async def replay_mcp_message(
+        self,
+        message: dict[str, Any],
+        auth: AuthContext,
+        server_name: str,
+    ) -> dict:
+        """Dry-run one captured MCP message through the request-policy
+        phases — the capture-replay harness's MCP executor (the
+        ``replay_request`` twin; see core/replay.py).
+
+        Runs the exact policy code a live message runs before anything
+        goes upstream and nothing else: the ``mcp.enabled`` / configured
+        server / server-allowlist gates, then — per message — the tool
+        policy and the request-phase guardrails of tier 49 (tools/call
+        arguments; the whole params object on the content methods), a
+        modify verdict predicted only when the rewrite is still a JSON
+        object, exactly as live. Deliberately NOT re-run: the circuit
+        breaker, the rate limit and the concurrency slot are state, not
+        policy (the chat twin's precedent — counters are skipped), the
+        session gate is gateway state a dry run holds none of, the
+        upstream call is execution, and the response phase judges
+        server output a dry run never sees. No log rows, no lifecycle
+        events; ctx.dry_run suppresses the guardrail counters.
+
+        Returns the predicted decision record shaped like the chat
+        twin's — ``model`` is the SERVER name (the log row's model
+        column), ``deployments`` is None (no routing on this surface) —
+        plus ``method``: which JSON-RPC method replayed. Denials use
+        the chat vocabulary (``content_policy_violation`` /
+        ``tool_not_allowed``) so the report reads one language across
+        surfaces.
+        """
+        kind = classify(message)
+        method = message.get("method") if isinstance(message.get("method"), str) else None
+        method_label = method or kind or "unknown"
+        ctx = RequestContext(
+            request_id=f"replay_{uuid.uuid4().hex}",
+            auth=auth,
+            model=server_name,
+            stream=False,
+            route="mcp",
+            request_body=message,
+            dry_run=True,
+        )
+        ctx.provider = "mcp"
+
+        def predicted(status: str, code: str | None, reason: str | None) -> dict:
+            return {
+                "model": server_name,
+                "method": method_label,
+                "guardrail_actions": list(ctx.guardrail_actions),
+                "status": status,
+                "error": {"code": code, "message": reason} if code else None,
+                "deployments": None,
+            }
+
+        if kind is None:
+            # The live route 400s unparseable envelopes before a row is
+            # ever written, so real captures never hold one — but a
+            # hand-made entry gets an honest prediction, not a crash.
+            return predicted(
+                "error", "invalid_request_error", "Not a JSON-RPC 2.0 message."
+            )
+        try:
+            # The gates, in the HTTP order — all policy, no state.
+            if not self.config.mcp.enabled:
+                raise MCPDisabledError()
+            server = self.config.mcp.server(server_name)
+            if server is None:
+                raise MCPServerNotAllowedError(server_name)
+            self._check_mcp_server_policy_for(server_name, auth)
+
+            params = (
+                message.get("params")
+                if isinstance(message.get("params"), dict)
+                else {}
+            )
+            if kind == "request" and method == "tools/call":
+                name = params.get("name")
+                if not isinstance(name, str):
+                    # Fail closed when a policy exists — the tier-30 rule.
+                    if not auth.is_admin and (
+                        auth.allowed_tools or auth.tenant_allowed_tools
+                    ):
+                        return predicted(
+                            "blocked",
+                            "tool_not_allowed",
+                            "Tool call rejected: no tool name in params, "
+                            "and this API key has a tool policy (fail "
+                            "closed).",
+                        )
+                elif not self._tool_name_allowed(name, ctx):
+                    return predicted(
+                        "blocked",
+                        "tool_not_allowed",
+                        f"Tool '{name}' is not allowed for this API key "
+                        "(allowed_tools policy).",
+                    )
+                arguments = params.get("arguments")
+                serialized = (
+                    json.dumps(arguments, sort_keys=True)
+                    if arguments is not None
+                    else "{}"
+                )
+                _, new_text, blocked = await self._mcp_guard_request(
+                    ctx, server, serialized, tool=name, method="tools/call"
+                )
+                if blocked is not None:
+                    return predicted("blocked", "content_policy_violation", blocked.reason)
+                if new_text is not None:
+                    # The rewrite must still be a JSON object — the live
+                    # fail-closed rule, predicted identically.
+                    try:
+                        if not isinstance(json.loads(new_text), dict):
+                            raise ValueError("not a JSON object")
+                    except ValueError:
+                        return predicted(
+                            "blocked",
+                            "content_policy_violation",
+                            "Blocked: a guardrail rewrote the tool arguments "
+                            "into something that is no longer a valid JSON "
+                            "object — failing closed rather than corrupting "
+                            "the call.",
+                        )
+            elif kind == "request" and method in MCP_CONTENT_METHODS:
+                serialized = json.dumps(params, sort_keys=True) if params else "{}"
+                _, new_text, blocked = await self._mcp_guard_request(
+                    ctx, server, serialized, method=method
+                )
+                if blocked is not None:
+                    return predicted("blocked", "content_policy_violation", blocked.reason)
+                if new_text is not None:
+                    try:
+                        if not isinstance(json.loads(new_text), dict):
+                            raise ValueError("not a JSON object")
+                    except ValueError:
+                        return predicted(
+                            "blocked",
+                            "content_policy_violation",
+                            "Blocked: a guardrail rewrote the message params "
+                            "into something that is no longer a valid JSON "
+                            "object — failing closed rather than corrupting "
+                            "the call.",
+                        )
+        except GatewayError as exc:
+            return predicted("error", exc.code, exc.message)
+        # Everything else — initialize, ping, catalog reads,
+        # notifications and client responses — carries no request-side
+        # policy beyond the gates: relayed untouched live, success here.
+        return predicted("success", None, None)
+
     async def _prepare_request_policy(
         self, request: ChatCompletionRequest, ctx: RequestContext
     ) -> ChatCompletionRequest:
@@ -1218,7 +1369,14 @@ class GatewayPipeline:
             model=server_name,
             stream=False,
             route="mcp",
-            request_body={"method": method},
+            # Tier 67: the VERBATIM JSON-RPC message, params included —
+            # the request-policy phases read the caller-controlled
+            # content (tools/call arguments, the content methods'
+            # params), and the capture-replay harness needs exactly
+            # that stored to re-run them. The write is still gated by
+            # logging.store_bodies (PII-safe mode keeps the column
+            # NULL) and truncated by logging.max_body_chars.
+            request_body=message,
         )
         ctx.provider = "mcp"
         metrics.INFLIGHT.inc()

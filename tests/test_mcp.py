@@ -50,6 +50,7 @@ from gateway.config import (
     EventHandlerConfig,
     GuardrailConfig,
     GuardrailScope,
+    LoggingConfig,
     MCPConfig,
     MCPServerConfig,
 )
@@ -1836,3 +1837,93 @@ async def test_guardrail_scope_keys_on_mcp(tmp_path):
         assert resp.status_code == 200
         assert "error" not in resp.json()
         assert env.mcp.bodies("tools/call")
+
+
+# ----------------------------------------------------------------------
+# Params storage (tier 67) — the replay harness's capture leg
+# ----------------------------------------------------------------------
+
+
+async def _newest_row_with_body(client) -> dict:
+    """The newest log row, fetched with its stored bodies."""
+    logs = await client.get("/admin/logs", headers=auth(ADMIN_KEY))
+    row_id = logs.json()["data"][0]["id"]
+    full = await client.get(f"/admin/logs/{row_id}", headers=auth(ADMIN_KEY))
+    assert full.status_code == 200, full.text
+    return full.json()
+
+
+async def test_params_storage_keeps_verbatim_message(tmp_path):
+    """The row stores the VERBATIM JSON-RPC message — params included —
+    since tier 67: the request-policy phases read caller-controlled
+    content (tools/call arguments, content-method params), and the
+    capture-replay harness needs exactly that stored to re-run them."""
+    async for env in _make_env(
+        tmp_path, config=make_config(mcp=_mcp_config()), mcp_mock=MockMCP()
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        call = _tools_call("get_weather", {"city": "Oslo", "unit": "c"})
+        resp = await _post(env.client, call, key, session=sid)
+        assert resp.status_code == 200
+
+        row = await _newest_row_with_body(env.client)
+        assert row["route"] == "mcp"
+        assert row["model"] == "test-server"
+        # The stored body IS the message the client sent — envelope,
+        # id, method and params, not a summary of it.
+        assert row["request_body"] == call
+
+
+async def test_params_storage_respects_pii_safe_mode(tmp_path):
+    """logging.store_bodies=false keeps the column NULL on this surface
+    too — the same PII-safe gate as every other one — while the
+    metadata (route, server, method outcome) still records."""
+    async for env in _make_env(
+        tmp_path,
+        config=make_config(
+            mcp=_mcp_config(), logging=LoggingConfig(store_bodies=False)
+        ),
+        mcp_mock=MockMCP(),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _tools_call("get_weather", {"city": "Oslo"}),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200
+
+        row = await _newest_row_with_body(env.client)
+        assert row["status"] == "success"
+        assert row["request_body"] is None  # PII-safe: no stored message
+        assert row["response_body"] is None
+
+
+async def test_params_storage_truncates_huge_messages(tmp_path):
+    """logging.max_body_chars truncation applies here as everywhere —
+    a message past the cap stores the honest marker (the replay
+    harness skips such rows rather than re-running half a message)."""
+    async for env in _make_env(
+        tmp_path,
+        config=make_config(
+            mcp=_mcp_config(), logging=LoggingConfig(max_body_chars=200)
+        ),
+        mcp_mock=MockMCP(),
+    ):
+        key = (await create_key(env.client, "mcp-key"))["key"]
+        sid = await _open_session(env.client, key)
+        resp = await _post(
+            env.client,
+            _tools_call("get_weather", {"city": "x" * 400}),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200
+
+        row = await _newest_row_with_body(env.client)
+        assert row["request_body"]["_truncated"] is True
+        assert "preview" in row["request_body"]
+        assert "x" * 400 not in json.dumps(row["request_body"])

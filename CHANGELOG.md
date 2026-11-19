@@ -8,6 +8,48 @@ All notable changes to the LLM Gateway are documented here. Format follows
 
 ### Added
 
+- MCP replay + params storage (tier 67) — the capture-replay
+  harness grows its second surface: MCP traffic becomes replayable,
+  and the capture leg that was missing (the message params) is
+  stored.
+  - **Params storage**: `handle_mcp` writes the VERBATIM JSON-RPC
+    message — envelope, id, method and params — onto the request-log
+    row's request body (it was a method label before). The
+    request-policy phases read caller-controlled content (`tools/call`
+    arguments, the content methods' params), and the replay harness
+    needs exactly that stored to re-run them. No new config:
+    `logging.store_bodies` still gates the write (PII-safe mode keeps
+    the column NULL — server/method/outcome metadata records either
+    way) and `logging.max_body_chars` still truncates (the honest
+    `_truncated` marker the harness skips).
+  - **MCP replay**: `pipeline.replay_mcp_message` — the
+    `replay_request` twin — dry-runs one captured message through the
+    request-policy phases only: the `mcp.enabled` / configured-server
+    / `allowed_mcp_servers` gates, then per method the tier-30 tool
+    policy (nameless fail-closed included) and the tier-49
+    request-phase guardrails over the serialized params, a modify
+    predicted only while the rewrite stays a JSON object (the live
+    fail-closed rule). Never re-run, deliberately: the session gate
+    (gateway state), the tier-66 breaker, RPM and the slot (counters),
+    the upstream call and the response phase. `ctx.dry_run`
+    suppresses guardrail counters as on chat; predictions carry
+    model = the server name, method = the JSON-RPC method,
+    deployments always None, denials in the chat vocabulary
+    (`content_policy_violation` / `tool_not_allowed`).
+  - **Honest comparability, MCP edition** (`core/replay.py`'s
+    `_replay_mcp_one`): pre-tier-67 rows (method label only) skip the
+    params-reading methods — `predates params storage` — while
+    `initialize`, notifications and catalog reads still replay on the
+    method alone (every policy that ever applied to them is
+    gate-level); truncated messages skip like their chat twins; the
+    same caller resolution (the recorded caller's *current* key, the
+    tenant boundary) and the same shared diff (status, request-phase
+    verdicts; the row's deployment is NULL, model the server name).
+    The dashboard's replay line shows the JSON-RPC method where chat
+    lines show the routing ladder.
+  - 8 tests in `tests/test_replay.py` + 3 params-storage tests in
+    `tests/test_mcp.py`; suite now 1527.
+
 - Per-server MCP circuit breakers + route-scoped SLOs (tier 66) —
   MCP parity items #1 and #2: tool servers get the deployment
   breaker's protection, and a tool server becomes a first-class SLO.

@@ -2,7 +2,7 @@
 
 This document describes the LLM Gateway's architecture, module boundaries, request lifecycle, extension points, and an honest assessment of how modular and flexible the system currently is.
 
-- **Codebase**: 96 Python files, ~39,300 lines, 1516 tests (+ one static HTML file — the admin dashboard)
+- **Codebase**: 96 Python files, ~39,600 lines, 1527 tests (+ one static HTML file — the admin dashboard)
 - **Stack**: Python 3.12+ / FastAPI (async) / httpx / SQLAlchemy 2 (async) / Pydantic v2
 - **Companion docs**: [README.md](README.md) for usage, configuration and quick start
 
@@ -1015,7 +1015,23 @@ gateway/
 │   │                       ADDED servers breakers while existing
 │   │                       state survives;
 │   │                       mcp_terminate drops the local mapping
-│   │                       first, then relays the upstream DELETE
+│   │                       first, then relays the upstream DELETE;
+│   │                       replay_mcp_message (tier 67) is the
+│   │                       route-mcp capture's dry-run executor —
+│   │                       the replay_request twin: the gates, the
+│   │                       tools/call tool policy and the
+│   │                       request-phase guardrails over the stored
+│   │                       message's params (the live fail-closed
+│   │                       rewrite rule predicted identically),
+│   │                       never the session gate / breaker / RPM /
+│   │                       slot / upstream / response phase (state,
+│   │                       counters or execution); the MCP ctx
+│   │                       stores the VERBATIM JSON-RPC message as
+│   │                       request_body — params included, the
+│   │                       store_bodies / max_body_chars gates
+│   │                       applying at the logging-service write
+│   │                       like on every surface — which is what
+│   │                       makes the surface replayable;
 │   ├── realtime.py         RealtimeRelay (tier 32) — the stateful twin of the
 │   │                       streaming chat path: two pumps (client→upstream,
 │   │                       upstream→client) supervised by one asyncio.wait
@@ -2135,6 +2151,16 @@ gateway/
 │   │                       exported but not comparable (their
 │   │                       outcome was state, not policy); outcomes
 │   │                       count on gateway_replay_total{result}.
+│   │                       Tier 67 extends the harness to route-mcp
+│   │                       lines: _replay_mcp_one resolves the same
+│   │                       caller, feeds the stored JSON-RPC message
+│   │                       to pipeline.replay_mcp_message and diffs
+│   │                       through the same _diff (model = the
+│   │                       server name, deployment None); captures
+│   │                       from before tier 67 (method label only,
+│   │                       no params) skip the params-reading
+│   │                       methods honestly, truncated messages
+│   │                       skip like their chat twins.
 │   ├── shadow_diff.py     Shadow diffing (tier 35): the evidence layer
 │   │                       over mirrored traffic. extract_content_text
 │   │                       pulls the answer text out of either logged
@@ -4469,6 +4495,35 @@ tests/
 │                        retries once then counts failed with the
 │                        crossing still persisted (duplicate silence
 │                        over duplicate noise)
+├── test_replay.py        Capture-replay harness: the three-leg
+│                        contract over /admin/logs/export +
+│                        /admin/replay — capture shape (routes, key_id
+│                        beside key_name, baseline fields, filters,
+│                        paging, shadow/bodiless exclusion, the
+│                        store_bodies=false empty capture),
+│                        same-config unchanged with the dry-run proof
+│                        (no upstream calls, no log rows, no
+│                        guardrail counters), newly blocked traffic,
+│                        removed model, removed deployment, revoked
+│                        key, error-row + blind-entry semantics,
+│                        route fidelity under route-scoped
+│                        guardrails, tenant-admin boundary, config
+│                        gates, prompt-policy reporting + metrics;
+│                        tier 67 adds the MCP leg — tools/call
+│                        unchanged + dry-run invisibility (MCP
+│                        upstream untouched), a candidate blocklist
+│                        flagging stored arguments, a removed
+│                        server, a narrowed allowed_mcp_servers key,
+│                        a narrowed allowed_tools key (per-name
+│                        tool_not_allowed), a newly blocked
+│                        resources/read, pre-tier-67 captures
+│                        (method label only) skipping the
+│                        params-reading methods while initialize
+│                        still replays, truncated-message skips, and
+│                        a mixed chat+MCP capture in one report;
+│                        unit tests pin the diff's request-phase
+│                        verdict scoping and the chat-only
+│                        validation
 ├── test_pii_scan.py      PII/secret scan over stored bodies: the
 │                        original-not-the-mask contract (redaction
 │                        protects the provider, the audit sees what
@@ -4670,7 +4725,14 @@ tests/
 │                        best-effort upstream DELETE), log rows, /admin/
 │                        mcp introspection (header NAMES only), key field
 │                        round-trip, hot-reload removal, mcp.* events
-│                        via a Recorder handler
+│                        via a Recorder handler; tier 67 adds params
+│                        storage — the verbatim JSON-RPC message
+│                        stored (envelope + id + method + params,
+│                        not a summary), store_bodies=false keeping
+│                        the column NULL (metadata intact), and
+│                        max_body_chars truncation (the honest
+│                        _truncated marker the replay harness
+│                        skips)
 ├── test_cli.py          The ``gateway`` console script (tier 64): the async
 │                        core (cli.run) driven against the in-process app —
 │                        output conventions (tables, --json = the exact

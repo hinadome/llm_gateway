@@ -13,7 +13,10 @@ The contract, three legs:
   caller's *current* key — no upstream calls, no counters, no cache,
   no spend, no log rows, no lifecycle events, and guardrail counters
   suppressed (ctx.dry_run) so a harness run can never trip block
-  alerts.
+  alerts. Route-``mcp`` lines (their bodies carry the verbatim
+  JSON-RPC message since tier 67) replay the same way through
+  ``pipeline.replay_mcp_message``: the server/allowlist gates, the
+  tool policy, the request-phase guardrails over the message params.
 * **Diff** — each line compares the prediction against the recorded
   baseline: status, model, request-phase guardrail verdicts,
   deployment membership. The changed lines are what the current
@@ -40,6 +43,7 @@ from gateway.config import (
     GuardrailConfig,
     GuardrailScope,
     LoggingConfig,
+    MCPConfig,
     ModelConfig,
     ReplayConfig,
 )
@@ -47,6 +51,14 @@ from gateway.observability.metrics import GUARDRAIL_BLOCKS, REPLAY
 from gateway.schemas import ChatCompletionRequest
 
 from .conftest import ADMIN_KEY, _make_env, auth, chat_body, create_key, make_config
+from .test_mcp import (
+    SERVER as MCP_SERVER,
+    MockMCP,
+    _open_session as _mcp_open_session,
+    _post as _mcp_post,
+    _request as _mcp_request,
+    _tools_call,
+)
 from .test_native_anthropic import anthropic_body
 
 
@@ -522,6 +534,318 @@ async def test_replay_reports_prompt_policy_and_metrics(tmp_path):
 
         # The harness counter saw the runs (unchanged lines).
         assert REPLAY.labels("unchanged")._value.get() >= before["unchanged"] + 2
+
+
+# -- MCP replay ---------------------------------------------------------------
+
+
+def _mcp_config():
+    """The MCP-enabled capture config: one server, the mock upstream."""
+    return make_config(mcp=MCPConfig(enabled=True, servers=[MCP_SERVER]))
+
+
+async def test_replay_mcp_tools_call_unchanged(tmp_path):
+    """An MCP capture replays like a chat one: same config → unchanged,
+    predicted as the server name plus the JSON-RPC method, no routing
+    ladder on this surface (deployments None, the row's deployment
+    NULL — the shared diff has nothing else to compare). The dry run
+    touches nothing — not even the MCP upstream."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-caller"))["key"]
+        sid = await _mcp_open_session(env.client, key)
+        resp = await _mcp_post(
+            env.client, _tools_call("get_weather", {"city": "Oslo"}), key, session=sid
+        )
+        assert resp.status_code == 200, resp.text
+
+        entries = await _capture(env.client)
+        assert len(entries) == 3  # tools/call, initialized notification, initialize
+
+        upstream_before = len(env.mcp.requests)
+        logs_before = await _log_total(env.client)
+        blocks_before = _blocks_total()
+
+        report = await _replay(env.client, entries)
+        assert report["changed"] == 0
+        assert report["not_comparable"] == 0
+        assert report["unchanged"] == 3
+
+        line = next(
+            r for r in report["results"] if r["predicted"]["method"] == "tools/call"
+        )
+        assert line["result"] == "unchanged"
+        assert line["predicted"]["status"] == "success"
+        assert line["predicted"]["model"] == "test-server"  # the server name
+        assert line["predicted"]["deployments"] is None  # no routing here
+        assert line["predicted"]["error"] is None
+        assert line["recorded"]["deployment"] is None
+
+        # A dry run touches nothing: no MCP upstream calls, no log
+        # rows, no guardrail enforcement counters.
+        assert len(env.mcp.requests) == upstream_before
+        assert await _log_total(env.client) == logs_before
+        assert _blocks_total() == blocks_before
+
+
+async def test_replay_mcp_flags_newly_blocked_tools_call(tmp_path):
+    """A candidate blocklist that now catches the stored arguments
+    predicts the denial — the in-band verdict the live call would have
+    gotten, with the counter still untouched."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-caller"))["key"]
+        sid = await _mcp_open_session(env.client, key)
+        resp = await _mcp_post(
+            env.client,
+            _tools_call("get_weather", {"note": "hello gateway"}),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200, resp.text
+        entries = await _capture(env.client)
+
+        # Candidate config: a blocklist that now catches this content.
+        candidate = _mcp_config()
+        candidate.guardrails.append(
+            GuardrailConfig(
+                name="keyword_blocklist",
+                enabled=True,
+                params={"blocked_terms": ["hello gateway"]},
+            )
+        )
+        env.app.state.pipeline.apply_config(candidate)
+
+        blocks_before = _blocks_total()
+        report = await _replay(env.client, entries)
+        line = next(
+            r for r in report["results"] if r["predicted"]["method"] == "tools/call"
+        )
+        assert line["result"] == "changed"
+        assert set(line["changes"]) == {"status", "guardrail_actions"}
+        assert line["predicted"]["status"] == "blocked"
+        assert line["predicted"]["error"]["code"] == "content_policy_violation"
+        verdicts = [
+            (a["guardrail"], a["action"]) for a in line["predicted"]["guardrail_actions"]
+        ]
+        assert ("keyword_blocklist", "block") in verdicts
+        # The gate-level messages (initialize, the notification) carry
+        # no params policy: they stay unchanged.
+        assert report["unchanged"] == 2
+        # The prediction never touched the enforcement counter — a
+        # harness run cannot trip block alerts.
+        assert _blocks_total() == blocks_before
+
+
+async def test_replay_mcp_flags_removed_server(tmp_path):
+    """A candidate config without the server flips every captured
+    message to the not-found prediction — the same finding as a
+    removed model on chat."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-caller"))["key"]
+        sid = await _mcp_open_session(env.client, key)
+        resp = await _mcp_post(
+            env.client, _tools_call("get_weather", {"city": "Oslo"}), key, session=sid
+        )
+        assert resp.status_code == 200, resp.text
+        entries = await _capture(env.client)
+
+        # Candidate config: the server is gone entirely.
+        env.app.state.pipeline.apply_config(
+            make_config(mcp=MCPConfig(enabled=True, servers=[]))
+        )
+
+        report = await _replay(env.client, entries)
+        assert report["changed"] == 3  # every message to it would 404
+        line = next(
+            r for r in report["results"] if r["predicted"]["method"] == "tools/call"
+        )
+        assert line["changes"] == ["status"]
+        assert line["predicted"]["status"] == "error"
+        assert line["predicted"]["error"]["code"] == "mcp_server_not_found"
+
+
+async def test_replay_mcp_flags_server_allowlist_edit(tmp_path):
+    """The caller replays at their CURRENT key: narrowing
+    allowed_mcp_servers after the capture flips every captured message
+    — gates run on every message kind, initialize included."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        created = await create_key(env.client, "mov")
+        key = created["key"]
+        sid = await _mcp_open_session(env.client, key)
+        resp = await _mcp_post(
+            env.client, _tools_call("get_weather", {"city": "Oslo"}), key, session=sid
+        )
+        assert resp.status_code == 200, resp.text
+        entries = await _capture(env.client, key_name="mov")
+        assert len(entries) == 3
+
+        patched = await env.client.patch(
+            f"/admin/keys/{created['id']}",
+            json={"allowed_mcp_servers": ["other-*"]},
+            headers=auth(ADMIN_KEY),
+        )
+        assert patched.status_code == 200, patched.text
+
+        report = await _replay(env.client, entries)
+        assert report["changed"] == 3
+        line = next(
+            r for r in report["results"] if r["predicted"]["method"] == "tools/call"
+        )
+        assert line["predicted"]["status"] == "error"
+        assert line["predicted"]["error"]["code"] == "mcp_server_not_found"
+
+
+async def test_replay_mcp_flags_tool_policy_edit(tmp_path):
+    """Narrowing allowed_tools after the capture predicts the per-name
+    tools/call denial (the chat twin of test_replay_flags_newly_blocked_
+    traffic, but key-driven): the initialize/notification lines never
+    read tool policy and stay unchanged."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        created = await create_key(env.client, "narrowed")
+        key = created["key"]
+        sid = await _mcp_open_session(env.client, key)
+        resp = await _mcp_post(
+            env.client, _tools_call("get_weather", {"city": "Oslo"}), key, session=sid
+        )
+        assert resp.status_code == 200, resp.text
+        entries = await _capture(env.client, key_name="narrowed")
+
+        patched = await env.client.patch(
+            f"/admin/keys/{created['id']}",
+            json={"allowed_tools": ["search_web"]},
+            headers=auth(ADMIN_KEY),
+        )
+        assert patched.status_code == 200, patched.text
+
+        report = await _replay(env.client, entries)
+        line = next(
+            r for r in report["results"] if r["predicted"]["method"] == "tools/call"
+        )
+        assert line["result"] == "changed"
+        assert line["changes"] == ["status"]
+        assert line["predicted"]["status"] == "blocked"
+        assert line["predicted"]["error"]["code"] == "tool_not_allowed"
+        assert "get_weather" in line["predicted"]["error"]["message"]
+        assert report["unchanged"] == 2
+
+
+async def test_replay_mcp_flags_newly_blocked_content_method(tmp_path):
+    """The content methods' policy (the whole params object through the
+    request-phase guardrails) predicts too — resources/read's URI is
+    caller-controlled text."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mcp-caller"))["key"]
+        sid = await _mcp_open_session(env.client, key)
+        resp = await _mcp_post(
+            env.client,
+            _mcp_request("resources/read", {"uri": "file:///secret/plans.md"}),
+            key,
+            session=sid,
+        )
+        assert resp.status_code == 200, resp.text
+        entries = await _capture(env.client)
+
+        candidate = _mcp_config()
+        candidate.guardrails.append(
+            GuardrailConfig(
+                name="keyword_blocklist",
+                enabled=True,
+                params={"blocked_terms": ["secret"]},
+            )
+        )
+        env.app.state.pipeline.apply_config(candidate)
+
+        report = await _replay(env.client, entries)
+        line = next(
+            r
+            for r in report["results"]
+            if r["predicted"] and r["predicted"]["method"] == "resources/read"
+        )
+        assert line["result"] == "changed"
+        assert line["predicted"]["status"] == "blocked"
+        assert line["predicted"]["error"]["code"] == "content_policy_violation"
+
+
+async def test_replay_mcp_legacy_and_truncated_captures_skip_honestly(tmp_path):
+    """Pre-tier-67 MCP rows stored only the method label: the
+    params-reading methods skip (a prediction over params the record
+    never held would be a guess), the gate-level methods replay on the
+    method alone. Truncated messages skip — half a message is not a
+    re-runnable one."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        entries = [
+            {
+                "route": "mcp",
+                "model": "test-server",
+                "status": "success",
+                "request_body": {"method": "tools/call"},
+            },
+            {
+                "route": "mcp",
+                "model": "test-server",
+                "status": "success",
+                "request_body": {"method": "resources/read"},
+            },
+            {
+                "route": "mcp",
+                "model": "test-server",
+                "status": "success",
+                "request_body": {"method": "initialize"},
+            },
+            {
+                "route": "mcp",
+                "model": "test-server",
+                "status": "success",
+                "request_body": {"_truncated": True, "preview": '{"jsonrpc"'},
+            },
+        ]
+        report = await _replay(env.client, entries)
+        results = report["results"]
+
+        assert results[0]["result"] == "not_comparable"
+        assert "predates params storage" in results[0]["skip_reason"]
+        assert "tools/call" in results[0]["skip_reason"]
+
+        assert results[1]["result"] == "not_comparable"
+        assert "resources/read" in results[1]["skip_reason"]
+
+        assert results[2]["result"] == "unchanged"
+        assert results[2]["predicted"]["method"] == "initialize"
+        assert results[2]["predicted"]["status"] == "success"
+
+        assert results[3]["result"] == "not_comparable"
+        assert "truncated" in results[3]["skip_reason"]
+
+
+async def test_replay_mixed_capture_spans_both_surfaces(tmp_path):
+    """One capture, two surfaces: chat lines diff against their routing
+    ladder, MCP lines against the server/method — one report, the same
+    summary counts."""
+    async for env in _make_env(tmp_path, config=_mcp_config(), mcp_mock=MockMCP()):
+        key = (await create_key(env.client, "mixed-caller"))["key"]
+        await env.client.post(
+            "/v1/chat/completions", json=chat_body(content="hi"), headers=auth(key)
+        )
+        sid = await _mcp_open_session(env.client, key)
+        resp = await _mcp_post(
+            env.client, _tools_call("get_weather", {"city": "Oslo"}), key, session=sid
+        )
+        assert resp.status_code == 200, resp.text
+
+        entries = await _capture(env.client)
+        assert {e["route"] for e in entries} == {"chat", "mcp"}
+
+        report = await _replay(env.client, entries)
+        assert report["changed"] == 0
+        assert report["not_comparable"] == 0
+        chat_line = next(
+            r for r in report["results"] if r["predicted"]["deployments"] is not None
+        )
+        assert chat_line["predicted"]["model"] == "test-model"
+        assert chat_line["predicted"]["deployments"] == ["openai/primary", "openai/fallback"]
+        mcp_line = next(
+            r for r in report["results"] if r["predicted"]["method"] == "tools/call"
+        )
+        assert mcp_line["predicted"]["model"] == "test-server"
 
 
 # -- unit level -----------------------------------------------------------------

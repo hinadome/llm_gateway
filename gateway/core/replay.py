@@ -6,10 +6,13 @@ the other two legs:
 
 * **replay** — re-execute a captured request through the request-policy
   phases *only* (model resolution, prompt policy, permissions,
-  guardrails, routing selection; see ``GatewayPipeline.replay_request``),
-  as the *current* state of the key that made it. No upstream call, no
-  counters, no cache, no spend, no log rows, no lifecycle events — the
-  run is free, deterministic and safe on a live gateway.
+  guardrails, routing selection; see ``GatewayPipeline.replay_request``
+  — or, for route-``mcp`` lines, ``GatewayPipeline.replay_mcp_message``:
+  the server/allowlist gates, the tool policy and the request-phase
+  guardrails over the stored JSON-RPC message), as the *current* state
+  of the key that made it. No upstream call, no counters, no cache, no
+  spend, no log rows, no lifecycle events — the run is free,
+  deterministic and safe on a live gateway.
 * **diff** — compare the predicted outcome against what the capture
   recorded. The differences are exactly what the current config would
   change about that traffic — the safety net for a hot reload: capture,
@@ -18,8 +21,10 @@ the other two legs:
 
 Comparability is decided per line, honestly: rows recorded as ``error``
 cannot be re-run (upstream failures and counter rejections are state,
-not policy), truncated or non-chat bodies cannot be parsed, and entries
-without a recorded baseline produce predictions but no diff.
+not policy), truncated bodies cannot be re-run, MCP captures from
+before tier 67 (which stored only the method label) skip the
+params-reading methods, and entries without a recorded baseline produce
+predictions but no diff.
 
 The harness replays as *keys*, impersonating their current policy (a
 tenant admin may only replay their tenant's keys — the same boundary
@@ -45,11 +50,18 @@ from .auth import (
     get_key_by_name,
     load_tenant_for_key,
 )
+from .mcp import MCP_CONTENT_METHODS
 
 # Recorded statuses the replay can diff against. "error" rows are out:
 # their cause may be upstream flake or a counter rejection — state the
 # dry run deliberately does not re-evaluate — so a diff would be noise.
 _COMPARABLE_STATUSES = ("success", "blocked")
+
+# The MCP methods whose policy READS the message params (tools/call
+# arguments; the whole params object on the content methods) — a
+# capture from before tier 67 stored only the method label, so these
+# cannot be honestly re-run from such rows.
+_MCP_PARAMS_METHODS: frozenset[str] = frozenset({"tools/call"}) | MCP_CONTENT_METHODS
 
 
 def _request_verdicts(actions: list | None) -> list[tuple]:
@@ -152,64 +164,24 @@ def _diff(recorded: dict[str, Any], predicted: dict[str, Any]) -> list[str]:
     return changes
 
 
-async def _replay_one(
-    pipeline: Any, entry: dict[str, Any], admin: Any
-) -> dict[str, Any]:
-    """Replay one capture line; returns the per-line result record."""
-    body = entry.get("request_body")
-    if not isinstance(body, dict):
-        return {
-            "result": "error",
-            "changes": None,
-            "skip_reason": None,
-            "detail": "entry has no request_body — not a capture line",
-            "predicted": None,
-            "recorded": None,
-        }
-    try:
-        request = ChatCompletionRequest.model_validate(body)
-    except ValidationError as exc:
-        # An embeddings-shaped row, or a body truncated by
-        # logging.max_body_chars — honest: the harness cannot re-run it.
-        return {
-            "result": "not_comparable",
-            "changes": None,
-            "skip_reason": f"unparseable request body ({exc.error_count()} errors)",
-            "predicted": None,
-            "recorded": None,
-        }
+def _not_comparable(reason: str) -> dict[str, Any]:
+    """A skipped line: the honest reason, nothing predicted compared."""
+    return {
+        "result": "not_comparable",
+        "changes": None,
+        "skip_reason": reason,
+        "predicted": None,
+        "recorded": None,
+    }
 
-    auth, rejection, skip = await _resolve_caller(entry, admin)
-    if skip is not None:
-        return {
-            "result": "not_comparable",
-            "changes": None,
-            "skip_reason": skip,
-            "predicted": None,
-            "recorded": None,
-        }
-    if rejection is not None:
-        predicted = rejection
-    else:
-        predicted = await pipeline.replay_request(
-            request, auth, route=entry.get("route", "chat")
-        )
 
-    # A recorded baseline enables the diff; rows recorded as "error"
-    # carry state the dry run cannot re-run (upstream/counter outcomes).
+def _diff_line(entry: dict[str, Any], predicted: dict[str, Any]) -> dict[str, Any]:
+    """The shared tail of both surfaces' lines: compare a prediction
+    against the capture's recorded baseline, or hand back a prediction
+    with no diff when there is nothing comparable to diff against."""
     recorded_status = entry.get("status")
     has_baseline = recorded_status in _COMPARABLE_STATUSES and isinstance(
         entry.get("request_body"), dict
-    )
-    recorded = (
-        {
-            "model": entry.get("model"),
-            "status": recorded_status,
-            "deployment": entry.get("deployment"),
-            "guardrail_actions": entry.get("guardrail_actions"),
-        }
-        if has_baseline
-        else None
     )
     if not has_baseline:
         return {
@@ -224,6 +196,12 @@ async def _replay_one(
             "predicted": predicted,
             "recorded": None,
         }
+    recorded = {
+        "model": entry.get("model"),
+        "status": recorded_status,
+        "deployment": entry.get("deployment"),
+        "guardrail_actions": entry.get("guardrail_actions"),
+    }
     changes = _diff(recorded, predicted)
     return {
         "result": "changed" if changes else "unchanged",
@@ -232,6 +210,99 @@ async def _replay_one(
         "predicted": predicted,
         "recorded": recorded,
     }
+
+
+def _mcp_replay_body(body: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """The JSON-RPC message an MCP capture line holds, or the reason it
+    cannot be replayed.
+
+    Rows written since tier 67 store the VERBATIM message (params
+    included — see ``handle_mcp``). Older rows stored only the method
+    label: their params-reading methods (``_MCP_PARAMS_METHODS``) skip
+    honestly — a prediction over params the record never held would be
+    a guess — while the rest (initialize, notifications, catalog
+    reads) still replay on the method alone, because every policy that
+    ever applied to them is gate-level.
+    """
+    if body.get("_truncated"):
+        return None, (
+            "truncated request body (logging.max_body_chars) — the "
+            "stored JSON-RPC message is incomplete"
+        )
+    if body.get("jsonrpc") == "2.0":
+        return body, None
+    method = body.get("method")
+    if not isinstance(method, str):
+        return None, (
+            "MCP capture body is neither a JSON-RPC message nor a "
+            "stored method label"
+        )
+    if method in _MCP_PARAMS_METHODS:
+        return None, (
+            "MCP capture predates params storage (tier 67) — only the "
+            f"method was stored, and {method} policy reads the message "
+            "params"
+        )
+    # The pre-params shape: synthesize the envelope the row's method
+    # arrived in. Request-shaped (initialize, ping, catalog reads) —
+    # and the prediction is gate-level either way, never params-level.
+    return {"jsonrpc": "2.0", "id": None, "method": method}, None
+
+
+async def _replay_mcp_one(
+    pipeline: Any, entry: dict[str, Any], admin: Any, body: dict[str, Any]
+) -> dict[str, Any]:
+    """Replay one route-``mcp`` capture line — the chat branch's
+    contract on the MCP surface: the recorded caller's *current* key,
+    the request-policy phases only
+    (``pipeline.replay_mcp_message``), and the same baseline diff —
+    the row's model column holds the SERVER name and its deployment is
+    NULL, so the shared ``_diff`` compares status and request-phase
+    guardrail verdicts exactly as on chat."""
+    message, skip = _mcp_replay_body(body)
+    if skip is not None:
+        return _not_comparable(skip)
+    auth, rejection, skip = await _resolve_caller(entry, admin)
+    if skip is not None:
+        return _not_comparable(skip)
+    if rejection is not None:
+        return _diff_line(entry, rejection)
+    predicted = await pipeline.replay_mcp_message(message, auth, entry.get("model"))
+    return _diff_line(entry, predicted)
+
+
+async def _replay_one(
+    pipeline: Any, entry: dict[str, Any], admin: Any
+) -> dict[str, Any]:
+    """Replay one capture line; returns the per-line result record."""
+    body = entry.get("request_body")
+    if not isinstance(body, dict):
+        return {
+            "result": "error",
+            "changes": None,
+            "skip_reason": None,
+            "detail": "entry has no request_body — not a capture line",
+            "predicted": None,
+            "recorded": None,
+        }
+    if entry.get("route") == "mcp":
+        return await _replay_mcp_one(pipeline, entry, admin, body)
+    try:
+        request = ChatCompletionRequest.model_validate(body)
+    except ValidationError as exc:
+        # An embeddings-shaped row, or a body truncated by
+        # logging.max_body_chars — honest: the harness cannot re-run it.
+        return _not_comparable(f"unparseable request body ({exc.error_count()} errors)")
+
+    auth, rejection, skip = await _resolve_caller(entry, admin)
+    if skip is not None:
+        return _not_comparable(skip)
+    if rejection is not None:
+        return _diff_line(entry, rejection)
+    predicted = await pipeline.replay_request(
+        request, auth, route=entry.get("route", "chat")
+    )
+    return _diff_line(entry, predicted)
 
 
 async def replay_entries(pipeline: Any, entries: list, admin: Any) -> dict[str, Any]:
